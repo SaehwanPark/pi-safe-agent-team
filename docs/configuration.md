@@ -43,18 +43,18 @@ A role can choose a route and capability ceiling. Child requests are intersected
 
 - `scout`: read/search, no shell/write/spawn;
 - `reviewer`: read/search, peer messaging, no write;
-- `worker`: read/write, optional shell, no peer broadcast by default;
+- `worker`: read/write through declared resources, optional shell, no peer broadcast by default; shared-workspace shell is read-only and allowlisted, while worktree shell is explicitly trusted;
 - `lead`: bounded spawn, peer messaging, resource transfer.
 
 The authority fields are coordinator state. Role prompt text is guidance only.
 
 ## Workspace policy
 
-Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Cleanup is explicit; a dirty artifact requires user confirmation/force through a future cleanup command.
+Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Cleanup is explicit; a dirty artifact requires user confirmation/force through a future cleanup command.
 
 ## Broker startup
 
-Normally the first root extension instance starts the local broker; later instances join the locked fabric. The runtime uses a stable per-fabric root identity and stores its reconnect credential in `root.token` with mode `0600`. A stale lock can be removed only when its recorded PID is no longer alive. The endpoint is local-user scoped. The broker is one writer for `events.jsonl`.
+Normally the first root extension instance starts the local broker; later instances join the locked fabric. The runtime uses a stable per-fabric root identity and stores its reconnect credential in `root.token` with mode `0600`. A broker restart permits one matching-token reattach for live actors; completed, failed, and cancelled semantic terminal actors remain terminal. A stale lock can be removed only when its recorded PID is no longer alive. The endpoint is local-user scoped. The broker is one writer for `events.jsonl`.
 
 ## Diagnostics
 

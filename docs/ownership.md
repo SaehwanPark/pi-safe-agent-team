@@ -4,13 +4,13 @@ Resource state is controlled by the broker. Agents may propose a handoff in pros
 
 ## Resource IDs and hierarchy
 
-A resource is an opaque ID such as `module:parser`, `file:parser.ts`, or `symbol:Parser.parse`. A definition may name one explicit parent. The parent relationship is part of state, not inferred from filesystem spelling.
+A resource is an opaque ID such as `module:parser`, `file:parser.ts`, or `symbol:Parser.parse`. A definition may name one explicit parent and an optional workspace-relative `path`. File paths match exactly; module/directory paths match the path and descendants. The parent relationship is part of state, not inferred from filesystem spelling.
 
-Two resources overlap when they are equal or one is an ancestor of the other. That makes a mutable borrow on `module:parser` conflict with a shared borrow on `file:parser.ts`, even if the two agents named different IDs.
+Two resources overlap when they are equal or one is an ancestor of the other; declared file/module paths also establish overlap when hierarchy links are omitted. That makes a mutable borrow on `module:parser` conflict with a shared borrow on `file:parser.ts`, even if the two agents named different IDs.
 
 ## Ownership versus borrowing
 
-- **Owner**: logical authority to transfer/grant the resource. Ownership is not a runtime mutex.
+- **Owner**: logical authority to transfer/grant the resource. Ownership is not a runtime mutex; even the owner must acquire a mutable borrow before a guarded filesystem write.
 - **Shared borrow**: read/comment/test access. Multiple agents may hold it concurrently.
 - **Mutable borrow**: write access. Only one overlapping mutable holder may exist, and no other agent may hold an overlapping shared borrow.
 - **Version**: increments when mutable content authority is released or transferred. Use `resource_snapshot` and retain `resourceId@version` in task results.
@@ -20,12 +20,13 @@ A parent grant applies to descendants. A child may inspect a resource only with 
 ## Typical flow
 
 ```text
-root: resource.define(module:parser)
-root: resource.define(file:parser.ts, parent=module:parser)
+root: resource.define(module:parser, path=src)
+root: resource.define(file:parser.ts, path=src/parser.ts, parent=module:parser)
 root: resource.grant(module:parser, child, [read, write])
 child: resource.borrow(file:parser.ts, shared)
 child: resource.release(leaseId)
 child: resource.borrow(module:parser, mutable, wait=true)
+child: edit/write(path=src/parser.ts)  # host checks the mutable hold at write time
 ```
 
 If a mutable request conflicts, the broker returns `waiting` plus a request ID. It does not pretend that a write succeeded. Waiters are FIFO by enqueue time and receive a durable `resource_granted` message when a release or lease expiry makes the request grantable.
@@ -57,4 +58,4 @@ Lease reclamation is deterministic and idempotent. It is not a merge or content-
 
 ## Write guard
 
-The child-safe `edit`/`write` path is exposed only when the capability allows repository writes. A resource-aware host can additionally call `resource.check_write` with a resource ID; the result is authoritative for whether the actor owns or holds mutable access. Shell access is separately gated by `mayUseShell`.
+The child-safe `read`/`grep`/`find`/`ls` tools are scoped to the managed workspace. The child-safe `edit`/`write` path is exposed only when the capability allows repository writes. The managed host passes each target path to `resource.check_write` at the final filesystem write operation; the path must match a declared file resource exactly or a declared module/directory resource, and the actor must hold mutable access across the hierarchy. Ownership alone is denied. Shell access is separately gated by `mayUseShell`: shared-workspace shell is a conservative read-only allowlist whose executable arguments must stay workspace-relative (no absolute or parent paths), while worktree shell is an explicitly trusted isolated-workspace escape hatch and is not resource-enforced.

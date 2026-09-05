@@ -97,6 +97,8 @@ export interface AgentRecord {
   childrenCreated: number;
   /** Broker-only reconnect credential; never include this in public projections. */
   authToken?: string;
+  /** True only for a liveness recovery window after a broker restart. */
+  reconnectable?: boolean;
 }
 
 export interface TaskResult {
@@ -132,6 +134,8 @@ export interface ResourceHold {
 
 export interface ResourceWaiter {
   requestId: RequestId;
+  /** Coordinator-assigned FIFO position; optional for pre-hardening journals. */
+  enqueuedSequence?: number;
   agentId: AgentId;
   mode: BorrowMode;
   enqueuedAt: number;
@@ -142,6 +146,8 @@ export interface ResourceRecord {
   id: ResourceId;
   kind: string;
   parentId?: ResourceId;
+  /** Workspace-relative path for mechanically guarded file/module writes. */
+  path?: string;
   owner?: AgentId;
   version: number;
   grants: Record<AgentId, ResourcePermission[]>;
@@ -158,7 +164,10 @@ export interface AgentMessage {
   to: AgentId;
   type: MessageType;
   body: string;
+  /** Monotonic sequence assigned by the sender; inboxes sort by this value. */
   senderSequence: number;
+  /** Monotonic broker sequence used for durable cross-sender replay ordering. */
+  brokerSequence?: number;
   requestId?: RequestId;
   replyTo?: MessageId;
   priority: MessagePriority;
@@ -218,6 +227,10 @@ export interface PersistedCoordinatorState {
   messages: AgentMessage[];
   requests: RequestRecord[];
   dedupe: Array<[string, MessageId]>;
+  /** Optional for replay compatibility with pre-hardening journals. */
+  nextBrokerSequence?: number;
+  /** Optional for replay compatibility with pre-hardening journals. */
+  nextResourceWaiterSequence?: number;
 }
 
 export interface AgentSummary {
@@ -262,11 +275,12 @@ export interface DispatchResult<T = unknown> {
 }
 
 export function cloneCapabilities(capabilities: AgentCapabilities): AgentCapabilities {
+  const legacy = capabilities as AgentCapabilities & { peerIds?: AgentId[]; resourceGrants?: Record<string, ResourcePermission[]> };
   return {
     ...capabilities,
-    peerIds: [...capabilities.peerIds],
+    peerIds: [...(legacy.peerIds ?? [])],
     resourceGrants: Object.fromEntries(
-      Object.entries(capabilities.resourceGrants).map(([resourceId, permissions]) => [resourceId, [...permissions]]),
+      Object.entries(legacy.resourceGrants ?? {}).map(([resourceId, permissions]) => [resourceId, [...permissions]]),
     ),
   };
 }
@@ -290,7 +304,10 @@ export function cloneResource(resource: ResourceRecord): ResourceRecord {
 }
 
 export function cloneMessage(message: AgentMessage): AgentMessage {
-  return { ...message, metadata: message.metadata ? { ...message.metadata } : undefined };
+  return {
+    ...message,
+    metadata: message.metadata ? JSON.parse(JSON.stringify(message.metadata)) as Record<string, unknown> : undefined,
+  };
 }
 
 export function cloneRequest(request: RequestRecord): RequestRecord {

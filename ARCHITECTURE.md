@@ -17,8 +17,8 @@ The first release is a local Pi extension and a small broker process:
 - typed, durable, at-least-once mailbox messages with request/reply correlation;
 - parent, scoped-peer, and child-to-parent routing;
 - explicit task graph with atomic claims and structured results;
-- hierarchical declared resources with ownership, shared/mutable borrows, transfer, release, leases, and versioned inspection;
-- capabilities enforced by the coordinator and by child tool-call guards;
+- hierarchical declared resources with workspace-relative paths, ownership, shared/mutable borrows, transfer, release, leases, and versioned inspection;
+- capabilities enforced by the coordinator and by child tool-operation guards at the final filesystem write boundary;
 - exact model/provider/thinking resolution using the caller's in-memory Pi model for inheritance;
 - compact `/agents` status views and a small tool surface;
 - optional Git worktree creation for managed coding children;
@@ -46,9 +46,9 @@ Pi root extension / managed child sessions
 
 ### `Coordinator`
 
-`src/core/coordinator.ts` is synchronous and owns all mutable coordination state. The broker invokes one operation at a time, so a task claim, resource acquisition, transfer, or message send is an atomic state transition. It returns a result plus internal events; it never trusts an agent-supplied sender field.
+`src/core/coordinator.ts` is synchronous and owns all mutable coordination state. The broker invokes one operation at a time, so a task claim, resource acquisition, transfer, or message send is an atomic state transition. It returns a result plus internal events; it never trusts an agent-supplied sender field. The class remains a single transaction boundary intentionally: splitting the maps across services would reintroduce cross-component locking; transport, policy, and Pi-operation guards are kept outside it instead.
 
-The coordinator uses plain serializable state internally. `exportState()`/`restoreState()` are used only for the broker's transaction rollback path and tests. Public records are defensive copies.
+The coordinator uses plain serializable state internally. `exportState()`/`restoreState()` are used only for the broker's transaction rollback path and tests. Public records are defensive copies. Capability ceilings are intersections: explicit peer/resource grants cannot be widened by a child, and an empty explicit peer list means no exception.
 
 ### `BrokerServer` and `FabricClient`
 
@@ -74,11 +74,11 @@ Recovery replays only committed transactions and ignores an incomplete final tra
 - the selected effective thinking level;
 - a session directory under the fabric state directory;
 - scoped coordination tools bound to the child identity;
-- a minimal inline extension for coordination instructions and write/shell guards.
+- guarded Pi built-in operations for resource-authorized file writes and conservative shell access.
 
-A handle owns at most one active `session.prompt()` call. Incoming messages are queued in the broker and then delivered through Pi's `steer`, `followUp`, or a fresh prompt. A clarification request is not awaited by the caller's JavaScript stack: the ask tool records a request and returns `terminate: true`; the child becomes `waiting`; a reply later starts a new prompt. This is the deadlock-free pause/resume path.
+A handle owns at most one active `session.prompt()` call. Incoming messages are queued in the broker and then delivered through Pi's `steer`, `followUp`, or a fresh prompt. Acknowledgement follows host queue acceptance, and an in-flight/accepted ID set makes notification plus inbox replay idempotent within the host process. A clarification request is not awaited by the caller's JavaScript stack: the ask tool records a request and returns `terminate: true`; the child becomes `waiting`; a reply later starts a new prompt. This is the deadlock-free pause/resume path.
 
-Managed children do not load the parent extension set a second time. They retain Pi's built-in tools, project context files, and skills, while the fabric's child-safe inline extension supplies the coordination surface. Arbitrary child extension inheritance is deferred because it can duplicate registrations and reintroduce unsafe orchestration paths.
+Managed children do not load the parent extension set a second time. They retain Pi's built-in tools, project context files, and skills, while the host supplies only the scoped coordination and guarded built-in operations. Arbitrary child extension inheritance is deferred because it can duplicate registrations and reintroduce unsafe orchestration paths.
 
 ### Model routing
 
@@ -96,9 +96,11 @@ explicit spawn override
 
 ### Resources
 
-Resource IDs are opaque strings, with optional explicit `parentId` links. Two resources overlap when they are equal or one is an ancestor of the other. An owner is a semantic authority, not an active lock. A mutable holder is exclusive across an overlapping hierarchy; shared holders conflict with a mutable holder but may coexist with one another. Waiting mutable requests are FIFO per resource and are granted by the coordinator after release/recovery.
+Resource IDs are opaque strings, with optional explicit `parentId` links and workspace-relative `path` declarations. Two resources overlap when they are equal or one is an ancestor of the other; declared file/module paths also establish overlap when links are omitted. An owner is a semantic authority, not an active lock: even the owner must hold a mutable borrow for a guarded file write. A mutable holder is exclusive across an overlapping hierarchy; shared holders conflict with a mutable holder but may coexist with one another. A holder cannot retain a shared lease while acquiring a mutable lease. Waiting requests are globally ordered by enqueue time across overlapping resources and are granted by the coordinator after release/recovery.
 
 Each active hold has a lease. Hosts heartbeat while a session is active; the broker also reclaims expired leases. A process disconnect or terminal agent state releases runtime holds and wakes waiters. Resource `version` increments on mutable release/transfer, and `snapshot` returns a stable version token for stale-dependency checks.
+
+Managed `edit`/`write` tools use Pi's operation override to call `resource.check_write` immediately before the final filesystem write. The target must be inside the managed workspace and match a declared file/module path. Shared-workspace shell uses a conservative read-only allowlist; a worktree shell is explicitly trusted and isolated by the Git worktree convention, so it is documented as a semantic escape hatch rather than a mechanically resource-guarded mutation path.
 
 ### Workspaces
 
@@ -110,13 +112,13 @@ Each active hold has a lease. Hosts heartbeat while a session is active; the bro
 2. The broker validates the connection actor and operation against the coordinator's current state.
 3. For mutations, the coordinator applies the operation, the server persists its event batch, and only then broadcasts derived notifications.
 4. A notification causes a relevant recipient host to enqueue a compact custom message; unrelated agents see nothing.
-5. A recipient acknowledges only after Pi has accepted the message into its mailbox/queue. Reconnect syncs anything still unacknowledged.
+5. A recipient acknowledges only after Pi has accepted the message into its mailbox/queue. Reconnect syncs anything still unacknowledged, and duplicate delivery attempts reuse the host's accepted-ID state.
 6. Root UI status reads a bounded projection (`agents`, `tasks`, `resources`, recent messages); full message bodies are fetched only on request.
 
 ## Failure behavior
 
 - model lookup/auth/session creation failure: child spawn fails and the coordinator-created identity is cancelled/released;
-- broker failure: clients report a structured unavailable error and reconnect without replaying mutations automatically;
+- broker failure: clients report a structured unavailable error and reconnect without replaying mutations automatically; a broker restart preserves pending semantic requests while marking live actors reconnectable for one matching-token reattach;
 - malformed journal tail: committed transactions before the tail remain usable; the tail is ignored and surfaced in diagnostics;
 - child crash: host marks it failed, releases task/resource runtime state, and sends a compact `agent_failed` notice to its parent;
 - parent shutdown: the managed subtree is cancelled, leases are released, and the broker retains bounded audit metadata;
@@ -135,18 +137,18 @@ Each active hold has a lease. Hosts heartbeat while a session is active; the bro
 
 1. A resource has at most one mutable holder across its hierarchy.
 2. A mutable holder cannot coexist with any shared holder across its hierarchy.
-3. An exclusive task has zero or one owner, and claim is atomic.
+3. An exclusive task has zero or one owner, claim is atomic, and completion is an explicit task transition rather than an inference from a model turn.
 4. Transfer is one serialized state transition; observers see either the old or new owner.
 5. Only coordinator-issued actor identity and capabilities authorize mutations.
 6. Message IDs are stable; sends are at-least-once and deduplicable by client key.
 7. Per-sender message sequence is FIFO; no global ordering is promised.
-8. Asking for a reply changes agent state to `waiting`; it never blocks the broker or parent turn.
-9. Expired/dead agent leases are reclaimable and cannot permanently lock resources.
+8. Asking for a reply changes agent state to `waiting`; it never blocks the broker or parent turn, and broker restart does not discard the pending request.
+9. Expired/dead agent leases are reclaimable and cannot permanently lock resources; broker-recovery liveness failures are reconnectable once, while semantic terminal states are not.
 10. Cancellation is idempotent and releases runtime-owned task/resource state.
 11. A child cannot exceed depth, child-count, total-agent, or capability limits.
 12. An explicit model route wins over role/default/inheritance and never silently changes provider.
 13. Model-generated payloads cannot set `from`, capabilities, ownership, or task authorship.
-14. Incoming messages are retained until accepted and acknowledged; busy receivers do not drop them.
+14. Incoming messages are retained until accepted and acknowledged; busy receivers do not drop them, and same-sender inbox replay is ordered by `senderSequence` rather than timestamps or random IDs.
 15. Root status is a bounded projection and does not copy unrelated transcripts into model context.
 
 ## Deferred by design

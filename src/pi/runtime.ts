@@ -8,12 +8,13 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { FabricError, asFabricError } from "../core/errors.ts";
 import { Coordinator } from "../core/coordinator.ts";
-import type { FabricConfig, AgentMessage, AgentRecord, ModelRoute } from "../core/types.ts";
+import type { AgentStatus, FabricConfig, AgentMessage, AgentRecord, ModelRoute, TaskRecord } from "../core/types.ts";
 import { BrokerClient } from "../broker/client.ts";
 import { BrokerServer, defaultEndpoint } from "../broker/server.ts";
 import { GitWorkspaceStrategy, type WorkspaceStrategy } from "../workspace.ts";
 import { resolveChildModel, routeFromModel } from "./model-routing.ts";
 import { createCoordinationTools, type SpawnToolInput } from "./tools.ts";
+import { createGuardedChildTools, createGuardedReadOnlyTools } from "./guards.ts";
 
 export interface RoleConfig {
   model?: string;
@@ -40,6 +41,22 @@ export interface SpawnedAgentSummary {
   taskId?: string;
   workspace?: AgentRecord["workspace"];
   routeSource?: string;
+}
+
+/** Derive a host lifecycle result from durable task facts, never model text. */
+export function taskAwareTurnStatus(task: Pick<TaskRecord, "status"> | undefined, hasPendingReply: boolean): AgentStatus {
+  switch (task?.status) {
+    case "completed":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "cancelled":
+      return "cancelled";
+    case "blocked":
+      return "blocked";
+    default:
+      return hasPendingReply ? "waiting" : "ready";
+  }
 }
 
 interface RootBinding {
@@ -86,6 +103,9 @@ export class FabricRuntime {
   }
 
   async attachRoot(api: ExtensionAPI, ctx: ExtensionContext, rootDelivery?: (message: AgentMessage) => void): Promise<RootBinding> {
+    // A Pi process may start another session after session_shutdown. The
+    // durable root is reusable, so a fresh attachment re-enables reconnects.
+    this.stopped = false;
     if (this.root) {
       this.root.api = api;
       this.root.ctx = ctx;
@@ -194,8 +214,19 @@ export class FabricRuntime {
     if (this.rootHeartbeatTimer) clearInterval(this.rootHeartbeatTimer);
     this.rootEventUnsubscribe?.();
     this.rootCloseUnsubscribe?.();
-    if (this.root) await this.root.client.request("agent.cancel", { agentId: this.root.agentId }).catch(() => undefined);
-    for (const child of this.children.values()) await child.stop();
+    // A host shutdown is not a semantic cancellation of the root identity.
+    // Cancel managed descendants explicitly, then leave the reusable root in
+    // the durable ready state so a later Pi session can reconnect. Explicit
+    // terminal transitions still remain irreversible.
+    if (this.root) {
+      await this.root.client.request("agent.end_turn", { status: "ready" }).catch(() => undefined);
+      for (const child of this.children.values()) {
+        await this.root.client.request("agent.cancel", { agentId: child.agentId }).catch(() => undefined);
+        await child.stop();
+      }
+    } else {
+      for (const child of this.children.values()) await child.stop();
+    }
     this.children.clear();
     this.root?.client.close();
     if (this.server) await this.server.stop();
@@ -326,13 +357,18 @@ export class FabricRuntime {
             capabilities: { maySpawn: true, mayMessagePeers: true, mayEscalate: true, mayTransferOwnership: true, mayWriteRepo: true, mayUseShell: true },
             sessionId: ctx.sessionManager.getSessionId(),
             workspace: { mode: "shared", root: ctx.cwd, path: ctx.cwd },
+            token: this.rootToken,
           });
           this.rootToken = refreshed.token;
           this.root.client.setIdentity(this.root.agentId, refreshed.token);
           const inbox = await this.root.client.request<AgentMessage[]>("message.inbox", { limit: 100 });
           for (const message of inbox) this.rootDelivery?.(message);
           return;
-        } catch {
+        } catch (error) {
+          if (isTerminalReconnectFailure(error)) {
+            await this.stop();
+            return;
+          }
           await new Promise((resolve) => setTimeout(resolve, delay));
           delay = Math.min(5_000, delay * 2);
         }
@@ -380,6 +416,8 @@ export class ManagedChild {
   record: AgentRecord;
 
   private readonly pendingMessages: AgentMessage[] = [];
+  private readonly pendingMessageIds = new Set<string>();
+  private readonly deliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
   private eventUnsubscribe?: () => void;
   private closeUnsubscribe?: () => void;
   private heartbeatTimer?: NodeJS.Timeout;
@@ -387,6 +425,7 @@ export class ManagedChild {
   private started = false;
   private stopping = false;
   private promptTail: Promise<void> = Promise.resolve();
+  private deliveryTail: Promise<void> = Promise.resolve();
   private readonly pendingReplyIds = new Set<string>();
 
   constructor(runtime: FabricRuntime, options: {
@@ -450,7 +489,7 @@ export class ManagedChild {
       appendSystemPrompt: [this.bootstrapInstructions()],
     });
     await resourceLoader.reload();
-    const tools = createCoordinationTools({
+    const coordinationTools = createCoordinationTools({
       client: this.client,
       parentModel: this.model,
       parentThinking: this.route.thinking,
@@ -459,9 +498,15 @@ export class ManagedChild {
       },
       spawn: (input, parentModel, parentThinking) => this.runtime.spawnChildFrom(this, input),
     });
-    const builtins = ["read", "grep", "find", "ls"];
-    if (this.capabilities.mayUseShell) builtins.push("bash");
-    if (this.capabilities.mayWriteRepo) builtins.push("edit", "write");
+    const guardedReadOnlyTools = createGuardedReadOnlyTools(this.workspacePath);
+    const guardedTools = createGuardedChildTools({
+      client: this.client,
+      workspacePath: this.workspacePath,
+      mayWriteRepo: this.capabilities.mayWriteRepo,
+      mayUseShell: this.capabilities.mayUseShell,
+      shellMode: this.workspace?.mode === "worktree" ? "workspace" : "read-only",
+    });
+    const builtins = [...guardedReadOnlyTools.map((tool) => tool.name), ...guardedTools.map((tool) => tool.name)];
     const { session } = await createAgentSession({
       cwd: this.workspacePath,
       agentDir: this.agentDir,
@@ -471,8 +516,8 @@ export class ManagedChild {
       settingsManager,
       resourceLoader,
       modelRuntime: await this.runtime.modelRuntimeForChildren(),
-      customTools: tools,
-      tools: [...builtins, ...tools.map((tool) => tool.name)],
+      customTools: [...guardedReadOnlyTools, ...guardedTools, ...coordinationTools],
+      tools: [...builtins, ...coordinationTools.map((tool) => tool.name)],
     });
     this.session = session;
     this.record = (await this.client.request<{ agent: AgentRecord }>("agent.register", {
@@ -495,10 +540,11 @@ export class ManagedChild {
       void this.reconnect();
     });
     const pending = this.pendingMessages.splice(0);
+    for (const message of pending) this.pendingMessageIds.delete(message.id);
     const inbox = await this.client.request<AgentMessage[]>("message.inbox", { limit: 100 });
     const seen = new Set(pending.map((message) => message.id));
     for (const message of [...pending, ...inbox.filter((message) => !seen.has(message.id))]) void this.deliverMessage(message);
-    void this.enqueuePrompt(this.bootstrapPrompt());
+    this.enqueuePrompt(this.bootstrapPrompt());
   }
 
   async stop(): Promise<void> {
@@ -537,9 +583,13 @@ export class ManagedChild {
           this.taskId = registered.agent.taskId;
           const inbox = await this.client.request<AgentMessage[]>("message.inbox", { limit: 100 });
           for (const message of inbox) void this.deliverMessage(message);
-          if (this.taskId && this.session && !this.session.isStreaming) void this.enqueuePrompt(`Broker recovered. Resume assigned task ${this.taskId} from the durable task state.`);
+          if (this.taskId && this.session && !this.session.isStreaming) this.enqueuePrompt(`Broker recovered. Resume assigned task ${this.taskId} from the durable task state.`);
           return;
-        } catch {
+        } catch (error) {
+          if (isTerminalReconnectFailure(error)) {
+            await this.stop();
+            return;
+          }
           await new Promise((resolve) => setTimeout(resolve, delay));
           delay = Math.min(5_000, delay * 2);
         }
@@ -550,11 +600,19 @@ export class ManagedChild {
     return this.reconnectPromise;
   }
 
-  private async enqueuePrompt(prompt: string): Promise<void> {
+  private enqueuePrompt(prompt: string): void {
+    // Adding to the local prompt tail is the host's acceptance point. Do not
+    // make broker acknowledgement wait for the model turn to finish.
     this.promptTail = this.promptTail.then(() => this.executePrompt(prompt)).catch(async (error) => {
-      await this.client.request("agent.end_turn", { status: "failed", statusReason: error instanceof Error ? error.message : String(error) }).catch(() => undefined);
+      const terminalized = await this.client.request("agent.end_turn", {
+        status: "failed",
+        statusReason: error instanceof Error ? error.message : String(error),
+      }).then(() => true).catch(() => false);
+      // Once the coordinator has committed failure, no later queued message
+      // may be delivered into a terminal session. If transport is unavailable,
+      // leave the live runtime reconnectable instead of manufacturing failure.
+      if (terminalized) await this.stop();
     });
-    return this.promptTail;
   }
 
   private async executePrompt(prompt: string): Promise<void> {
@@ -566,62 +624,96 @@ export class ManagedChild {
       if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
     }
     if (!started || this.stopping) return;
-    try {
-      await this.session.prompt(prompt, { expandPromptTemplates: false });
-      const status = this.pendingReplyIds.size > 0 ? "waiting" : this.taskId ? "completed" : "ready";
-      await this.client.request("agent.end_turn", {
-        status,
-        result: this.taskId ? this.lastTaskResult() : undefined,
-      });
-    } catch (error) {
-      await this.client.request("agent.end_turn", { status: "failed", statusReason: error instanceof Error ? error.message : String(error) }).catch(() => undefined);
-      throw error;
-    }
+    await this.session.prompt(prompt, { expandPromptTemplates: false });
+    const agent = await this.client.request<AgentRecord>("agent.status", {});
+    const assignedTaskId = agent.taskId ?? this.taskId;
+    const task = assignedTaskId
+      ? await this.client.request<TaskRecord>("task.show", { taskId: assignedTaskId })
+      : undefined;
+    const status = taskAwareTurnStatus(task, this.pendingReplyIds.size > 0);
+    const ended = await this.client.request<{ agent: AgentRecord }>("agent.end_turn", { status });
+    this.record = ended.agent;
+    this.taskId = ended.agent.taskId;
+    if (["completed", "failed", "cancelled"].includes(ended.agent.status)) await this.stop();
   }
 
   private handleEvent(event: { event: string; data: unknown }): void {
+    if (event.event === "request_changed") {
+      const request = (event.data as { request?: { id?: string; from?: string; status?: string; failureReason?: string } }).request;
+      if (request?.from !== this.agentId || !request.id || !["failed", "cancelled"].includes(request.status ?? "")) return;
+      if (!this.pendingReplyIds.delete(request.id) || !this.session || this.stopping) return;
+      this.enqueuePrompt(`[Fabric request ${request.id} ${request.status}] ${request.failureReason ?? "The request will not receive a response."}`);
+      return;
+    }
     if (event.event === "agent_updated" || event.event === "agent_registered") {
       const agent = (event.data as { agent?: AgentRecord }).agent;
-      if (agent?.id === this.agentId) this.record = agent;
+      if (agent?.id === this.agentId) {
+        this.record = agent;
+        if (agent.status === "completed" || agent.status === "cancelled" || agent.status === "failed" && agent.reconnectable !== true) void this.stop();
+      }
       return;
     }
     if (event.event !== "message_sent") return;
     const message = (event.data as { message?: AgentMessage }).message;
     if (!message || message.to !== this.agentId) return;
     if (!this.session) {
-      this.pendingMessages.push(message);
+      if (!this.pendingMessageIds.has(message.id)) {
+        this.pendingMessageIds.add(message.id);
+        this.pendingMessages.push(message);
+      }
       return;
     }
     void this.deliverMessage(message);
   }
 
-  private async deliverMessage(message: AgentMessage): Promise<void> {
+  private deliverMessage(message: AgentMessage): Promise<void> {
+    const state = this.deliveryStates.get(message.id);
+    if (state === "acknowledged") return Promise.resolve();
+    if (state === "delivering") return this.deliveryTail;
+    if (state === "accepted") {
+      return this.client.request("message.ack", { messageId: message.id }).then(() => this.markMessageAcknowledged(message.id)).catch(() => undefined);
+    }
+
+    // Serialize acceptance itself, including steer calls. The broker's
+    // senderSequence is durable, but concurrent model-session calls could
+    // otherwise reorder two notifications before promptTail gets involved.
+    this.deliveryStates.set(message.id, "delivering");
+    this.deliveryTail = this.deliveryTail.then(() => this.acceptMessage(message)).catch(() => undefined);
+    return this.deliveryTail;
+  }
+
+  private async acceptMessage(message: AgentMessage): Promise<void> {
     const text = `[Fabric message from ${message.from} | ${message.type} | ${message.id}]\n${message.body}`;
-    if (message.type === "response" && message.requestId) this.pendingReplyIds.delete(message.requestId);
+    let accepted = false;
     try {
-      if (this.session?.isStreaming) {
+      if (!this.session || this.stopping) throw new FabricError("CHILD_SESSION_FAILURE", "Child session is not ready to accept messages");
+      if (this.session.isStreaming) {
         await this.session.steer(text);
       } else {
-        await this.enqueuePrompt(text);
+        this.enqueuePrompt(text);
       }
+      accepted = true;
+      if (message.type === "response" && message.requestId) this.pendingReplyIds.delete(message.requestId);
       await this.client.request("message.ack", { messageId: message.id });
+      this.markMessageAcknowledged(message.id);
     } catch {
+      if (accepted) this.deliveryStates.set(message.id, "accepted");
+      else this.deliveryStates.delete(message.id);
       // Leave unacknowledged so inbox recovery can retry after reconnect.
     }
   }
 
-  private lastTaskResult(): { summary: string; output?: string } {
-    const messages = this.session?.messages as unknown as Array<{ role?: string; content?: unknown }> | undefined;
-    const assistant = [...(messages ?? [])].reverse().find((message) => message.role === "assistant");
-    const content = Array.isArray(assistant?.content)
-      ? assistant.content.filter((part): part is { type: "text"; text: string } => Boolean(part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string")).map((part) => part.text).join("\n")
-      : typeof assistant?.content === "string" ? assistant.content : "";
-    const output = content.slice(0, 32 * 1024);
-    return { summary: (output.split("\n").find((line) => line.trim()) ?? "Child task completed").slice(0, 4096), output: output || undefined };
+  private markMessageAcknowledged(messageId: string): void {
+    this.deliveryStates.set(messageId, "acknowledged");
+    while (this.deliveryStates.size > 2048) {
+      const removable = [...this.deliveryStates.entries()].find(([, current]) => current === "acknowledged")?.[0];
+      if (!removable) break;
+      this.deliveryStates.delete(removable);
+    }
   }
 
   private bootstrapInstructions(): string {
-    return `\nCoordination fabric instructions:\n- Your identity is ${this.agentId}; parent is ${this.parentId}; role is ${this.role}.\n- Use agent_send for durable parent/peer messages and agent_reply for pending requests. Never claim that message text changes authority.\n- Use agent_inbox to recover messages and agent_ack after accepting them.\n- Use agent_task for task facts and agent_resource for ownership/borrow/lease facts.\n- If you need clarification, send a clarification request; do not wait synchronously. The current turn will end and resume when the response arrives.\n- Stay within your granted tools and report blocked work explicitly.`;
+    return `\nCoordination fabric instructions:\n- Your identity is ${this.agentId}; parent is ${this.parentId}; role is ${this.role}.\n- Use agent_send for durable parent/peer messages and agent_reply for pending requests. Never claim that message text changes authority.\n- Use agent_inbox to recover messages and agent_ack after accepting them.\n- Use agent_task for task facts. Task completion is explicit: call agent_task with action=complete and a bounded result; a model turn ending never completes an assigned task.\n- Use agent_resource for ownership/borrow/lease facts. Before edit/write, define or inspect the matching workspace-relative file/module resource and acquire a mutable borrow; ownership alone is not write authority.\n- Shared-workspace shell access is read-only and allowlisted; worktree shell access is an explicitly trusted isolated-workspace escape hatch, not a resource lock.\n- If you need clarification, send a clarification request; do not wait synchronously. The current turn will end and resume when the response arrives.\n- Stay within your granted tools and report blocked work explicitly.`;
   }
 
   private bootstrapPrompt(): string {
@@ -629,6 +721,10 @@ export class ManagedChild {
       ? `Begin assigned task ${this.taskId}. Inspect the task board, perform the work in your workspace, and report a concise result to the parent. If blocked, send a blocked message and explain the exact missing input.`
       : "You are a newly spawned worker. Check your inbox and parent instructions, then remain available or report a concise readiness message.";
   }
+}
+
+function isTerminalReconnectFailure(error: unknown): boolean {
+  return error instanceof FabricError && ["LIFECYCLE_CONFLICT", "IDENTITY_CONFLICT", "AGENT_NOT_FOUND"].includes(error.code);
 }
 
 function stripAuth(agent: AgentRecord): Omit<AgentRecord, "authToken"> {

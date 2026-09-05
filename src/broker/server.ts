@@ -120,6 +120,7 @@ export class BrokerServer {
   private readonly server = net.createServer((socket) => this.accept(socket));
   private readonly connections = new Set<BrokerConnection>();
   private readonly requestCache = new Map<string, ResponseFrame>();
+  private readonly inFlightRequests = new Map<string, Promise<ResponseFrame>>();
   private readonly requestOrder: string[] = [];
   private operationTail: Promise<void> = Promise.resolve();
   private readonly maintenanceMs: number;
@@ -138,6 +139,9 @@ export class BrokerServer {
 
   async start(): Promise<void> {
     if (this.started) return;
+    this.requestCache.clear();
+    this.inFlightRequests.clear();
+    this.requestOrder.length = 0;
     await this.acquireLock();
     try {
       await this.journal.replay(this.coordinator);
@@ -215,8 +219,8 @@ export class BrokerServer {
       connection.send({ kind: "error", version: PROTOCOL_VERSION, error: new FabricError("BROKER_UNAVAILABLE", "Broker is stopping").toJSON() });
       return;
     }
-    const request = frame as Partial<RequestFrame>;
-    if (typeof request.id !== "string" || request.id.length === 0 || request.id.length > 512 || typeof request.op !== "string" || request.op.length === 0 || request.op.length > 128 || request.version !== PROTOCOL_VERSION) {
+    const request = frame && typeof frame === "object" && !Array.isArray(frame) ? frame as Partial<RequestFrame> : {};
+    if (typeof request.id !== "string" || request.id.length === 0 || request.id.length > 512 || request.id.includes("\u0000") || typeof request.op !== "string" || request.op.length === 0 || request.op.length > 128 || request.op.includes("\u0000") || request.version !== PROTOCOL_VERSION) {
       connection.send({ kind: "error", version: PROTOCOL_VERSION, error: new FabricError("PROTOCOL_VERSION_UNSUPPORTED", "request must include protocol version 1, bounded id/op, and op").toJSON() });
       return;
     }
@@ -226,13 +230,23 @@ export class BrokerServer {
       connection.send(cached);
       return;
     }
+    const inFlight = this.inFlightRequests.get(key);
+    if (inFlight) {
+      void inFlight.then((response) => connection.send(response), () => undefined);
+      return;
+    }
     const normalized: RequestFrame = { id: request.id, version: request.version, op: request.op, args: request.args ?? {} };
-    this.operationTail = this.operationTail.then(() => this.handleRequest(connection, normalized, key)).catch(() => undefined);
+    const flight = this.operationTail.then(() => this.handleRequest(connection, normalized, key));
+    this.inFlightRequests.set(key, flight);
+    this.operationTail = flight.then(() => undefined, () => undefined);
+    void flight.then((response) => connection.send(response), () => undefined).finally(() => {
+      if (this.inFlightRequests.get(key) === flight) this.inFlightRequests.delete(key);
+    });
   }
 
   private handleHello(connection: BrokerConnection, frame: unknown): void {
-    const hello = frame as Partial<HelloFrame>;
-    if (hello.kind !== "hello" || hello.version !== PROTOCOL_VERSION || typeof hello.agentId !== "string" || hello.agentId.length === 0 || hello.agentId.length > 512 || (hello.token !== undefined && (typeof hello.token !== "string" || hello.token.length > 512))) {
+    const hello = frame && typeof frame === "object" && !Array.isArray(frame) ? frame as Partial<HelloFrame> : {};
+    if (hello.kind !== "hello" || hello.version !== PROTOCOL_VERSION || typeof hello.agentId !== "string" || hello.agentId.length === 0 || hello.agentId.length > 512 || hello.agentId.includes("\u0000") || (hello.token !== undefined && (typeof hello.token !== "string" || hello.token.length > 512 || hello.token.includes("\u0000")))) {
       connection.send({ kind: "hello", version: PROTOCOL_VERSION, ok: false, error: new FabricError("PROTOCOL_VERSION_UNSUPPORTED", "expected a version 1 hello frame").toJSON() });
       connection.close();
       return;
@@ -247,9 +261,11 @@ export class BrokerServer {
     connection.send({ kind: "hello", version: PROTOCOL_VERSION, ok: true });
   }
 
-  private async handleRequest(connection: BrokerConnection, request: RequestFrame, cacheKey: string): Promise<void> {
+  private async handleRequest(connection: BrokerConnection, request: RequestFrame, cacheKey: string): Promise<ResponseFrame> {
     const actorId = connection.actorId;
-    if (!actorId) return;
+    if (!actorId) {
+      return { id: request.id, version: PROTOCOL_VERSION, ok: false, error: new FabricError("IDENTITY_CONFLICT", "connection is not authenticated").toJSON() };
+    }
     const before = this.coordinator.exportState();
     let response: ResponseFrame;
     try {
@@ -268,7 +284,7 @@ export class BrokerServer {
       response = { id: request.id, version: PROTOCOL_VERSION, ok: false, error: asFabricError(error, "PERSISTENCE_FAILURE").toJSON() };
     }
     this.cacheResponse(cacheKey, response);
-    connection.send(response);
+    return response;
   }
 
   private enqueueMaintenance(): void {
@@ -311,7 +327,7 @@ export class BrokerServer {
       case "request_changed":
         return event.request.from === actorId || event.request.to === actorId || observer.depth === 0;
       case "resource_changed":
-        return observer.depth === 0 || event.resource.owner === actorId || Boolean(event.resource.grants[actorId]) || event.resource.sharedHolds.some((hold) => hold.agentId === actorId) || event.resource.mutableHold?.agentId === actorId || event.resource.waiters.some((waiter) => waiter.agentId === actorId);
+        return observer.depth === 0 || event.resource.owner === actorId || Object.prototype.hasOwnProperty.call(event.resource.grants, actorId) || event.resource.sharedHolds.some((hold) => hold.agentId === actorId) || event.resource.mutableHold?.agentId === actorId || event.resource.waiters.some((waiter) => waiter.agentId === actorId);
       case "task_changed":
         return observer.depth === 0 || event.task.creator === actorId || event.task.owner === actorId || event.task.owner === observer.parentId;
       case "agent_registered":

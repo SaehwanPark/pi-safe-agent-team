@@ -9,7 +9,7 @@ A local-first Pi extension for recursive, observable multi-agent work with deter
 - explicit provider/model/thinking routing with safe inheritance from the caller's selected model;
 - durable at-least-once parent/peer mailboxes and request/reply without synchronous deadlock;
 - atomic task claims and structured task results;
-- hierarchical ownership, shared/mutable borrows, FIFO waiters, leases, transfer, and snapshots;
+- hierarchical ownership, declared workspace paths, shared/mutable borrows, FIFO waiters, leases, transfer, and snapshots;
 - capability checks for spawning, peer messaging, shell, repository writes, and resources;
 - append-only transaction journal and reconnect recovery;
 - shared workspaces or explicit clean Git worktrees;
@@ -81,10 +81,11 @@ npm run typecheck
 
 ## Safe collaboration rules
 
-- `agent_send` is durable; busy receivers do not lose messages. A message is not acknowledged until the host accepts it.
-- A clarification request returns `terminate: true`; the child becomes `waiting`, and a later `agent_reply` starts a fresh prompt. No parent turn is synchronously blocked.
-- `agent_resource` is authoritative for ownership and borrows. A prompt saying “I own this file” never changes state.
-- A task result is submitted explicitly and is bounded by `maxTaskOutput`.
+- `agent_send` is durable; busy receivers do not lose messages. A message is acknowledged only after the host accepts it into its queue, and duplicate notifications are idempotent.
+- A clarification request returns `terminate: true`; the child becomes `waiting`, and a later `agent_reply` starts a fresh prompt. Pending clarification records survive broker restart; no parent turn is synchronously blocked.
+- `agent_resource` is authoritative for ownership and borrows. A prompt saying “I own this file” never changes state; even the owner must hold a mutable borrow before a guarded file mutation.
+- A task result is submitted explicitly with `agent_task(action=complete, result=...)` and is bounded by `maxTaskOutput`; a model turn ending never completes an assigned task.
+- Managed child `read`/`grep`/`find`/`ls` tools are workspace-scoped; `edit`/`write` tools also resolve their target against a declared workspace-relative file/module resource and call the coordinator at the actual filesystem write boundary. Shared-workspace shell is a conservative read-only allowlist with workspace-relative arguments; worktree shell is explicitly trusted and isolated only by the Git worktree.
 - Model inheritance means the caller's actual in-memory `provider/model` object. Missing or excluded explicit routes fail closed.
 - Dirty worktrees are never silently deleted.
 
@@ -117,7 +118,7 @@ See [`docs/configuration.md`](docs/configuration.md) for limits, role routes, en
 
 ## Status
 
-The deterministic coordinator, journal, local broker, model-routing adapter, workspace strategy, Pi extension surface, and initial tests are implemented. The roadmap remains the source of truth for hardening and additional integration coverage; this is not a claim of production-distributed orchestration.
+The deterministic coordinator, journal, local broker, model-routing adapter, guarded workspace mutation boundary, Pi extension surface, and adversarial hardening tests are implemented. The roadmap remains the source of truth for additional integration coverage; this is not a claim of production-distributed orchestration.
 
 ## License
 

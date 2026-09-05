@@ -11,7 +11,8 @@ export { resolveRoute, routeId } from "./src/core/routing.ts";
 export { BrokerClient } from "./src/broker/client.ts";
 export { BrokerServer, startBroker } from "./src/broker/server.ts";
 export { Journal } from "./src/broker/journal.ts";
-export { FabricRuntime, ManagedChild } from "./src/pi/runtime.ts";
+export { FabricRuntime, ManagedChild, taskAwareTurnStatus } from "./src/pi/runtime.ts";
+export { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, workspaceRelativePath } from "./src/pi/guards.ts";
 export { GitWorkspaceStrategy, SharedWorkspaceStrategy } from "./src/workspace.ts";
 export * from "./src/core/types.ts";
 
@@ -46,14 +47,43 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     return box;
   });
 
+  const rootDeliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
+  let rootDeliveryTail: Promise<void> = Promise.resolve();
   const rootDelivery = (api: ExtensionAPI) => (message: AgentMessage): void => {
-    const content = `[${message.type} from ${message.from}]\n${message.body}`;
-    api.sendMessage({ customType: "safe-agents.message", content, display: true, details: message }, {
-      triggerTurn: true,
-      deliverAs: message.priority === "urgent" ? "steer" : "followUp",
-    });
-    void runtime.request("message.ack", { messageId: message.id }).catch(() => undefined);
+    const state = rootDeliveryStates.get(message.id);
+    if (state === "acknowledged" || state === "delivering") return;
+    if (state === "accepted") {
+      void runtime.request("message.ack", { messageId: message.id }).then(() => rememberRootMessage(message.id, "acknowledged")).catch(() => undefined);
+      return;
+    }
+    rootDeliveryStates.set(message.id, "delivering");
+    // Preserve broker order at the host boundary too. In particular, two
+    // urgent messages must not race through api.sendMessage and reach the
+    // root model in the reverse order.
+    rootDeliveryTail = rootDeliveryTail.then(async () => {
+      try {
+        const content = `[${message.type} from ${message.from}]\n${message.body}`;
+        await api.sendMessage({ customType: "safe-agents.message", content, display: true, details: message }, {
+          triggerTurn: true,
+          deliverAs: message.priority === "urgent" ? "steer" : "followUp",
+        });
+        rememberRootMessage(message.id, "accepted");
+        await runtime.request("message.ack", { messageId: message.id });
+        rememberRootMessage(message.id, "acknowledged");
+      } catch {
+        rootDeliveryStates.delete(message.id);
+      }
+    }).catch(() => undefined);
   };
+
+  function rememberRootMessage(messageId: string, state: "accepted" | "acknowledged"): void {
+    rootDeliveryStates.set(messageId, state);
+    while (rootDeliveryStates.size > 2048) {
+      const removable = [...rootDeliveryStates.entries()].find(([, current]) => current === "acknowledged")?.[0];
+      if (!removable) break;
+      rootDeliveryStates.delete(removable);
+    }
+  }
 
   pi.on("session_start", async (_event, ctx) => {
     try {

@@ -51,6 +51,7 @@ const sharedResourceFields = {
   permissions: Type.Optional(Type.Array(Type.String())),
   kind: Type.Optional(Type.String()),
   parentId: Type.Optional(Type.String()),
+  path: Type.Optional(Type.String({ description: "Workspace-relative file path or module directory guarded by mutable borrows" })),
   version: Type.Optional(Type.Number()),
 };
 

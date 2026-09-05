@@ -108,6 +108,7 @@ const ALL_MESSAGE_TYPES = new Set<MessageType>([
   "steer",
   "agent_failed",
 ]);
+const INTERNAL_MESSAGE_TYPES = new Set<MessageType>(["agent_failed", "resource_granted"]);
 const ALL_RESOURCE_PERMISSIONS = new Set<ResourcePermission>(["read", "comment", "write", "test"]);
 const ALL_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
@@ -134,8 +135,17 @@ function defaultCapabilities(): AgentCapabilities {
 
 function mergeCapabilities(requested: Partial<AgentCapabilities> | undefined, parent?: AgentCapabilities): AgentCapabilities {
   const base = defaultCapabilities();
-  if (requested?.peerIds !== undefined) assertCondition(Array.isArray(requested.peerIds), "INVALID_ARGUMENT", "peerIds must be an array");
-  if (requested?.resourceGrants !== undefined) assertCondition(Boolean(requested.resourceGrants) && typeof requested.resourceGrants === "object" && !Array.isArray(requested.resourceGrants), "INVALID_ARGUMENT", "resourceGrants must be an object");
+  if (requested !== undefined) assertCondition(Boolean(requested) && typeof requested === "object" && !Array.isArray(requested), "INVALID_ARGUMENT", "capabilities must be an object");
+  for (const key of ["maySpawn", "mayMessagePeers", "mayEscalate", "mayTransferOwnership", "mayWriteRepo", "mayUseShell"] as const) {
+    if (requested?.[key] !== undefined) assertCondition(typeof requested[key] === "boolean", "INVALID_ARGUMENT", `${key} must be a boolean`);
+  }
+  if (requested?.peerIds !== undefined) {
+    assertCondition(Array.isArray(requested.peerIds), "INVALID_ARGUMENT", "peerIds must be an array");
+    for (const peerId of requested.peerIds) parseAgentId(peerId, "peerIds[]");
+  }
+  if (requested?.resourceGrants !== undefined) {
+    assertCondition(Boolean(requested.resourceGrants) && typeof requested.resourceGrants === "object" && !Array.isArray(requested.resourceGrants), "INVALID_ARGUMENT", "resourceGrants must be an object");
+  }
   const ceiling = parent ?? {
     maySpawn: true,
     mayMessagePeers: true,
@@ -153,18 +163,54 @@ function mergeCapabilities(requested: Partial<AgentCapabilities> | undefined, pa
     mayTransferOwnership: Boolean(requested?.mayTransferOwnership && ceiling.mayTransferOwnership),
     mayWriteRepo: Boolean(requested?.mayWriteRepo && ceiling.mayWriteRepo),
     mayUseShell: Boolean(requested?.mayUseShell && ceiling.mayUseShell),
-    peerIds: (requested?.peerIds ?? []).filter((id) => ceiling.peerIds.length === 0 || ceiling.peerIds.includes(id)),
+    // An empty explicit list means no explicit exceptions. Only a root may
+    // establish the initial list; descendants can receive a strict subset.
+    peerIds: parent
+      ? [...new Set((requested?.peerIds ?? []).filter((id) => parent.peerIds.includes(id)))]
+      : [...new Set(requested?.peerIds ?? [])],
     resourceGrants: {},
   };
-  for (const [resourceId, permissions] of Object.entries(requested?.resourceGrants ?? {})) {
-    result.resourceGrants[resourceId] = permissions.filter((permission) => ALL_RESOURCE_PERMISSIONS.has(permission));
+  for (const [resourceId, rawPermissions] of Object.entries(requested?.resourceGrants ?? {})) {
+    assertCondition(Array.isArray(rawPermissions), "INVALID_ARGUMENT", `resourceGrants.${resourceId} must be an array`);
+    const permissions = rawPermissions.map((permission) => {
+      assertCondition(typeof permission === "string" && ALL_RESOURCE_PERMISSIONS.has(permission as ResourcePermission), "INVALID_ARGUMENT", `Unknown resource permission ${String(permission)}`);
+      return permission as ResourcePermission;
+    });
+    const ceilingPermissions = parent && hasOwn(parent.resourceGrants, resourceId) ? parent.resourceGrants[resourceId] : undefined;
+    const boundedPermissions = [...new Set(parent
+      ? permissions.filter((permission) => ceilingPermissions?.includes(permission))
+      : permissions)];
+    if (boundedPermissions.length > 0) Object.defineProperty(result.resourceGrants, resourceId, { value: boundedPermissions, enumerable: true, configurable: true, writable: true });
   }
   return { ...base, ...result };
 }
 
+function normalizeResourcePath(value: unknown, name = "path"): string {
+  const raw = parseString(value, name, 4096).replaceAll("\\", "/");
+  assertCondition(!raw.startsWith("/") && !/^[A-Za-z]:/.test(raw), "INVALID_ARGUMENT", `${name} must be workspace-relative`);
+  const parts = raw.split("/").filter((part) => part.length > 0 && part !== ".");
+  assertCondition(parts.length > 0 && !parts.includes(".."), "INVALID_ARGUMENT", `${name} must not escape the workspace`);
+  const normalized = parts.join("/");
+  // Windows workspace paths are case-insensitive even when the declared
+  // resource spelling is not. Canonicalize the policy key so casing cannot
+  // bypass a matching file resource.
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
 function parseString(value: unknown, name: string, maxLength = 512): string {
   assertCondition(typeof value === "string" && value.length > 0 && value.length <= maxLength, "INVALID_ARGUMENT", `${name} must be a non-empty string of at most ${maxLength} characters`);
+  assertCondition(!value.includes("\u0000"), "INVALID_ARGUMENT", `${name} must not contain a NUL character`);
   return value;
+}
+
+function parseAgentId(value: unknown, name = "agentId"): string {
+  const id = parseString(value, name);
+  assertCondition(!["__proto__", "constructor", "prototype"].includes(id), "INVALID_ARGUMENT", `${name} uses a reserved identity key`);
+  return id;
+}
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
 }
 
 function parseOptionalString(value: unknown, name: string, maxLength = 512): string | undefined {
@@ -191,6 +237,21 @@ function parseMetadata(value: unknown): Record<string, unknown> | undefined {
   }
 }
 
+function parseWorkspace(value: unknown): AgentRecord["workspace"] | undefined {
+  if (value === undefined) return undefined;
+  assertCondition(Boolean(value) && typeof value === "object" && !Array.isArray(value), "INVALID_ARGUMENT", "workspace must be an object");
+  const workspace = value as Record<string, unknown>;
+  const mode = workspace.mode;
+  assertCondition(mode === "shared" || mode === "worktree", "INVALID_ARGUMENT", "workspace.mode must be shared or worktree");
+  return {
+    mode,
+    root: parseString(workspace.root, "workspace.root", 4096),
+    path: parseString(workspace.path, "workspace.path", 4096),
+    baseRef: workspace.baseRef === undefined ? undefined : parseString(workspace.baseRef, "workspace.baseRef", 512),
+    branch: workspace.branch === undefined ? undefined : parseString(workspace.branch, "workspace.branch", 512),
+  };
+}
+
 function cloneConfig(config: FabricConfig): FabricConfig {
   return { ...config };
 }
@@ -209,6 +270,8 @@ export class Coordinator {
   private requests = new Map<RequestId, RequestRecord>();
   private dedupe = new Map<string, string>();
   private nextMessageSequence = new Map<AgentId, number>();
+  private nextBrokerSequence = 0;
+  private nextResourceWaiterSequence = 0;
 
   constructor(options: CoordinatorOptions) {
     this.rootId = parseString(options.rootId, "rootId");
@@ -225,14 +288,17 @@ export class Coordinator {
     assertCondition(this.config.maxConcurrentAgents > 0, "INVALID_ARGUMENT", "maxConcurrentAgents must be positive");
     assertCondition(this.config.maxMailboxMessages > 0, "INVALID_ARGUMENT", "maxMailboxMessages must be positive");
     assertCondition(this.config.maxMessageBody > 0, "INVALID_ARGUMENT", "maxMessageBody must be positive");
+    assertCondition(this.config.maxTaskOutput > 0, "INVALID_ARGUMENT", "maxTaskOutput must be positive");
     assertCondition(this.config.messageRetention > 0, "INVALID_ARGUMENT", "messageRetention must be positive");
     assertCondition(this.config.leaseMs > 0, "INVALID_ARGUMENT", "leaseMs must be positive");
+    assertCondition(this.config.heartbeatMs > 0, "INVALID_ARGUMENT", "heartbeatMs must be positive");
   }
 
   /** Apply a protocol operation as one synchronous, atomic state transition. */
   dispatch(actorId: AgentId | undefined, operation: string, args: Record<string, unknown> = {}): DispatchResult<any> {
     const before = this.exportState();
     const events: CoordinatorEvent[] = [];
+    assertCondition(Boolean(args) && typeof args === "object" && !Array.isArray(args), "INVALID_ARGUMENT", "operation args must be an object");
     this.reclaimExpired(this.clock(), events);
 
     try {
@@ -248,7 +314,7 @@ export class Coordinator {
       case "agent.begin_turn":
         return this.withEvents(events, this.beginTurn(this.requireActor(actorId).id, events));
       case "agent.end_turn":
-        return this.withEvents(events, this.endTurn(this.requireActor(actorId).id, args, events));
+        return this.withEvents(events, this.endTurn(this.requireBoundAgent(actorId).id, args, events));
       case "agent.heartbeat":
         return this.withEvents(events, this.heartbeat(this.requireActor(actorId).id, events));
       case "agent.cancel":
@@ -310,29 +376,42 @@ export class Coordinator {
   }
 
   registerAgent(actorId: AgentId | undefined, input: RegisterAgentArgs, events: CoordinatorEvent[] = []): { agent: Omit<AgentRecord, "authToken">; token: string } {
-    const id = parseString(actorId, "agentId");
+    const id = parseAgentId(actorId);
+    assertCondition(id !== "broker", "IDENTITY_CONFLICT", "The broker identity is reserved");
+    const rootId = parseString(input.rootId, "rootId");
+    const parentId = input.parentId === undefined ? undefined : parseAgentId(input.parentId, "parentId");
+    const taskId = input.taskId === undefined ? undefined : parseString(input.taskId, "taskId");
+    const sessionId = parseOptionalString(input.sessionId, "sessionId");
+    const token = input.token === undefined ? undefined : parseString(input.token, "token");
+    const role = parseOptionalString(input.role, "role", 128);
     const now = this.clock();
     const route = this.validateRoute(input.route);
+    const workspace = parseWorkspace(input.workspace);
     const existing = this.agents.get(id);
 
     if (existing) {
-      if (existing.authToken && input.token !== existing.authToken) {
-        throw new FabricError("IDENTITY_CONFLICT", `Agent ${id} has a different reconnect credential`);
-      }
-      if (input.parentId && input.parentId !== existing.parentId) {
+      assertCondition(Boolean(existing.authToken) && token === existing.authToken, "IDENTITY_CONFLICT", `Agent ${id} requires its reconnect credential`);
+      if (parentId && parentId !== existing.parentId) {
         throw new FabricError("IDENTITY_CONFLICT", `Agent ${id} cannot change parent identity`);
       }
-      if (input.rootId && input.rootId !== this.rootId) {
+      if (rootId !== this.rootId) {
         throw new FabricError("IDENTITY_CONFLICT", `Agent ${id} belongs to another fabric`);
       }
+      assertCondition(!isTerminal(existing.status) || existing.reconnectable === true, "LIFECYCLE_CONFLICT", `Agent ${id} is terminal and cannot reconnect`);
       const next = cloneAgent(existing);
-      if (isTerminal(next.status)) next.status = "ready";
-      if (next.status === "starting") next.status = "ready";
+      if (!next.authToken) next.authToken = token ?? this.idFactory("token");
+      if (next.reconnectable) {
+        assertCondition(next.status === "failed", "LIFECYCLE_CONFLICT", `Agent ${id} has an invalid recovery state`);
+        next.status = "ready";
+        next.reconnectable = false;
+      } else if (next.status === "starting") {
+        next.status = "ready";
+      }
       next.statusReason = undefined;
       next.lastActivity = now;
-      next.sessionId = input.sessionId ?? next.sessionId;
-      next.workspace = input.workspace ?? next.workspace;
-      assertCondition(input.taskId === undefined || input.taskId === next.taskId, "IDENTITY_CONFLICT", `Agent ${id} cannot change its assigned task`);
+      next.sessionId = sessionId ?? next.sessionId;
+      next.workspace = workspace ?? next.workspace;
+      assertCondition(taskId === undefined || taskId === next.taskId, "IDENTITY_CONFLICT", `Agent ${id} cannot change its assigned task`);
       if (next.taskId) {
         const task = this.tasks.get(next.taskId);
         if (!task || task.owner && task.owner !== id || task && isTaskTerminal(task.status)) {
@@ -353,13 +432,16 @@ export class Coordinator {
       return { agent: publicAgent(next), token: next.authToken as string };
     }
 
-    assertCondition(input.rootId === this.rootId, "IDENTITY_CONFLICT", `Agent ${id} must register with fabric ${this.rootId}`);
-    if (!input.parentId) {
+    assertCondition(rootId === this.rootId, "IDENTITY_CONFLICT", `Agent ${id} must register with fabric ${this.rootId}`);
+    assertCondition(taskId === undefined, "IDENTITY_CONFLICT", "A new agent cannot self-assign a task; use agent.spawn or task.claim");
+    if (!parentId) {
       assertCondition(!this.rootAgentId || id === this.rootAgentId, "IDENTITY_CONFLICT", `Only root agent ${this.rootAgentId ?? "the configured root"} may register without a parent`);
       assertCondition(![...this.agents.values()].some((agent) => !agent.parentId), "IDENTITY_CONFLICT", "The fabric already has a root agent");
     }
-    const parent = input.parentId ? this.requireAgent(input.parentId) : undefined;
-    const depth = parent ? parent.depth + 1 : input.depth ?? 0;
+    const parent = parentId ? this.requireAgent(parentId) : undefined;
+    const depth = parent ? parent.depth + 1 : parseNumber(input.depth, "depth", 0);
+    assertCondition(Number.isInteger(depth), "INVALID_ARGUMENT", "depth must be an integer");
+    assertCondition(parent || depth === 0, "IDENTITY_CONFLICT", "A root agent must have depth 0");
     assertCondition(depth >= 0 && depth <= this.config.maxDepth, "AGENT_LIMIT_REACHED", `Agent depth ${depth} exceeds maxDepth ${this.config.maxDepth}`);
     assertCondition(this.activeAgentCount() < this.config.maxTotalAgents, "AGENT_LIMIT_REACHED", "The fabric has reached maxTotalAgents");
     if (parent) {
@@ -368,21 +450,24 @@ export class Coordinator {
       assertCondition(depth === parent.depth + 1, "IDENTITY_CONFLICT", "Child depth must be parent depth plus one");
     }
 
+    const initialStatus = input.initialStatus ?? "ready";
+    assertCondition(initialStatus === "starting" || initialStatus === "ready", "INVALID_ARGUMENT", "initialStatus must be starting or ready");
     const record: AgentRecord = {
       id,
       rootId: this.rootId,
       parentId: parent?.id,
       depth,
-      role: parseOptionalString(input.role, "role", 128) ?? "agent",
+      role: role ?? "agent",
       route,
       capabilities: mergeCapabilities(input.capabilities, parent?.capabilities),
-      status: input.initialStatus ?? "ready",
-      sessionId: input.sessionId,
-      workspace: input.workspace,
+      status: initialStatus,
+      sessionId,
+      workspace,
       createdAt: now,
       lastActivity: now,
       childrenCreated: 0,
-      authToken: input.token ?? this.idFactory("token"),
+      authToken: token ?? this.idFactory("token"),
+      reconnectable: false,
     };
     this.agents.set(id, record);
     this.nextMessageSequence.set(id, 0);
@@ -426,7 +511,9 @@ export class Coordinator {
       }, events).value.id as TaskId;
     } else if (taskId) {
       const task = this.requireTask(taskId);
-      assertCondition(!task.owner || task.owner === result.agent.id, "TASK_BUSY", `Task ${taskId} already has an owner`);
+      const currentOwner = task.owner ? this.requireAgent(task.owner) : undefined;
+      assertCondition(!isTaskTerminal(task.status), "TASK_BUSY", `Task ${taskId} is already ${task.status}`);
+      assertCondition(!currentOwner || isTerminal(currentOwner.status) || currentOwner.id === result.agent.id, "TASK_BUSY", `Task ${taskId} already has an owner`);
       assertCondition(this.taskDependenciesCompleted(task), "TASK_BLOCKED", `Task ${taskId} dependencies are not complete`);
       task.owner = result.agent.id;
       task.status = "active";
@@ -448,12 +535,12 @@ export class Coordinator {
     assertCondition(actor.capabilities.maySpawn, "CAPABILITY_DENIED", `Agent ${actorId} cannot configure children`);
     assertCondition(this.canControl(actor, target) && target.parentId === actorId, "CAPABILITY_DENIED", `Agent ${actorId} cannot configure child ${target.id}`);
     const next = cloneAgent(target);
-    if (args.workspace !== undefined) next.workspace = args.workspace as AgentRecord["workspace"];
     if (args.sessionId !== undefined) next.sessionId = parseString(args.sessionId, "sessionId", 512);
+    if (args.workspace !== undefined) next.workspace = parseWorkspace(args.workspace);
     next.lastActivity = this.clock();
     this.agents.set(target.id, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
-    return cloneAgent(next);
+    return publicAgent(next);
   }
 
   private updateAgent(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): AgentRecord {
@@ -467,13 +554,13 @@ export class Coordinator {
       throw new FabricError("LIFECYCLE_CONFLICT", "Use agent.end_turn for terminal transitions so runtime claims are released");
     }
     if (requestedStatus) this.transitionStatus(next, requestedStatus, parseOptionalString(args.statusReason, "statusReason", 2048));
-    if (args.taskId !== undefined) next.taskId = parseOptionalString(args.taskId, "taskId");
+    assertCondition(args.taskId === undefined, "IDENTITY_CONFLICT", "Use task.claim or task.update to change task ownership");
     if (args.route !== undefined) next.route = this.validateRoute(args.route as ModelRoute);
-    if (args.workspace !== undefined) next.workspace = args.workspace as AgentRecord["workspace"];
+    if (args.workspace !== undefined) next.workspace = parseWorkspace(args.workspace);
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
-    return cloneAgent(next);
+    return publicAgent(next);
   }
 
   private beginTurn(actorId: AgentId, events: CoordinatorEvent[]): { started: boolean; reason?: string } {
@@ -495,31 +582,51 @@ export class Coordinator {
   private endTurn(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): { agent: AgentRecord; task?: TaskRecord } {
     const agent = this.requireAgent(actorId);
     const requested = (args.status as AgentStatus | undefined) ?? "ready";
+    assertCondition(!isTerminal(agent.status) || requested === agent.status, "LIFECYCLE_CONFLICT", `Agent ${actorId} is already ${agent.status}`);
+    if (isTerminal(agent.status)) return { agent: publicAgent(agent), task: agent.taskId ? cloneTask(this.requireTask(agent.taskId)) : undefined };
+
+    // A model turn ending is not a task fact. When a worker has an assigned
+    // task, deterministic task state controls whether its lifecycle may become
+    // terminal; an uncompleted task can only leave the worker ready.
+    const effectiveStatus = this.statusAfterTask(agent, requested);
     const next = cloneAgent(agent);
-    this.transitionStatus(next, requested, parseOptionalString(args.statusReason, "statusReason", 2048));
+    this.transitionStatus(next, effectiveStatus, parseOptionalString(args.statusReason, "statusReason", 2048));
+    if (isTerminal(effectiveStatus)) next.reconnectable = false;
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
 
-    let task: TaskRecord | undefined;
-    if (isTerminal(requested)) {
-      // Complete before runtime cleanup: cleanup intentionally clears a live
-      // owner, while a successful terminal turn must retain the task result.
-      if (requested === "completed" && agent.taskId) {
-        const current = this.requireTask(agent.taskId);
-        if (current.owner === actorId && !isTaskTerminal(current.status)) task = this.completeTask(actorId, current, args.result, events);
-      }
-      if (requested === "failed" || requested === "cancelled") this.cancelRequestsFor(actorId, requested, `Agent ${actorId} became ${requested}`, events);
-      this.releaseAgentRuntime(actorId, requested === "cancelled" ? "cancelled" : "released", events);
-      if (requested !== "completed" && agent.taskId) {
-        const current = this.requireTask(agent.taskId);
-        if (!isTaskTerminal(current.status)) task = cloneTask(current);
-      }
-      if (requested === "failed" && next.parentId) {
+    let task = agent.taskId ? cloneTask(this.requireTask(agent.taskId)) : undefined;
+    if (isTerminal(effectiveStatus)) {
+      this.cancelRequestsFor(actorId, effectiveStatus === "cancelled" ? "cancelled" : "failed", `Agent ${actorId} became ${effectiveStatus}`, events);
+      // Every terminal state releases runtime claims. Successful task facts
+      // remain durable, but a completed worker must not keep a lease alive.
+      this.releaseAgentRuntime(actorId, effectiveStatus === "cancelled" ? "cancelled" : "released", events);
+      if (effectiveStatus === "failed" && next.parentId) {
         this.sendInternalMessage(actorId, next.parentId, "agent_failed", next.statusReason ?? `Agent ${actorId} failed`, { failedAgentId: actorId }, events);
       }
+      if (effectiveStatus !== "completed" && agent.taskId) {
+        task = cloneTask(this.requireTask(agent.taskId));
+      }
     }
-    return { agent: cloneAgent(this.requireAgent(actorId)), task };
+    return { agent: publicAgent(this.requireAgent(actorId)), task };
+  }
+
+  private statusAfterTask(agent: AgentRecord, requested: AgentStatus): AgentStatus {
+    if (!agent.taskId) return requested;
+    const task = this.requireTask(agent.taskId);
+    switch (task.status) {
+      case "completed":
+        return "completed";
+      case "failed":
+        return "failed";
+      case "cancelled":
+        return "cancelled";
+      case "blocked":
+        return "blocked";
+      default:
+        return requested === "completed" ? "ready" : requested;
+    }
   }
 
   private heartbeat(actorId: AgentId, events: CoordinatorEvent[]): { agent: AgentRecord; leases: number } {
@@ -551,7 +658,7 @@ export class Coordinator {
         events.push({ type: "resource_changed", resource: cloneResource(resource) });
       }
     }
-    return { agent: cloneAgent(next), leases };
+    return { agent: publicAgent(next), leases };
   }
 
   private cancelAgent(actorId: AgentId, targetId: AgentId, events: CoordinatorEvent[]): { cancelled: AgentId[] } {
@@ -562,9 +669,10 @@ export class Coordinator {
     const cancelled: AgentId[] = [];
     const visit = (agent: AgentRecord): void => {
       for (const child of this.agents.values()) if (child.parentId === agent.id) visit(child);
-      if (isTerminal(agent.status)) return;
+      if (isTerminal(agent.status) && !agent.reconnectable) return;
       const next = cloneAgent(agent);
       next.status = "cancelled";
+      next.reconnectable = false;
       next.statusReason = `Cancelled by ${actorId}`;
       next.lastActivity = this.clock();
       this.agents.set(next.id, next);
@@ -582,7 +690,7 @@ export class Coordinator {
     const actor = this.requireActor(actorId);
     assertCondition(actor.id === target.id || this.canControl(actor, target) || this.isVisiblePeer(actor, target), "MESSAGE_NOT_VISIBLE", `Agent ${actorId} cannot inspect ${target.id}`);
     if (scope === "tree" || scope === "children") return this.discoverAgents(actorId, scope);
-    return cloneAgent(target);
+    return publicAgent(target);
   }
 
   private discoverAgents(actorId: AgentId, scope: unknown): AgentSummary[] {
@@ -611,16 +719,18 @@ export class Coordinator {
     const to = parseString(input.to, "to");
     const type = input.type;
     assertCondition(ALL_MESSAGE_TYPES.has(type), "INVALID_ARGUMENT", `Unknown message type: ${String(type)}`);
+    assertCondition(!INTERNAL_MESSAGE_TYPES.has(type), "CAPABILITY_DENIED", `Message type ${type} is broker-generated`);
     const body = parseString(input.body, "body", this.config.maxMessageBody);
     const recipient = this.requireAgent(to);
     const sender = this.requireActor(actorId);
+    if (type === "escalation") assertCondition(sender.capabilities.mayEscalate, "CAPABILITY_DENIED", `Agent ${actorId} cannot escalate`);
     assertCondition(!isTerminal(sender.status), "LIFECYCLE_CONFLICT", `Agent ${actorId} is terminal`);
     assertCondition(!isTerminal(recipient.status), "AGENT_NOT_FOUND", `Recipient ${to} is not active`);
     assertCondition(this.canMessage(sender, recipient), "CAPABILITY_DENIED", `Agent ${actorId} cannot message ${to}`);
     return this.recordMessage(sender, recipient, type, body, {
       priority: input.priority,
       expectsReply: input.expectsReply,
-      clientDedupeKey: input.clientDedupeKey,
+      clientDedupeKey: input.clientDedupeKey === undefined ? undefined : parseString(input.clientDedupeKey, "clientDedupeKey", 512),
       metadata: input.metadata,
     }, events);
   }
@@ -650,9 +760,9 @@ export class Coordinator {
     const message = this.messages.get(messageId);
     assertCondition(message, "MESSAGE_NOT_FOUND", `Message ${messageId} was not found`);
     assertCondition(message.to === actorId, "MESSAGE_NOT_VISIBLE", `Agent ${actorId} cannot acknowledge ${messageId}`);
-    if (message.acknowledgedAt) return cloneMessage(message);
+    if (message.acknowledgedAt !== undefined) return cloneMessage(message);
     message.acknowledgedAt = this.clock();
-    if (!message.deliveredAt) message.deliveredAt = message.acknowledgedAt;
+    if (message.deliveredAt === undefined) message.deliveredAt = message.acknowledgedAt;
     events.push({ type: "message_acknowledged", message: cloneMessage(message) });
     this.pruneMessages(events);
     return cloneMessage(message);
@@ -661,8 +771,8 @@ export class Coordinator {
   private inbox(actorId: AgentId, limit: unknown): AgentMessage[] {
     const max = Math.max(1, Math.min(100, Math.floor(parseNumber(limit, "limit", 50))));
     return [...this.messages.values()]
-      .filter((message) => message.to === actorId && !message.acknowledgedAt)
-      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
+      .filter((message) => message.to === actorId && message.acknowledgedAt === undefined)
+      .sort((left, right) => left.senderSequence - right.senderSequence || (left.brokerSequence ?? 0) - (right.brokerSequence ?? 0) || left.id.localeCompare(right.id))
       .slice(0, max)
       .map(cloneMessage);
   }
@@ -671,8 +781,10 @@ export class Coordinator {
     const actor = this.requireActor(actorId);
     const all = actor.depth === 0 && args.scope === "all";
     return [...this.messages.values()]
-      .filter((message) => all || message.from === actorId || message.to === actorId || this.canMessage(actor, this.agents.get(message.from) as AgentRecord) || this.canMessage(actor, this.agents.get(message.to) as AgentRecord))
-      .sort((left, right) => right.createdAt - left.createdAt || right.id.localeCompare(left.id))
+      // Workers may inspect only their own conversations. A root may request
+      // the separate, explicitly privileged audit projection.
+      .filter((message) => all || message.from === actorId || message.to === actorId)
+      .sort((left, right) => (right.brokerSequence ?? 0) - (left.brokerSequence ?? 0) || right.createdAt - left.createdAt || right.id.localeCompare(left.id))
       .slice(0, 100)
       .map(cloneMessage);
   }
@@ -680,7 +792,8 @@ export class Coordinator {
   private createTask(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): DispatchResult<TaskRecord> {
     const actor = this.requireActor(actorId);
     const description = parseString(args.description, "description", 16 * 1024);
-    const dependencies = Array.isArray(args.dependencies) ? args.dependencies.map((id) => parseString(id, "dependency")) : [];
+    if (args.dependencies !== undefined) assertCondition(Array.isArray(args.dependencies), "INVALID_ARGUMENT", "dependencies must be an array");
+    const dependencies = (args.dependencies as unknown[] | undefined)?.map((id) => parseString(id, "dependency")) ?? [];
     for (const dependency of dependencies) {
       assertCondition(this.tasks.has(dependency), "TASK_NOT_FOUND", `Dependency ${dependency} was not found`);
     }
@@ -689,6 +802,7 @@ export class Coordinator {
     const owner = parseOptionalString(args.owner, "owner");
     if (owner) {
       const ownerAgent = this.requireAgent(owner);
+      assertCondition(!isTerminal(ownerAgent.status), "AGENT_NOT_FOUND", `Agent ${owner} is not active`);
       assertCondition(this.canControl(actor, ownerAgent) || owner === actorId, "CAPABILITY_DENIED", `Agent ${actorId} cannot assign a task to ${owner}`);
       assertCondition(!ownerAgent.taskId || ownerAgent.taskId === undefined, "TASK_BUSY", `Agent ${owner} already has a primary task`);
     }
@@ -726,6 +840,7 @@ export class Coordinator {
       task.updatedAt = this.clock();
     }
     assertCondition(!task.owner || task.owner === actorId, "TASK_BUSY", `Task ${taskId} is owned by ${task.owner}`);
+    assertCondition(!actor.taskId || actor.taskId === taskId, "TASK_BUSY", `Agent ${actorId} already has primary task ${actor.taskId}`);
     assertCondition(!isTaskTerminal(task.status), "TASK_BUSY", `Task ${taskId} is already ${task.status}`);
     assertCondition(this.taskDependenciesCompleted(task), "TASK_BLOCKED", `Task ${taskId} dependencies are not complete`);
     task.owner = actorId;
@@ -832,12 +947,13 @@ export class Coordinator {
     assertCondition(actor.capabilities.mayWriteRepo || actor.capabilities.mayTransferOwnership, "CAPABILITY_DENIED", `Agent ${actorId} cannot define resources`);
     const id = parseString(args.resourceId, "resourceId", 1024);
     const kind = parseString(args.kind ?? "resource", "kind", 128);
+    const parentId = parseOptionalString(args.parentId, "parentId", 1024);
+    const resourcePath = args.path === undefined ? undefined : normalizeResourcePath(args.path);
     const existing = this.resources.get(id);
     if (existing) {
-      assertCondition(existing.kind === kind && existing.parentId === parseOptionalString(args.parentId, "parentId", 1024), "IDENTITY_CONFLICT", `Resource ${id} already has a different definition`);
+      assertCondition(existing.kind === kind && existing.parentId === parentId && (args.path === undefined || existing.path === resourcePath), "IDENTITY_CONFLICT", `Resource ${id} already has a different definition`);
       return cloneResource(existing);
     }
-    const parentId = parseOptionalString(args.parentId, "parentId", 1024);
     if (parentId) {
       assertCondition(parentId !== id && this.resources.has(parentId), "RESOURCE_NOT_FOUND", `Parent resource ${parentId} was not found`);
       assertCondition(!this.wouldCreateResourceCycle(id, parentId), "INVALID_ARGUMENT", `Resource ${id} would create a hierarchy cycle`);
@@ -848,6 +964,7 @@ export class Coordinator {
       id,
       kind,
       parentId,
+      path: resourcePath,
       owner: actorId,
       version: 1,
       grants: { [actorId]: permissions.length ? permissions : ["read", "comment", "write", "test"] },
@@ -881,7 +998,7 @@ export class Coordinator {
   private grantResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const resource = this.requireResource(parseString(args.resourceId, "resourceId"));
     const actor = this.requireActor(actorId);
-    assertCondition(resource.owner === actorId || actor.capabilities.mayTransferOwnership, "CAPABILITY_DENIED", `Agent ${actorId} cannot grant ${resource.id}`);
+    assertCondition(this.canManageResource(actor, resource), "CAPABILITY_DENIED", `Agent ${actorId} cannot grant ${resource.id}`);
     const targetId = parseString(args.agentId, "agentId");
     const target = this.requireAgent(targetId);
     assertCondition(!isTerminal(target.status), "AGENT_NOT_FOUND", `Agent ${targetId} is not active`);
@@ -931,6 +1048,7 @@ export class Coordinator {
       if (currentWaiter) return { status: "waiting", requestId: currentWaiter.requestId, resource: cloneResource(resource) };
       const waiter: ResourceWaiter = {
         requestId: this.idFactory("resource-request"),
+        enqueuedSequence: ++this.nextResourceWaiterSequence,
         agentId: actorId,
         mode,
         enqueuedAt: this.clock(),
@@ -995,21 +1113,41 @@ export class Coordinator {
   }
 
   private checkWrite(actorId: AgentId, args: Record<string, unknown>): { allowed: boolean; reason?: string; resourceId?: string } {
-    const resourceId = parseOptionalString(args.resourceId, "resourceId");
-    if (!resourceId) {
-      const actor = this.requireActor(actorId);
-      return { allowed: actor.capabilities.mayWriteRepo };
+    const actor = this.requireActor(actorId);
+    if (!actor.capabilities.mayWriteRepo) {
+      return { allowed: false, reason: `Agent ${actorId} is not allowed to write repository files` };
     }
-    const resource = this.requireResource(resourceId);
-    if (resource.owner === actorId) return { allowed: true, resourceId };
-    if (resource.mutableHold?.agentId === actorId) return { allowed: true, resourceId };
-    return { allowed: false, resourceId, reason: `Agent ${actorId} does not hold mutable access to ${resourceId}` };
+    const resourceId = parseOptionalString(args.resourceId, "resourceId");
+    const requestedPath = args.path === undefined ? undefined : normalizeResourcePath(args.path);
+    assertCondition(resourceId || requestedPath, "INVALID_ARGUMENT", "resource.check_write requires resourceId or path");
+
+    const selectedResource = resourceId ? this.requireResource(resourceId) : undefined;
+    const candidates = requestedPath
+      ? this.resourcesForPath(requestedPath)
+      : selectedResource ? [selectedResource] : [];
+    if (selectedResource && requestedPath && !candidates.some((candidate) => candidate.id === selectedResource.id)) {
+      return { allowed: false, resourceId: selectedResource.id, reason: `Resource ${selectedResource.id} does not declare ${requestedPath}` };
+    }
+    if (candidates.length === 0) {
+      return { allowed: false, reason: `No declared resource matches ${requestedPath}` };
+    }
+    const conflicting = requestedPath === undefined ? undefined : candidates.find((resource) => resource.sharedHolds.length > 0 || resource.mutableHold && resource.mutableHold.agentId !== actorId);
+    if (conflicting) {
+      return { allowed: false, resourceId: conflicting.id, reason: `A conflicting runtime hold prevents writing ${requestedPath}` };
+    }
+    const allowed = candidates.find((resource) => this.hasMutableHold(resource, actorId));
+    if (allowed) return { allowed: true, resourceId: allowed.id };
+    return {
+      allowed: false,
+      resourceId: candidates[0].id,
+      reason: `Agent ${actorId} does not hold mutable access to ${candidates[0].id}`,
+    };
   }
 
   private status(actorId: AgentId, args: Record<string, unknown>): FabricStatus {
     const actor = this.requireActor(actorId);
     assertCondition(actor.depth === 0, "CAPABILITY_DENIED", "Only a fabric root may request full status");
-    const allMessages = [...this.messages.values()].sort((left, right) => right.createdAt - left.createdAt).slice(0, 100).map(cloneMessage);
+    const allMessages = [...this.messages.values()].sort((left, right) => (right.brokerSequence ?? 0) - (left.brokerSequence ?? 0) || right.createdAt - left.createdAt).slice(0, 100).map(cloneMessage);
     return {
       rootId: this.rootId,
       agents: [...this.agents.values()].map((candidate) => this.toSummary(candidate)),
@@ -1038,10 +1176,13 @@ export class Coordinator {
       const next = cloneAgent(agent);
       next.status = "failed";
       next.statusReason = "Broker restarted before the agent reconnected";
+      next.reconnectable = true;
       next.lastActivity = this.clock();
       this.agents.set(next.id, next);
       events.push({ type: "agent_updated", agent: cloneAgent(next) });
-      this.cancelRequestsFor(next.id, "failed", "Broker restarted before the agent reconnected", events);
+      // A restart only proves that transport liveness was interrupted. Keep
+      // semantic requests pending until an actor explicitly resolves or fails
+      // them; a reconnecting host may still be waiting on the reply.
       this.releaseAgentRuntime(next.id, "broker-recovery", events);
       recovered.push(next.id);
     }
@@ -1058,7 +1199,7 @@ export class Coordinator {
   authenticate(agentId: AgentId, token?: string): boolean {
     const agent = this.agents.get(agentId);
     if (!agent) return true;
-    return Boolean(agent.authToken && token === agent.authToken);
+    return Boolean(agent.authToken && token !== undefined && token === agent.authToken);
   }
 
   exportState(): PersistedCoordinatorState {
@@ -1071,6 +1212,8 @@ export class Coordinator {
       messages: [...this.messages.values()].map(cloneMessage),
       requests: [...this.requests.values()].map(cloneRequest),
       dedupe: [...this.dedupe.entries()],
+      nextBrokerSequence: this.nextBrokerSequence,
+      nextResourceWaiterSequence: this.nextResourceWaiterSequence,
     };
   }
 
@@ -1083,13 +1226,23 @@ export class Coordinator {
     this.requests.clear();
     this.dedupe.clear();
     this.nextMessageSequence.clear();
+    this.nextBrokerSequence = state.nextBrokerSequence ?? 0;
+    this.nextResourceWaiterSequence = state.nextResourceWaiterSequence ?? 0;
     for (const agent of state.agents) {
       assertCondition(agent.rootId === this.rootId, "IDENTITY_CONFLICT", `Persisted agent ${agent.id} belongs to another fabric`);
       this.agents.set(agent.id, cloneAgent(agent));
     }
     for (const task of state.tasks) this.tasks.set(task.id, cloneTask(task));
-    for (const resource of state.resources) this.resources.set(resource.id, cloneResource(resource));
-    for (const message of state.messages) this.messages.set(message.id, cloneMessage(message));
+    for (const resource of state.resources) {
+      const next = cloneResource(resource);
+      for (const waiter of next.waiters) this.nextResourceWaiterSequence = Math.max(this.nextResourceWaiterSequence, waiter.enqueuedSequence ?? 0);
+      this.resources.set(next.id, next);
+    }
+    for (const message of state.messages) {
+      const next = cloneMessage(message);
+      if (next.brokerSequence !== undefined) this.nextBrokerSequence = Math.max(this.nextBrokerSequence, next.brokerSequence);
+      this.messages.set(next.id, next);
+    }
     for (const request of state.requests) this.requests.set(request.id, cloneRequest(request));
     for (const [key, value] of state.dedupe) this.dedupe.set(key, value);
     for (const [agentId, sequence] of Object.entries(state.nextMessageSequence)) this.nextMessageSequence.set(agentId, sequence);
@@ -1107,15 +1260,24 @@ export class Coordinator {
         case "task_changed":
           this.tasks.set(event.task.id, cloneTask(event.task));
           break;
-        case "resource_changed":
-          this.resources.set(event.resource.id, cloneResource(event.resource));
+        case "resource_changed": {
+          const resource = cloneResource(event.resource);
+          for (const waiter of resource.waiters) this.nextResourceWaiterSequence = Math.max(this.nextResourceWaiterSequence, waiter.enqueuedSequence ?? 0);
+          this.resources.set(resource.id, resource);
           break;
-        case "message_sent":
-          this.messages.set(event.message.id, cloneMessage(event.message));
-          this.nextMessageSequence.set(event.message.from, Math.max(this.nextMessageSequence.get(event.message.from) ?? 0, event.message.senderSequence));
-          if (event.message.clientDedupeKey) this.dedupe.set(`${event.message.from}\u0000${event.message.clientDedupeKey}`, event.message.id);
+        }
+        case "message_sent": {
+          const message = cloneMessage(event.message);
+          // Journals from before brokerSequence was introduced are upgraded in
+          // replay order, preserving their committed event order.
+          message.brokerSequence ??= ++this.nextBrokerSequence;
+          this.nextBrokerSequence = Math.max(this.nextBrokerSequence, message.brokerSequence);
+          this.messages.set(message.id, message);
+          this.nextMessageSequence.set(message.from, Math.max(this.nextMessageSequence.get(message.from) ?? 0, message.senderSequence));
+          if (message.clientDedupeKey) this.dedupe.set(`${message.from}\u0000${message.clientDedupeKey}`, message.id);
           if (event.request) this.requests.set(event.request.id, cloneRequest(event.request));
           break;
+        }
         case "message_acknowledged":
           this.messages.set(event.message.id, cloneMessage(event.message));
           break;
@@ -1143,15 +1305,19 @@ export class Coordinator {
     return { value: result as T, events: initial };
   }
 
-  private requireActor(actorId: AgentId | undefined): AgentRecord {
+  private requireBoundAgent(actorId: AgentId | undefined): AgentRecord {
     assertCondition(actorId, "IDENTITY_CONFLICT", "A bound actor identity is required");
-    const actor = this.requireAgent(actorId);
+    return this.requireAgent(actorId);
+  }
+
+  private requireActor(actorId: AgentId | undefined): AgentRecord {
+    const actor = this.requireBoundAgent(actorId);
     assertCondition(!isTerminal(actor.status), "LIFECYCLE_CONFLICT", `Agent ${actorId} is terminal`);
     return actor;
   }
 
   private requireAgent(agentId: AgentId): AgentRecord {
-    const id = parseString(agentId, "agentId");
+    const id = parseAgentId(agentId);
     const agent = this.agents.get(id);
     assertCondition(agent, "AGENT_NOT_FOUND", `Agent ${id} was not found`);
     return agent;
@@ -1222,7 +1388,7 @@ export class Coordinator {
         if (existing) return { message: cloneMessage(existing), request: existing.requestId ? this.requests.get(existing.requestId) && cloneRequest(this.requests.get(existing.requestId) as RequestRecord) : undefined };
       }
     }
-    const pendingCount = [...this.messages.values()].filter((message) => message.to === recipient.id && !message.acknowledgedAt).length;
+    const pendingCount = [...this.messages.values()].filter((message) => message.to === recipient.id && message.acknowledgedAt === undefined).length;
     assertCondition(pendingCount < this.config.maxMailboxMessages, "MAILBOX_FULL", `Mailbox for ${recipient.id} is full`, { recipient: recipient.id });
     const now = this.clock();
     const priority = options.priority ?? "normal";
@@ -1230,6 +1396,7 @@ export class Coordinator {
     assertCondition(options.expectsReply === undefined || typeof options.expectsReply === "boolean", "INVALID_ARGUMENT", "expectsReply must be boolean");
     const sequence = (this.nextMessageSequence.get(sender.id) ?? 0) + 1;
     this.nextMessageSequence.set(sender.id, sequence);
+    const brokerSequence = ++this.nextBrokerSequence;
     const message: AgentMessage = {
       id: this.idFactory("message"),
       from: sender.id,
@@ -1237,6 +1404,7 @@ export class Coordinator {
       type,
       body,
       senderSequence: sequence,
+      brokerSequence,
       requestId: options.requestId,
       replyTo: options.replyTo,
       priority,
@@ -1267,8 +1435,8 @@ export class Coordinator {
   private pruneMessages(events: CoordinatorEvent[]): void {
     if (this.messages.size <= this.config.messageRetention) return;
     const candidates = [...this.messages.values()]
-      .filter((message) => Boolean(message.acknowledgedAt))
-      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+      .filter((message) => message.acknowledgedAt !== undefined)
+      .sort((left, right) => (left.brokerSequence ?? 0) - (right.brokerSequence ?? 0) || left.createdAt - right.createdAt || left.id.localeCompare(right.id));
     const ids: string[] = [];
     let remaining = this.messages.size;
     for (const message of candidates) {
@@ -1347,12 +1515,15 @@ export class Coordinator {
     let ownerTaskCleared = false;
     const owner = this.agents.get(agentId);
     for (const task of this.tasks.values()) {
-      if (task.owner !== agentId || isTaskTerminal(task.status)) continue;
+      if (task.owner !== agentId || task.status === "completed") continue;
+      const wasTerminal = isTaskTerminal(task.status);
       task.owner = undefined;
-      task.status = reason === "cancelled" ? "cancelled" : "ready";
-      task.blockedReason = reason === "cancelled" ? "Agent cancelled" : `Owner ${agentId} released (${reason})`;
+      if (!wasTerminal) {
+        task.status = reason === "cancelled" ? "cancelled" : "ready";
+        task.blockedReason = reason === "cancelled" ? "Agent cancelled" : `Owner ${agentId} released (${reason})`;
+      }
       task.updatedAt = this.clock();
-      if (owner?.taskId === task.id && reason !== "broker-recovery") {
+      if (owner?.taskId === task.id && (reason !== "broker-recovery" || wasTerminal)) {
         owner.taskId = undefined;
         ownerTaskCleared = true;
       }
@@ -1370,7 +1541,7 @@ export class Coordinator {
       for (const resource of this.resources.values()) {
         for (const waiter of resource.waiters) candidates.push({ resource, waiter });
       }
-      candidates.sort((left, right) => left.waiter.enqueuedAt - right.waiter.enqueuedAt || left.waiter.requestId.localeCompare(right.waiter.requestId));
+      candidates.sort((left, right) => this.waiterPrecedes(left.waiter, right.waiter) ? -1 : this.waiterPrecedes(right.waiter, left.waiter) ? 1 : 0);
       for (const candidate of candidates) {
         if (!this.agents.has(candidate.waiter.agentId) || isTerminal(this.requireAgent(candidate.waiter.agentId).status)) {
           candidate.resource.waiters = candidate.resource.waiters.filter((waiter) => waiter.requestId !== candidate.waiter.requestId);
@@ -1379,6 +1550,7 @@ export class Coordinator {
           break;
         }
         if (candidate.resource.waiters[0]?.requestId !== candidate.waiter.requestId) continue;
+        if (this.hasEarlierOverlappingWaiter(candidate.resource.id, candidate.waiter)) continue;
         if (!this.canAcquire(candidate.resource, candidate.waiter.agentId, candidate.waiter.mode)) continue;
         candidate.resource.waiters = candidate.resource.waiters.filter((waiter) => waiter.requestId !== candidate.waiter.requestId);
         const hold = this.addHold(candidate.resource, candidate.waiter.agentId, candidate.waiter.mode, candidate.waiter.leaseMs);
@@ -1442,10 +1614,21 @@ export class Coordinator {
     return this.overlappingResources(resource.id).some((candidate) => candidate.waiters.some((waiter) => waiter.agentId !== agentId));
   }
 
+  private hasEarlierOverlappingWaiter(resourceId: ResourceId, waiter: ResourceWaiter): boolean {
+    return this.overlappingResources(resourceId).some((candidate) => candidate.waiters.some((other) => other.requestId !== waiter.requestId && this.waiterPrecedes(other, waiter)));
+  }
+
+  private waiterPrecedes(left: ResourceWaiter, right: ResourceWaiter): boolean {
+    if (left.enqueuedSequence !== undefined && right.enqueuedSequence !== undefined && left.enqueuedSequence !== right.enqueuedSequence) return left.enqueuedSequence < right.enqueuedSequence;
+    return left.enqueuedAt < right.enqueuedAt || (left.enqueuedAt === right.enqueuedAt && left.requestId.localeCompare(right.requestId) < 0);
+  }
+
   private canAcquire(resource: ResourceRecord, agentId: AgentId, mode: BorrowMode): boolean {
     for (const overlap of this.overlappingResources(resource.id)) {
-      if (overlap.mutableHold && overlap.mutableHold.agentId !== agentId) return false;
-      if (mode === "mutable" && overlap.sharedHolds.some((hold) => hold.agentId !== agentId)) return false;
+      // A holder cannot downgrade/upgrade itself behind the coordinator's
+      // back: shared and mutable holds for one actor are still conflicting.
+      if (overlap.mutableHold) return false;
+      if (mode === "mutable" && overlap.sharedHolds.length > 0) return false;
     }
     return true;
   }
@@ -1455,7 +1638,21 @@ export class Coordinator {
   }
 
   private overlaps(left: ResourceId, right: ResourceId): boolean {
-    return this.isAncestor(left, right) || this.isAncestor(right, left);
+    if (this.isAncestor(left, right) || this.isAncestor(right, left)) return true;
+    const leftResource = this.resources.get(left);
+    const rightResource = this.resources.get(right);
+    if (!leftResource || !rightResource) return false;
+    const leftPath = this.declaredResourcePath(leftResource);
+    const rightPath = this.declaredResourcePath(rightResource);
+    if (!leftPath || !rightPath) return false;
+    if (leftResource.kind === "file" && rightResource.kind === "file") return leftPath === rightPath;
+    if (leftResource.kind === "file") return this.pathContains(rightPath, leftPath);
+    if (rightResource.kind === "file") return this.pathContains(leftPath, rightPath);
+    return this.pathContains(leftPath, rightPath) || this.pathContains(rightPath, leftPath);
+  }
+
+  private pathContains(directoryPath: string, candidatePath: string): boolean {
+    return directoryPath === candidatePath || candidatePath.startsWith(`${directoryPath}/`);
   }
 
   private isAncestor(ancestorId: ResourceId, descendantId: ResourceId): boolean {
@@ -1491,11 +1688,63 @@ export class Coordinator {
   }
 
   private hasPermission(resource: ResourceRecord, agentId: AgentId, permission: ResourcePermission): boolean {
+    const agent = this.agents.get(agentId);
     for (const candidate of this.resourceAncestors(resource)) {
       if (candidate.owner === agentId) return true;
-      if (candidate.grants[agentId]?.includes(permission)) return true;
+      if (hasOwn(candidate.grants, agentId) && candidate.grants[agentId].includes(permission)) return true;
+      if (agent && hasOwn(agent.capabilities.resourceGrants, candidate.id) && agent.capabilities.resourceGrants[candidate.id]!.includes(permission)) return true;
     }
     return false;
+  }
+
+  private canManageResource(actor: AgentRecord, resource: ResourceRecord): boolean {
+    if (resource.owner === actor.id) return true;
+    if (!actor.capabilities.mayTransferOwnership) return false;
+    if (!resource.owner) return actor.depth === 0;
+    return this.canControl(actor, this.requireAgent(resource.owner));
+  }
+
+  private hasMutableHold(resource: ResourceRecord, agentId: AgentId): boolean {
+    // A hold on an ancestor or declared directory path authorizes descendant
+    // paths, but a narrow descendant hold must not accidentally authorize its
+    // parent or sibling.
+    return [...this.resources.values()].some((candidate) => candidate.mutableHold?.agentId === agentId && this.resourceContains(candidate, resource));
+  }
+
+  private resourceContains(container: ResourceRecord, candidate: ResourceRecord): boolean {
+    if (this.isAncestor(container.id, candidate.id)) return true;
+    const containerPath = this.declaredResourcePath(container);
+    const candidatePath = this.declaredResourcePath(candidate);
+    if (!containerPath || !candidatePath) return false;
+    if (container.kind === "file") return candidate.kind === "file" && containerPath === candidatePath;
+    return this.pathContains(containerPath, candidatePath);
+  }
+
+  private resourcesForPath(path: string): ResourceRecord[] {
+    return [...this.resources.values()]
+      .filter((resource) => {
+        const resourcePath = this.declaredResourcePath(resource);
+        if (!resourcePath) return false;
+        if (resource.kind === "file") return path === resourcePath;
+        return path === resourcePath || path.startsWith(`${resourcePath}/`);
+      })
+      .sort((left, right) => this.resourcePathSpecificity(right) - this.resourcePathSpecificity(left) || left.id.localeCompare(right.id));
+  }
+
+  private declaredResourcePath(resource: ResourceRecord): string | undefined {
+    if (resource.path) return resource.path;
+    if (resource.kind === "file" && resource.id.startsWith("file:")) {
+      try {
+        return normalizeResourcePath(resource.id.slice("file:".length));
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+
+  private resourcePathSpecificity(resource: ResourceRecord): number {
+    return this.declaredResourcePath(resource)?.length ?? 0;
   }
 
   private canInspectResource(agentId: AgentId, resource: ResourceRecord): boolean {
