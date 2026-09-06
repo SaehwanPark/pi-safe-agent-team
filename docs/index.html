@@ -1,0 +1,1230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>pi-safe-agents-team — Deterministic Multi-Agent Coordination for Pi</title>
+  <meta name="description" content="A local-first Pi extension for recursive, observable multi-agent coding with deterministic coordination and Rust-style borrow checking.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
+  <style>
+    :root {
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace;
+      
+      --bg-primary: #0a0d12;
+      --bg-secondary: #111620;
+      --bg-tertiary: #161d2b;
+      --bg-card: rgba(22, 29, 43, 0.7);
+      --bg-code: #070a0e;
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-accent: rgba(56, 189, 248, 0.3);
+      
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --text-accent: #38bdf8;
+      --text-success: #34d399;
+      --text-warning: #fbbf24;
+      --text-danger: #f87171;
+      
+      --glow-accent: rgba(56, 189, 248, 0.15);
+      --glow-success: rgba(52, 211, 153, 0.15);
+      
+      --sidebar-width: 280px;
+      --header-height: 64px;
+    }
+
+    [data-theme="light"] {
+      --bg-primary: #f8fafc;
+      --bg-secondary: #ffffff;
+      --bg-tertiary: #f1f5f9;
+      --bg-card: rgba(255, 255, 255, 0.85);
+      --bg-code: #0f172a;
+      --border-subtle: rgba(0, 0, 0, 0.08);
+      --border-accent: rgba(2, 132, 199, 0.3);
+      
+      --text-primary: #0f172a;
+      --text-secondary: #475569;
+      --text-muted: #64748b;
+      --text-accent: #0284c7;
+      --text-success: #059669;
+      --text-warning: #d97706;
+      --text-danger: #dc2626;
+      
+      --glow-accent: rgba(2, 132, 199, 0.1);
+      --glow-success: rgba(5, 150, 105, 0.1);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background-color: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+
+    /* Top Navbar */
+    header.top-nav {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      height: var(--header-height);
+      background: rgba(10, 13, 18, 0.8);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+    }
+
+    [data-theme="light"] header.top-nav {
+      background: rgba(248, 250, 252, 0.85);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      font-size: 1.15rem;
+      color: var(--text-primary);
+      text-decoration: none;
+    }
+
+    .brand-badge {
+      font-size: 0.75rem;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      background: var(--glow-accent);
+      color: var(--text-accent);
+      border: 1px solid var(--border-accent);
+      font-weight: 600;
+      letter-spacing: 0.05em;
+    }
+
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .theme-toggle, .mobile-toggle {
+      background: transparent;
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 8px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+    }
+
+    .theme-toggle:hover, .mobile-toggle:hover {
+      color: var(--text-primary);
+      border-color: var(--text-accent);
+    }
+
+    .gh-link {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      padding: 6px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border-subtle);
+      transition: all 0.2s ease;
+    }
+
+    .gh-link:hover {
+      color: var(--text-primary);
+      border-color: var(--text-accent);
+      background: var(--glow-accent);
+    }
+
+    /* Container Layout */
+    .app-layout {
+      display: flex;
+      flex: 1;
+      max-width: 1440px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    /* Sidebar Navigation */
+    aside.sidebar {
+      width: var(--sidebar-width);
+      position: sticky;
+      top: var(--header-height);
+      height: calc(100vh - var(--header-height));
+      overflow-y: auto;
+      padding: 24px 16px;
+      border-right: 1px solid var(--border-subtle);
+      flex-shrink: 0;
+    }
+
+    .sidebar-section {
+      margin-bottom: 24px;
+    }
+
+    .sidebar-title {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-muted);
+      font-weight: 700;
+      margin-bottom: 8px;
+      padding: 0 12px;
+    }
+
+    .sidebar-nav {
+      list-style: none;
+    }
+
+    .sidebar-link {
+      display: block;
+      padding: 6px 12px;
+      border-radius: 6px;
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: all 0.15s ease;
+    }
+
+    .sidebar-link:hover {
+      color: var(--text-accent);
+      background: var(--bg-tertiary);
+    }
+
+    .sidebar-link.active {
+      color: var(--text-accent);
+      background: var(--glow-accent);
+      font-weight: 600;
+    }
+
+    /* Main Content Area */
+    main.content {
+      flex: 1;
+      padding: 40px 48px 100px;
+      max-width: 960px;
+      overflow-x: hidden;
+    }
+
+    /* Hero Section */
+    .hero-section {
+      padding-bottom: 48px;
+      border-bottom: 1px solid var(--border-subtle);
+      margin-bottom: 48px;
+    }
+
+    .hero-title {
+      font-size: 2.75rem;
+      font-weight: 800;
+      line-height: 1.15;
+      letter-spacing: -0.03em;
+      margin-bottom: 16px;
+      background: linear-gradient(135deg, #38bdf8 0%, #818cf8 50%, #c084fc 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    [data-theme="light"] .hero-title {
+      background: linear-gradient(135deg, #0284c7 0%, #4338ca 50%, #7e22ce 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero-subtitle {
+      font-size: 1.25rem;
+      color: var(--text-secondary);
+      margin-bottom: 28px;
+      max-width: 720px;
+      font-weight: 400;
+    }
+
+    .hero-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 28px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+    }
+
+    .badge.success {
+      color: var(--text-success);
+      border-color: rgba(52, 211, 153, 0.3);
+      background: var(--glow-success);
+    }
+
+    .hero-buttons {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      text-decoration: none;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .btn-primary {
+      background: var(--text-accent);
+      color: #030712;
+      border: 1px solid var(--text-accent);
+    }
+
+    .btn-primary:hover {
+      filter: brightness(1.1);
+      box-shadow: 0 0 16px var(--glow-accent);
+    }
+
+    .btn-secondary {
+      background: var(--bg-secondary);
+      color: var(--text-primary);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--text-accent);
+      background: var(--bg-tertiary);
+    }
+
+    /* Content Typography & Structure */
+    h2.section-header {
+      font-size: 1.85rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-top: 56px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--text-primary);
+      scroll-margin-top: 80px;
+    }
+
+    h3.subsection-header {
+      font-size: 1.35rem;
+      font-weight: 600;
+      margin-top: 36px;
+      margin-bottom: 14px;
+      color: var(--text-primary);
+      scroll-margin-top: 80px;
+    }
+
+    p {
+      margin-bottom: 16px;
+      color: var(--text-secondary);
+      font-size: 1rem;
+    }
+
+    ul, ol {
+      margin-bottom: 20px;
+      padding-left: 24px;
+      color: var(--text-secondary);
+    }
+
+    li {
+      margin-bottom: 8px;
+    }
+
+    strong {
+      color: var(--text-primary);
+    }
+
+    /* Callout Boxes */
+    .callout {
+      padding: 16px 20px;
+      border-radius: 8px;
+      margin: 24px 0;
+      border-left: 4px solid;
+      background: var(--bg-secondary);
+    }
+
+    .callout.info {
+      border-color: var(--text-accent);
+      background: rgba(56, 189, 248, 0.06);
+    }
+
+    .callout.warning {
+      border-color: var(--text-warning);
+      background: rgba(251, 191, 36, 0.06);
+    }
+
+    .callout.danger {
+      border-color: var(--text-danger);
+      background: rgba(248, 113, 113, 0.06);
+    }
+
+    .callout-title {
+      font-weight: 700;
+      font-size: 0.95rem;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .callout.info .callout-title { color: var(--text-accent); }
+    .callout.warning .callout-title { color: var(--text-warning); }
+    .callout.danger .callout-title { color: var(--text-danger); }
+
+    /* Code Blocks */
+    .code-wrapper {
+      position: relative;
+      margin: 20px 0;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-code);
+    }
+
+    .code-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 16px;
+      background: rgba(255, 255, 255, 0.03);
+      border-bottom: 1px solid var(--border-subtle);
+      font-family: var(--font-mono);
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+
+    pre {
+      padding: 16px;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 0.875rem;
+      line-height: 1.6;
+      color: #e2e8f0;
+    }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.875em;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--bg-tertiary);
+      color: var(--text-accent);
+      border: 1px solid var(--border-subtle);
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+      border: none;
+      color: inherit;
+    }
+
+    .copy-btn {
+      background: transparent;
+      border: 1px solid var(--border-subtle);
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.15s ease;
+    }
+
+    .copy-btn:hover {
+      color: var(--text-primary);
+      border-color: var(--text-accent);
+    }
+
+    /* Cards Grid */
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+      margin: 28px 0;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 24px;
+      backdrop-filter: blur(8px);
+      transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .card:hover {
+      transform: translateY(-2px);
+      border-color: var(--border-accent);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+    }
+
+    .card-icon {
+      font-size: 1.75rem;
+      margin-bottom: 12px;
+      display: inline-block;
+    }
+
+    .card-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+
+    .card-desc {
+      font-size: 0.9rem;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    /* Architecture Diagram Box */
+    .diagram-box {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 28px;
+      margin: 28px 0;
+      overflow-x: auto;
+      text-align: center;
+    }
+
+    .diagram-box svg {
+      max-width: 100%;
+      height: auto;
+    }
+
+    /* Interactive Tab Switcher */
+    .tab-container {
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      overflow: hidden;
+      margin: 24px 0;
+      background: var(--bg-secondary);
+    }
+
+    .tab-nav {
+      display: flex;
+      border-bottom: 1px solid var(--border-subtle);
+      background: var(--bg-tertiary);
+      overflow-x: auto;
+    }
+
+    .tab-btn {
+      padding: 12px 20px;
+      background: transparent;
+      border: none;
+      color: var(--text-secondary);
+      font-weight: 600;
+      font-size: 0.9rem;
+      cursor: pointer;
+      white-space: nowrap;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s ease;
+    }
+
+    .tab-btn:hover {
+      color: var(--text-primary);
+    }
+
+    .tab-btn.active {
+      color: var(--text-accent);
+      border-bottom-color: var(--text-accent);
+      background: var(--bg-secondary);
+    }
+
+    .tab-pane {
+      display: none;
+      padding: 24px;
+    }
+
+    .tab-pane.active {
+      display: block;
+    }
+
+    /* Comparison Table */
+    .table-container {
+      overflow-x: auto;
+      margin: 24px 0;
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+    }
+
+    table.comparison-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+      text-align: left;
+    }
+
+    table.comparison-table th {
+      background: var(--bg-tertiary);
+      padding: 14px 16px;
+      font-weight: 700;
+      color: var(--text-primary);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    table.comparison-table td {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+    }
+
+    table.comparison-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    table.comparison-table tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .check {
+      color: var(--text-success);
+      font-weight: 700;
+    }
+
+    .cross {
+      color: var(--text-muted);
+    }
+
+    /* Mobile Responsive */
+    @media (max-width: 900px) {
+      aside.sidebar {
+        display: none;
+        position: fixed;
+        left: 0;
+        top: var(--header-height);
+        bottom: 0;
+        z-index: 40;
+        background: var(--bg-primary);
+        width: 260px;
+        box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
+      }
+
+      aside.sidebar.open {
+        display: block;
+      }
+
+      main.content {
+        padding: 24px 20px 80px;
+      }
+
+      .hero-title {
+        font-size: 2.1rem;
+      }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Navigation Bar -->
+  <header class="top-nav">
+    <a href="#" class="brand">
+      <span>🛡️ safe-agents-team</span>
+      <span class="brand-badge">v0.1.0</span>
+    </a>
+    <div class="nav-actions">
+      <button class="mobile-toggle" id="mobile-toggle" aria-label="Toggle navigation menu" style="display: none;">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark/light theme">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="sun-icon"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+      </button>
+      <a href="https://github.com/SaehwanPark/pi-safe-agent-team" class="gh-link" target="_blank" rel="noopener">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/></svg>
+        <span>GitHub</span>
+      </a>
+    </div>
+  </header>
+
+  <div class="app-layout">
+    <!-- Sidebar Navigation -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-title">Getting Started</div>
+        <ul class="sidebar-nav">
+          <li><a href="#overview" class="sidebar-link active">Overview</a></li>
+          <li><a href="#problem" class="sidebar-link">The Problem</a></li>
+          <li><a href="#key-insight" class="sidebar-link">Key Insight</a></li>
+          <li><a href="#installation" class="sidebar-link">Installation</a></li>
+          <li><a href="#quickstart" class="sidebar-link">Quick Start</a></li>
+        </ul>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-title">Architecture & Safety</div>
+        <ul class="sidebar-nav">
+          <li><a href="#architecture" class="sidebar-link">Broker Architecture</a></li>
+          <li><a href="#borrow-checker" class="sidebar-link">Borrow Checker & Leases</a></li>
+          <li><a href="#write-fencing" class="sidebar-link">Write Fences</a></li>
+          <li><a href="#root-host-guard" class="sidebar-link">Root Host Guard</a></li>
+          <li><a href="#path-identity" class="sidebar-link">Real Path Identity</a></li>
+        </ul>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-title">Comparison & Reference</div>
+        <ul class="sidebar-nav">
+          <li><a href="#comparison" class="sidebar-link">Prior Art Comparison</a></li>
+          <li><a href="#slash-commands" class="sidebar-link">Slash Commands</a></li>
+          <li><a href="#operational-boundaries" class="sidebar-link">Operational Boundaries</a></li>
+          <li><a href="#docs-links" class="sidebar-link">Deep-Dive Guides</a></li>
+        </ul>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="content">
+
+      <!-- Hero Section -->
+      <section id="overview" class="hero-section">
+        <div class="hero-badges">
+          <span class="badge success">● Production Candidate v0.1.0</span>
+          <span class="badge">CI: Linux · macOS · Windows</span>
+          <span class="badge">MIT License</span>
+        </div>
+        <h1 class="hero-title">Deterministic Multi-Agent Coordination for Pi</h1>
+        <p class="hero-subtitle">
+          An authoritative, local-first runtime for recursive Pi subagents. Semantic agents reason about code; an out-of-band broker enforces mechanical borrow checking, write fencing, durable mailboxes, and atomic tasks.
+        </p>
+        <div class="hero-buttons">
+          <a href="#installation" class="btn btn-primary">Install from GitHub</a>
+          <a href="#problem" class="btn btn-secondary">Why Prompt Coordination Fails</a>
+          <a href="https://github.com/SaehwanPark/pi-safe-agent-team" class="btn btn-secondary" target="_blank">View on GitHub</a>
+        </div>
+      </section>
+
+      <!-- The Problem Statement -->
+      <section id="problem">
+        <h2 class="section-header">The Problem: Why Multi-Agent Coding Breaks Down</h2>
+        <p>
+          Most agent frameworks treat collaboration as a <em>prompt-engineering problem</em>. Subagents are given prompt instructions—<em>"coordinate with your peers"</em>, <em>"do not edit files assigned to another agent"</em>—and left to share the same workspace or global chat channel.
+        </p>
+        <p>
+          Under real programming workloads, prompt-level conventions inevitably break down:
+        </p>
+
+        <div class="card-grid">
+          <div class="card">
+            <div class="card-icon">💥</div>
+            <div class="card-title">Silent File Clobbering</div>
+            <div class="card-desc">Two agents editing the same workspace simultaneously overwrite each other's edits. Neither git nor the LLM notices the collision until code vanishes.</div>
+          </div>
+          <div class="card">
+            <div class="card-icon">🏎️</div>
+            <div class="card-title">Parent-Child Write Races</div>
+            <div class="card-desc">While a child agent refactors a module, the user or parent continues editing. Without physical write locks, the parent mutates files out from under the child.</div>
+          </div>
+          <div class="card">
+            <div class="card-icon">🛑</div>
+            <div class="card-title">Synchronous Call-Stack Deadlocks</div>
+            <div class="card-desc">When a child pauses to request user guidance, conventional tools block the parent's JavaScript event loop, freezing the entire session.</div>
+          </div>
+          <div class="card">
+            <div class="card-icon">📢</div>
+            <div class="card-title">Context Window Flooding</div>
+            <div class="card-desc">Unscoped broadcast chatrooms spam every agent with every peer's internal thoughts, rapidly exhausting context limits with conversational noise.</div>
+          </div>
+          <div class="card">
+            <div class="card-icon">👻</div>
+            <div class="card-title">Ghost Duplication on Retries</div>
+            <div class="card-desc">Transport timeouts during agent spawn or task assignment cause naive retries to create duplicate workers or parallel competing tasks.</div>
+          </div>
+          <div class="card">
+            <div class="card-icon">🔓</div>
+            <div class="card-title">Symlink & Alias Bypasses</div>
+            <div class="card-desc">File locks that check purely lexical strings are trivially bypassed when an agent writes through a directory alias, junction, or relative symlink.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Key Insight -->
+      <section id="key-insight">
+        <h2 class="section-header">The Key Insight: Separation of Concerns</h2>
+        <div class="callout info">
+          <div class="callout-title">Core Thesis</div>
+          <strong>"Agents make semantic decisions. A deterministic broker enforces coordination correctness."</strong>
+          <br>An LLM should never be trusted to act as a mutex, a distributed lock manager, an identity authority, or an atomic queue.
+        </div>
+        <p>
+          <code>pi-safe-agents-team</code> introduces an authoritative out-of-band coordinator daemon that sits between your Pi agent sessions and the underlying filesystem. It models workspace concurrency after the <strong>Rust borrow checker</strong>:
+        </p>
+        <ul>
+          <li><strong>Hierarchical Resources</strong>: Files and folders form a strict permission and borrow hierarchy.</li>
+          <li><strong>Shared vs. Mutable Borrows</strong>: Multiple agents may hold shared read leases simultaneously. Only <em>one</em> actor may hold an exclusive mutable lease across any overlapping path tree.</li>
+          <li><strong>Time-Bounded Leases & Heartbeats</strong>: Leases automatically reclaim if an agent crashes or stalls, preventing permanent deadlocks without stack locks.</li>
+          <li><strong>In-Flight Write Fencing</strong>: Active writes establish ephemeral exclusion fences so a lease expiring mid-mutation cannot hand the file to a competitor until the disk write finishes.</li>
+        </ul>
+      </section>
+
+      <!-- Architecture Diagram & Tab Explorer -->
+      <section id="architecture">
+        <h2 class="section-header">Broker Architecture</h2>
+        <p>
+          The architecture connects full-featured Pi SDK <code>AgentSession</code> instances to a single, serialized coordinator process over local IPC:
+        </p>
+
+        <div class="diagram-box">
+          <svg viewBox="0 0 800 360" width="800" height="360" xmlns="http://www.w3.org/2000/svg">
+            <style>
+              .node { fill: var(--bg-tertiary); stroke: var(--border-accent); stroke-width: 1.5; rx: 8; }
+              .node-hl { fill: rgba(56, 189, 248, 0.12); stroke: var(--text-accent); stroke-width: 2; rx: 8; }
+              .text-head { font-family: var(--font-sans); font-size: 14px; font-weight: 700; fill: var(--text-primary); text-anchor: middle; }
+              .text-sub { font-family: var(--font-mono); font-size: 11px; fill: var(--text-secondary); text-anchor: middle; }
+              .edge { stroke: var(--text-muted); stroke-width: 1.5; stroke-dasharray: 4,4; fill: none; }
+              .edge-solid { stroke: var(--text-accent); stroke-width: 2; fill: none; }
+            </svg>
+            <g transform="translate(40, 20)">
+              <!-- Top Layer: Agents -->
+              <rect x="60" y="0" width="180" height="50" class="node" />
+              <text x="150" y="24" class="text-head">Root Pi Session</text>
+              <text x="150" y="40" class="text-sub">Interactive Developer</text>
+
+              <rect x="480" y="0" width="180" height="50" class="node" />
+              <text x="570" y="24" class="text-head">Managed Child Session</text>
+              <text x="570" y="40" class="text-sub">createAgentSession()</text>
+
+              <!-- IPC Layer -->
+              <path d="M 150 50 L 150 90 L 360 110" class="edge-solid" />
+              <path d="M 570 50 L 570 90 L 360 110" class="edge-solid" />
+
+              <rect x="230" y="100" width="260" height="46" class="node-hl" />
+              <text x="360" y="122" class="text-head">Broker Server (Daemon)</text>
+              <text x="360" y="137" class="text-sub">Unix Socket / Windows Named Pipe</text>
+
+              <!-- Coordinator & Components -->
+              <path d="M 360 146 L 360 175" class="edge-solid" />
+
+              <rect x="60" y="175" width="600" height="70" class="node" />
+              <text x="360" y="198" class="text-head">Deterministic State Machine (Coordinator)</text>
+              
+              <rect x="80" y="210" width="120" height="25" fill="var(--bg-secondary)" stroke="var(--border-subtle)" rx="4" />
+              <text x="140" y="226" class="text-sub">Atomic Task Board</text>
+
+              <rect x="215" y="210" width="130" height="25" fill="var(--bg-secondary)" stroke="var(--border-subtle)" rx="4" />
+              <text x="280" y="226" class="text-sub">Durable FIFO Inboxes</text>
+
+              <rect x="360" y="210" width="140" height="25" fill="var(--bg-secondary)" stroke="var(--border-subtle)" rx="4" />
+              <text x="430" y="226" class="text-sub">Borrow Checker & Leases</text>
+
+              <rect x="515" y="210" width="130" height="25" fill="var(--bg-secondary)" stroke="var(--border-subtle)" rx="4" />
+              <text x="580" y="226" class="text-sub">Append-Only Journal</text>
+
+              <!-- Bottom Layer: Filesystem Boundary -->
+              <path d="M 360 245 L 360 275" class="edge-solid" />
+
+              <rect x="180" y="275" width="360" height="50" class="node-hl" />
+              <text x="360" y="297" class="text-head">Guarded Filesystem Boundary</text>
+              <text x="360" y="313" class="text-sub">Write Fences · Realpath Aliasing · Fail-Closed Interception</text>
+            </g>
+          </svg>
+        </div>
+
+        <!-- Interactive Tabbed Deep Dive -->
+        <div class="tab-container">
+          <div class="tab-nav">
+            <button class="tab-btn active" data-tab="tab-fencing">Write Fencing Flow</button>
+            <button class="tab-btn" data-tab="tab-rootguard">Root Host Guard</button>
+            <button class="tab-btn" data-tab="tab-idempotency">Durable Idempotency</button>
+            <button class="tab-btn" data-tab="tab-clarification">Non-Blocking Clarification</button>
+          </div>
+          <div class="tab-pane active" id="tab-fencing">
+            <h3 class="subsection-header" style="margin-top: 0;">In-Flight Write Fences (begin_write & end_write)</h3>
+            <p>
+              Authorization and filesystem mutation are not atomic on standard OS filesystems. To prevent race conditions where a lease expires while a slow file write is actively executing:
+            </p>
+            <ol>
+              <li>Worker acquires a mutable borrow (e.g. 5-second lease).</li>
+              <li>Before invoking node:fs, the tool calls <code>resource.begin_write({ path, fenceMs })</code>.</li>
+              <li>The coordinator authorizes the write and establishes an active in-memory <strong>write fence</strong>.</li>
+              <li>If the 5-second lease lapses during a 10-second file write, the fence continues to deny competing leases.</li>
+              <li>Once mutation completes, the worker calls <code>resource.end_write({ fenceId })</code>, immediately releasing queued waiters.</li>
+            </ol>
+          </div>
+          <div class="tab-pane" id="tab-rootguard">
+            <h3 class="subsection-header" style="margin-top: 0;">Root Host Guard (hostGuard: true)</h3>
+            <p>
+              The user interactively driving Pi should not be forced to manually define and lease every single file before typing an edit. The Root Host Guard transparently bridges interactive freedom with multi-agent safety:
+            </p>
+            <ul>
+              <li>Root <code>edit</code> and <code>write</code> tool calls are intercepted before touching disk.</li>
+              <li>Targets are checked against <code>resource.begin_write({ path, hostGuard: true })</code>.</li>
+              <li><strong>Undeclared paths</strong> pass through freely without prior declaration.</li>
+              <li><strong>Declared paths</strong> leased or fenced by active child workers are immediately vetoed with a visible explanation.</li>
+              <li><strong>Fail-closed guarantee</strong>: If the broker daemon crashes or disconnects during a coordinated write, the root guard fails closed to protect in-flight worker writes from collision.</li>
+            </ul>
+          </div>
+          <div class="tab-pane" id="tab-idempotency">
+            <h3 class="subsection-header" style="margin-top: 0;">Actor-Scoped Operation Deduplication</h3>
+            <p>
+              Network blips and IPC timeouts often cause callers to wonder whether their creation succeeded. Naive retries result in duplicate subagents and parallel conflicting tasks:
+            </p>
+            <ul>
+              <li><code>agent.spawn</code> and <code>task.create</code> accept an actor-scoped <code>operationId</code>.</li>
+              <li>The client generates an operation ID and retries ambiguous failures with the same key.</li>
+              <li>The coordinator journals the result. If a matching retry arrives, the coordinator returns <code>{ ...originalResponse, replayed: true }</code> without repeating the state transition.</li>
+              <li>Mismatched reuse of an existing operation ID fails closed with <code>IDEMPOTENCY_CONFLICT</code>.</li>
+            </ul>
+          </div>
+          <div class="tab-pane" id="tab-clarification">
+            <h3 class="subsection-header" style="margin-top: 0;">Deadlock-Free Clarification</h3>
+            <p>
+              When a child encounters ambiguity, conventional tools block the parent turn synchronously, causing call-stack deadlocks:
+            </p>
+            <ul>
+              <li>The child calls <code>agent_send({ type: "clarification", to: "parent", body: "Which auth scheme?" })</code>.</li>
+              <li>The tool signals <code>terminate: true</code>, immediately releasing the model turn and execution capacity.</li>
+              <li>The child transitions cleanly to the <code>waiting</code> state.</li>
+              <li>When the parent or user provides an answer via <code>agent_reply</code>, a fresh prompt turn wakes the child.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- Prior Art & Comparison Matrix -->
+      <section id="comparison">
+        <h2 class="section-header">How It Compares to Other Subagent Extensions</h2>
+        <p>
+          We surveyed existing approaches in the Pi and open-source multi-agent ecosystems to retain strong ideas while fixing foundational concurrency holes:
+        </p>
+
+        <div class="table-container">
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th>Feature / Guarantee</th>
+                <th>Official Pi Subagent</th>
+                <th>nicobailon/pi-subagents</th>
+                <th>tmustier/pi-agent-teams</th>
+                <th>pi-safe-agents-team</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>Execution Model</strong></td>
+                <td>Single in-process turn</td>
+                <td>SDK <code>createAgentSession</code></td>
+                <td>Background processes</td>
+                <td><span class="check">SDK persistent session</span></td>
+              </tr>
+              <tr>
+                <td><strong>Resource Concurrency</strong></td>
+                <td><span class="cross">None (Prompt only)</span></td>
+                <td><span class="cross">None (Prompt only)</span></td>
+                <td><span class="cross">None (Worktree only)</span></td>
+                <td><span class="check">Authoritative Borrow Checker</span></td>
+              </tr>
+              <tr>
+                <td><strong>In-Flight Write Fencing</strong></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="check">Yes (begin_write / end_write)</span></td>
+              </tr>
+              <tr>
+                <td><strong>Root/User Write Interception</strong></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="check">Yes (hostGuard: true)</span></td>
+              </tr>
+              <tr>
+                <td><strong>Symlink & Alias Disambiguation</strong></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="check">Yes (Realpath canonicalization)</span></td>
+              </tr>
+              <tr>
+                <td><strong>Parent Clarification</strong></td>
+                <td><span class="cross">Unsupported</span></td>
+                <td>Blocks JS event loop</td>
+                <td>File / message polling</td>
+                <td><span class="check">Non-blocking (waiting state)</span></td>
+              </tr>
+              <tr>
+                <td><strong>Durable Mailbox Delivery</strong></td>
+                <td><span class="cross">No</span></td>
+                <td>Async supervisor queue</td>
+                <td>Shared files / tmux</td>
+                <td><span class="check">FIFO queue + Acknowledged sync</span></td>
+              </tr>
+              <tr>
+                <td><strong>Idempotent Spawning / Tasks</strong></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="cross">No</span></td>
+                <td><span class="check">operationId journaled dedup</span></td>
+              </tr>
+              <tr>
+                <td><strong>Cross-Platform Parity</strong></td>
+                <td>In-process</td>
+                <td>In-process</td>
+                <td>POSIX / tmux</td>
+                <td><span class="check">Windows Named Pipes + Sockets</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Installation Section -->
+      <section id="installation">
+        <h2 class="section-header">Installation</h2>
+        
+        <div class="callout warning">
+          <div class="callout-title">npm Deployment Deferred</div>
+          Due to npm registry authentication and credential configuration, direct installation via the public npm registry is currently deferred. 
+          <strong>Please install directly from the GitHub repository using the options below.</strong>
+        </div>
+
+        <h3 class="subsection-header">Option 1: Pi Package Manager (Recommended)</h3>
+        <p>From your project workspace, run:</p>
+        <div class="code-wrapper">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button class="copy-btn" onclick="copyCode('install-pi')">Copy</button>
+          </div>
+          <pre><code id="install-pi">pi install git:github.com/SaehwanPark/pi-safe-agent-team</code></pre>
+        </div>
+
+        <h3 class="subsection-header">Option 2: Clone to User Extensions Directory</h3>
+        <p>Clone directly into your personal Pi extensions directory to make it available across all workspaces:</p>
+        <div class="code-wrapper">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button class="copy-btn" onclick="copyCode('install-git')">Copy</button>
+          </div>
+          <pre><code id="install-git">git clone https://github.com/SaehwanPark/pi-safe-agent-team ~/.pi/agent/extensions/pi-safe-agents-team</code></pre>
+        </div>
+
+        <h3 class="subsection-header">Option 3: Local Development Setup</h3>
+        <div class="code-wrapper">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button class="copy-btn" onclick="copyCode('install-dev')">Copy</button>
+          </div>
+          <pre><code id="install-dev">git clone https://github.com/SaehwanPark/pi-safe-agent-team.git
+cd pi-safe-agent-team
+npm install
+npm run check
+pi -e ./index.ts</code></pre>
+        </div>
+      </section>
+
+      <!-- Quick Start -->
+      <section id="quickstart">
+        <h2 class="section-header">Quick Start & Usage</h2>
+        
+        <h3 class="subsection-header">1. Spawning a Coordinated Worker</h3>
+        <p>With the extension loaded in Pi, prompt your root model:</p>
+        <div class="code-wrapper">
+          <div class="code-header"><span>Prompt</span></div>
+          <pre><code>Spawn a read-only scout agent to investigate the database schema in src/db.
+Do not grant write permissions or shell execution. Ask for clarification if details are missing.</code></pre>
+        </div>
+        <p>
+          The root session invokes <code>agent_spawn</code>. The coordinator returns an actor identity, binds child-safe tools, and begins the child's session asynchronously without blocking you.
+        </p>
+
+        <h3 class="subsection-header">2. Monitoring via Slash Commands</h3>
+        <p>Inspect the live coordination fabric using Pi slash commands:</p>
+        <ul>
+          <li><code>/agents</code> — Overview of active agents, health, and running turn counts.</li>
+          <li><code>/agents tree</code> — Tree view of the parent-child hierarchy and roles.</li>
+          <li><code>/agents tasks</code> — Deterministic task board with claims, dependencies, and results.</li>
+          <li><code>/agents resources</code> — Real-time resource ownership, shared/mutable holds, and waiters.</li>
+          <li><code>/agents inbox</code> — Inspection of unacknowledged and pending messages.</li>
+        </ul>
+
+        <h3 class="subsection-header">3. Standalone Coordinator TypeScript SDK</h3>
+        <p>The state coordinator is pure TypeScript and can be tested without models or networking:</p>
+        <div class="code-wrapper">
+          <div class="code-header"><span>TypeScript</span><button class="copy-btn" onclick="copyCode('sdk-code')">Copy</button></div>
+          <pre><code id="sdk-code">import { Coordinator } from "pi-safe-agents-team";
+
+const coordinator = new Coordinator({ rootId: "demo" });
+
+// 1. Register root
+coordinator.dispatch("root", "agent.register", {
+  rootId: "demo",
+  role: "root",
+  route: { provider: "local", model: "qwen", thinking: "medium" },
+  capabilities: { maySpawn: true, mayWriteRepo: true },
+});
+
+// 2. Define a protected resource
+coordinator.dispatch("root", "resource.define", {
+  resourceId: "file:src/config.ts",
+  kind: "file",
+  path: "src/config.ts",
+  permissions: ["write"],
+});
+
+// 3. Borrow exclusively & begin fenced write
+coordinator.dispatch("root", "resource.borrow", {
+  resourceId: "file:src/config.ts",
+  mode: "mutable",
+  leaseMs: 15_000,
+});
+const writeFence = coordinator.dispatch("root", "resource.begin_write", {
+  path: "src/config.ts",
+  fenceMs: 30_000,
+}).value;
+
+console.log("Write authorized, fence active:", writeFence.fenceId);</code></pre>
+        </div>
+      </section>
+
+      <!-- Operational Boundaries & Caveats -->
+      <section id="operational-boundaries">
+        <h2 class="section-header">Operational Boundaries & Known Caveats</h2>
+        <p>
+          In the spirit of honest distributed-systems engineering, we document the system's exact operational boundaries:
+        </p>
+        
+        <div class="callout warning">
+          <div class="callout-title">Write Fences Across Broker Crashes</div>
+          Write fences (<code>resource.begin_write</code>) are currently kept in coordinator memory. They strictly protect writes during normal broker operation (including lease lapses and root write interception). However, if the broker process crashes mid-write and restarts while the writer's filesystem call is still executing, the fence is not crash-durable. <em>(A post-v0.1 recovery quarantine mechanism is planned to temporarily fence resources that had active leases upon restart).</em>
+        </div>
+
+        <div class="callout info">
+          <div class="callout-title">Shell Isolation Scope</div>
+          Shared-workspace shell (<code>workspace: "shared"</code>) is strictly verified and read-only. Arguments are checked for path escapes and indirect file-reading flags (e.g. <code>file -f</code>, <code>wc --files0-from</code>). In contrast, worktree shell (<code>workspace: "worktree"</code>) is an explicitly trusted developer escape hatch isolated by Git worktrees, not by coordinator resource locks.
+        </div>
+      </section>
+
+      <!-- Deep Dive Guides -->
+      <section id="docs-links">
+        <h2 class="section-header">Deep-Dive Documentation</h2>
+        <p>Explore the full architectural specifications and guides in the repository:</p>
+        <div class="card-grid">
+          <a href="https://github.com/SaehwanPark/pi-safe-agent-team/blob/main/ARCHITECTURE.md" class="card" style="text-decoration: none;">
+            <div class="card-title">ARCHITECTURE.md ↗</div>
+            <div class="card-desc">Comprehensive system design, component boundaries, state transition invariants, and deferred features.</div>
+          </a>
+          <a href="https://github.com/SaehwanPark/pi-safe-agent-team/blob/main/PROTOCOL.md" class="card" style="text-decoration: none;">
+            <div class="card-title">PROTOCOL.md ↗</div>
+            <div class="card-desc">JSONL frames, IPC protocol specifications, error code reference, and operation schemas.</div>
+          </a>
+          <a href="https://github.com/SaehwanPark/pi-safe-agent-team/blob/main/docs/ownership.md" class="card" style="text-decoration: none;">
+            <div class="card-title">docs/ownership.md ↗</div>
+            <div class="card-desc">Detailed mechanics of hierarchical resource trees, shared vs mutable borrows, leases, and write fencing.</div>
+          </a>
+          <a href="https://github.com/SaehwanPark/pi-safe-agent-team/blob/main/PRIOR_ART.md" class="card" style="text-decoration: none;">
+            <div class="card-title">PRIOR_ART.md ↗</div>
+            <div class="card-desc">In-depth technical breakdown of existing Pi subagent extensions and architectural lessons learned.</div>
+          </a>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script>
+    // Copy code button handler
+    function copyCode(id) {
+      const codeElement = document.getElementById(id);
+      if (!codeElement) return;
+      navigator.clipboard.writeText(codeElement.innerText).then(() => {
+        const btn = event.currentTarget;
+        const originalText = btn.innerText;
+        btn.innerText = "Copied!";
+        setTimeout(() => { btn.innerText = originalText; }, 2000);
+      });
+    }
+
+    // Interactive Tab switcher
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const targetTab = btn.getAttribute('data-tab');
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        const pane = document.getElementById(targetTab);
+        if (pane) pane.classList.add('active');
+      });
+    });
+
+    // Theme toggle handler (dark / light)
+    const themeToggle = document.getElementById('theme-toggle');
+    const savedTheme = localStorage.getItem('theme') || 'dark';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+
+    themeToggle.addEventListener('click', () => {
+      const current = document.documentElement.getAttribute('data-theme');
+      const next = current === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+    });
+
+    // Mobile nav toggle
+    const mobileToggle = document.getElementById('mobile-toggle');
+    const sidebar = document.getElementById('sidebar');
+    if (window.innerWidth <= 900) {
+      mobileToggle.style.display = 'flex';
+    }
+    window.addEventListener('resize', () => {
+      mobileToggle.style.display = window.innerWidth <= 900 ? 'flex' : 'none';
+    });
+    mobileToggle.addEventListener('click', () => {
+      sidebar.classList.toggle('open');
+    });
+
+    // Active link highlighting on scroll
+    const sections = document.querySelectorAll('section[id]');
+    const navLinks = document.querySelectorAll('.sidebar-link');
+    window.addEventListener('scroll', () => {
+      let current = '';
+      sections.forEach(section => {
+        const sectionTop = section.offsetTop - 100;
+        if (window.pageYOffset >= sectionTop) {
+          current = section.getAttribute('id');
+        }
+      });
+      navLinks.forEach(link => {
+        link.classList.remove('active');
+        if (link.getAttribute('href') === `#${current}`) {
+          link.classList.add('active');
+        }
+      });
+    });
+  </script>
+</body>
+</html>

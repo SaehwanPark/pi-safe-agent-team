@@ -479,6 +479,15 @@ export function assertReadOnlyShellCommand(command: string): void {
   })) {
     throw new FabricError("CAPABILITY_DENIED", "Commands that write an output file are not allowed in a shared workspace");
   }
+  if (tokens.some((token) => {
+    const option = stripQuotes(token);
+    if (executable === "file" && (option === "-f" || /^-[^-]*f/.test(option) || option === "--files-from" || option.startsWith("--files-from="))) return true;
+    if ((executable === "wc" || executable === "du" || executable === "sort") && (option === "--files0-from" || option.startsWith("--files0-from="))) return true;
+    if (executable === "find" && (option === "-files0-from" || option.startsWith("-files0-from="))) return true;
+    return false;
+  })) {
+    throw new FabricError("CAPABILITY_DENIED", "Indirect file-list options are not allowed in a shared workspace");
+  }
   if (!readOnlyExecutables.has(executable)) {
     throw new FabricError("CAPABILITY_DENIED", `Shell command ${executable} is not in the read-only allowlist`);
   }

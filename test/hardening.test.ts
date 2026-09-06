@@ -80,6 +80,12 @@ test("shared shell rejects mutation syntax and dangerous read-command options", 
   expectCode(() => assertReadOnlyShellCommand("/tmp/cat secret"), "CAPABILITY_DENIED");
   expectCode(() => assertReadOnlyShellCommand("cat ../secret"), "CAPABILITY_DENIED");
   expectCode(() => assertReadOnlyShellCommand("grep secret /etc/hosts"), "CAPABILITY_DENIED");
+  expectCode(() => assertReadOnlyShellCommand("file -f names.txt"), "CAPABILITY_DENIED");
+  expectCode(() => assertReadOnlyShellCommand("file --files-from=names.txt"), "CAPABILITY_DENIED");
+  expectCode(() => assertReadOnlyShellCommand("wc --files0-from=names.bin"), "CAPABILITY_DENIED");
+  expectCode(() => assertReadOnlyShellCommand("du --files0-from=names.bin"), "CAPABILITY_DENIED");
+  expectCode(() => assertReadOnlyShellCommand("sort --files0-from=names.bin"), "CAPABILITY_DENIED");
+  expectCode(() => assertReadOnlyShellCommand("find . -files0-from names.bin"), "CAPABILITY_DENIED");
 });
 
 test("shared git inspection cannot execute a repository alias", async () => {

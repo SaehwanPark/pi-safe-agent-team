@@ -1,12 +1,12 @@
 # pi-safe-agents-team architecture
 
-> Status: v1 architecture baseline (2026-09-05). This document describes the implementation target; behavior is reconciled with tests as the code lands.
+> Status: v0.1 architecture baseline (2026-09-06). This document describes the implementation target; behavior is reconciled with tests as the code lands.
 
 ## North star
 
 Agents make semantic decisions. A local coordinator makes coordination decisions. An LLM is never asked to act as a mutex, message queue, identity provider, or authority source.
 
-## Concrete v1 scope
+## Concrete v0.1 scope
 
 The first release is a local Pi extension and a small broker process:
 
@@ -24,7 +24,7 @@ The first release is a local Pi extension and a small broker process:
 - optional Git worktree creation for managed coding children;
 - append-only broker journal with transaction markers, crash-tail recovery, and durable write-idempotency records.
 
-The v1 implementation deliberately does not attempt a distributed service, remote agents, automatic merge/release policy, transcript replication, or unrestricted extension propagation into managed children.
+The v0.1 implementation deliberately does not attempt a distributed service, remote agents, automatic merge/release policy, transcript replication, or unrestricted extension propagation into managed children. Future v1.0 milestones will address multi-host / distributed fabric scaling.
 
 ## Components
 
@@ -100,9 +100,11 @@ Resource IDs are opaque strings, with optional explicit `parentId` links and wor
 
 Each active hold has a lease. Hosts heartbeat while a session is active; the broker also reclaims expired leases. A process disconnect or terminal agent state releases runtime holds and wakes waiters. Resource `version` increments on mutable release/transfer, and `snapshot` returns a stable version token for stale-dependency checks.
 
-Managed `edit`/`write` tools use Pi's operation override to call `resource.check_write` immediately before the final filesystem write. The target must be inside the managed workspace and match a declared file/module path. Shared-workspace shell uses a conservative read-only allowlist; a worktree shell is explicitly trusted and isolated by the Git worktree convention, so it is documented as a semantic escape hatch rather than a mechanically resource-guarded mutation path.
+Managed `edit`/`write` tools use Pi's operation override to execute a guarded write flow: `resource.begin_write` authorizes the write and places an active write fence on the matched resource, the filesystem mutation completes, and `resource.end_write` releases the fence. The target must be inside the managed workspace and match a declared file/module path. The write fence ensures that even if an agent's lease lapses mid-write, competing borrowers are excluded from clobbering the file. Shared-workspace shell uses a conservative read-only allowlist with argument path containment and indirect file-list exclusions (`file -f`, `--files0-from`); a worktree shell is explicitly trusted and isolated by the Git worktree convention, so it is documented as a semantic escape hatch rather than a mechanically resource-guarded mutation path.
 
-The root also participates in borrowing. A Pi `tool_call` veto intercepts the root session's `edit`/`write` calls before mutation and consults `resource.check_write` with `hostGuard: true`: undeclared paths remain writable (the root need not declare everything first), but any live foreign hold on an overlapping declared resource blocks the root write. The root therefore cannot mechanically race a child's borrow; only its unintercepted shell remains a trusted mutation path, and that is documented as such rather than claimed as guarded.
+The root also participates in borrowing. A Pi `tool_call` veto intercepts the root session's `edit`/`write` calls before mutation and invokes `resource.begin_write` with `hostGuard: true`: undeclared paths remain writable (the root need not declare everything first), but any live foreign hold or active foreign write fence on an overlapping declared resource blocks the root write. Coordinated writes fail closed if the broker is unavailable, protecting in-flight child writes during outages. Only the root's unintercepted shell remains a trusted mutation path, and that is documented as such rather than claimed as guarded.
+
+> **Durability boundary note**: Write fencing protects coordinated writes during normal broker operation, including lease expiry and root interception. However, write fences are in-memory coordinator records and are not crash-durable across an independent broker restart. A post-v0.1 recovery quarantine will temporarily fence resources that had active mutable leases at the time of broker failure to bridge crash survivability.
 
 ### Workspaces
 
