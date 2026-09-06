@@ -234,18 +234,19 @@ test("a lost response after a committed write replays the original task on retry
     const server = new BrokerServer({ directory, rootId: "fabric", rootAgentId: "root", journal, config: { maxTotalAgents: 8 } });
     await server.start();
     try {
-      const root = new BrokerClient({ endpoint: server.endpoint, agentId: "root", requestTimeoutMs: 100 });
+      const root = new BrokerClient({ endpoint: server.endpoint, agentId: "root" });
       await root.request("agent.register", { rootId: "fabric", route, capabilities: { maySpawn: true } });
-      const slow = root.requestIdempotent<TaskRecord & { replayed?: boolean }>("task.create", { description: "response lost" }, "op-lost");
+      const slow = root.requestIdempotent<TaskRecord & { replayed?: boolean }>("task.create", { description: "response lost" }, "op-lost", 150);
       // The first attempt blocks inside the journal and times out client-side,
       // so its response is ambiguous; the retry then waits behind it.
       await journal.entered;
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      await new Promise((resolve) => setTimeout(resolve, 250));
       journal.release();
       const created = await slow;
       const listed = await root.request<TaskRecord[]>("task.list", {});
       assert.equal(listed.length, 1);
       assert.equal(listed[0].id, created.id);
+      assert.equal(created.replayed, true);
       root.close();
     } finally {
       journal.release();

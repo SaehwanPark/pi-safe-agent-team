@@ -27,7 +27,7 @@ function isAmbiguousBrokerFailure(error: unknown): boolean {
 
 export class BrokerClient {
   readonly endpoint: string;
-  readonly requestTimeoutMs: number;
+  requestTimeoutMs: number;
   private agentId: string;
   private token?: string;
   private socket?: net.Socket;
@@ -66,17 +66,18 @@ export class BrokerClient {
     }
   }
 
-  async request<T = unknown>(op: string, args: Record<string, unknown> = {}): Promise<T> {
+  async request<T = unknown>(op: string, args: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
     await this.connect();
     const socket = this.socket;
     if (!socket || socket.destroyed) throw new FabricError("BROKER_UNAVAILABLE", "Broker connection is not available");
     const id = `request-${randomUUID()}`;
     const frame: RequestFrame = { id, version: PROTOCOL_VERSION, op, args };
+    const effectiveTimeoutMs = timeoutMs ?? this.requestTimeoutMs;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new FabricError("BROKER_UNAVAILABLE", `Broker request ${op} timed out`));
-      }, this.requestTimeoutMs);
+      }, effectiveTimeoutMs);
       this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
       try {
         socket.write(`${JSON.stringify(frame)}\n`);
@@ -95,11 +96,11 @@ export class BrokerClient {
    * the retry replays the original response instead of duplicating the child
    * or task. Deterministic business errors are never retried.
    */
-  async requestIdempotent<T = unknown>(op: string, args: Record<string, unknown> = {}, operationId?: string): Promise<T> {
+  async requestIdempotent<T = unknown>(op: string, args: Record<string, unknown> = {}, operationId?: string, timeoutMs?: number): Promise<T> {
     const id = operationId ?? `op-${randomUUID()}`;
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.request<T>(op, { ...args, operationId: id });
+        return await this.request<T>(op, { ...args, operationId: id }, timeoutMs);
       } catch (error) {
         if (attempt >= 1 || !isAmbiguousBrokerFailure(error)) throw error;
       }

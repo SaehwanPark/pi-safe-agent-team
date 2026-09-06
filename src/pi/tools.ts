@@ -5,9 +5,9 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { FabricError } from "../core/errors.ts";
 import type { MessageType, ModelRoute } from "../core/types.ts";
 export interface BrokerRequestClient {
-  request<T = unknown>(operation: string, args?: Record<string, unknown>): Promise<T>;
+  request<T = unknown>(operation: string, args?: Record<string, unknown>, timeoutMs?: number): Promise<T>;
   /** Optional: coordinators that deduplicate spawns/creates by operationId. */
-  requestIdempotent?<T = unknown>(operation: string, args?: Record<string, unknown>, operationId?: string): Promise<T>;
+  requestIdempotent?<T = unknown>(operation: string, args?: Record<string, unknown>, operationId?: string, timeoutMs?: number): Promise<T>;
 }
 
 export interface SpawnToolInput {
