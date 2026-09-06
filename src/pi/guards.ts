@@ -1,6 +1,6 @@
 import { constants as fsConstants } from "node:fs";
 import { access as fsAccess, lstat as fsLstat, mkdir as fsMkdir, open as fsOpen, readFile as fsReadFile, realpath as fsRealpath, readdir as fsReaddir, stat as fsStat } from "node:fs/promises";
-import { delimiter, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import {
   createBashToolDefinition,
   createEditToolDefinition,
@@ -197,15 +197,67 @@ async function ensureDirectoryWithoutFollowingSymlinks(workspacePath: string, di
 }
 
 async function authorizeWrite(client: WriteAuthorizationClient, workspacePath: string, absolutePath: string): Promise<void> {
-  const path = workspaceRelativePath(workspacePath, absolutePath);
   await assertFilesystemTargetWithinWorkspace(workspacePath, absolutePath);
-  const decision = await client.request<WriteDecision>("resource.check_write", { path });
+  const identity = await resolvePolicyPathIdentity(workspacePath, absolutePath);
+  if (!identity.coordinated || identity.path === undefined) {
+    throw new FabricError("CAPABILITY_DENIED", `Target ${absolutePath} resolves outside the managed workspace`, { workspacePath, absolutePath });
+  }
+  const decision = await client.request<WriteDecision>("resource.check_write", { path: identity.path });
   if (decision?.allowed !== true) {
-    throw new FabricError("CAPABILITY_DENIED", typeof decision?.reason === "string" ? decision.reason : `No mutable resource hold authorizes ${path}`, {
-      path,
+    throw new FabricError("CAPABILITY_DENIED", typeof decision?.reason === "string" ? decision.reason : `No mutable resource hold authorizes ${identity.path}`, {
+      path: identity.path,
       resourceId: typeof decision?.resourceId === "string" ? decision.resourceId : undefined,
     });
   }
+}
+
+/**
+ * Resolve a target through symlinks and junctions to the real filesystem
+ * path it will actually modify, tolerating a not-yet-existing tail by
+ * resolving the nearest existing ancestor. Borrowing policy must key on this
+ * identity: the same file reached through a directory alias or alternate
+ * spelling is still the same file, and a textual path alone would let one
+ * writer sidestep another actor's hold.
+ */
+async function realpathWithMissingTail(target: string): Promise<string> {
+  const missingTail: string[] = [];
+  let probe = target;
+  while (true) {
+    try {
+      const realProbe = await fsRealpath(probe);
+      return missingTail.length ? resolve(realProbe, ...missingTail.reverse()) : realProbe;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      missingTail.push(probe.slice(dirname(probe).length + 1) || basename(probe));
+      const parent = dirname(probe);
+      if (parent === probe) throw error;
+      probe = parent;
+    }
+  }
+}
+
+export interface PolicyPathIdentity {
+  /** True when the real target lies inside the workspace and is resource-coordinatable. */
+  coordinated: boolean;
+  /** Canonical workspace-relative identity (native separators folded to "/"), if coordinated. */
+  path?: string;
+}
+
+async function resolvePolicyPathIdentity(workspacePath: string, targetPath: string): Promise<PolicyPathIdentity> {
+  if (targetPath.includes("\u0000")) throw new FabricError("CAPABILITY_DENIED", "Filesystem paths must not contain NUL characters");
+  const root = resolve(workspacePath);
+  const target = resolve(root, targetPath);
+  const realRoot = await fsRealpath(root).catch((error: unknown) => {
+    throw new FabricError("CAPABILITY_DENIED", `Managed workspace is not accessible: ${error instanceof Error ? error.message : String(error)}`, { workspacePath });
+  });
+  const realTarget = await realpathWithMissingTail(target).catch((error: unknown) => {
+    if (error instanceof FabricError) throw error;
+    throw new FabricError("CAPABILITY_DENIED", `Cannot resolve the real path of ${targetPath}: ${error instanceof Error ? error.message : String(error)}`, { workspacePath, targetPath });
+  });
+  const relativePath = relative(realRoot, realTarget);
+  if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) return { coordinated: false };
+  return { coordinated: true, path: relativePath.split(sep).join("/") };
 }
 
 async function assertFilesystemTargetWithinWorkspace(workspacePath: string, targetPath: string): Promise<void> {
@@ -255,11 +307,16 @@ export async function evaluateRootWriteGuard(options: RootWriteGuardOptions, too
   if (toolName !== "edit" && toolName !== "write") return undefined;
   const requested = (input as { path?: unknown } | undefined)?.path;
   if (typeof requested !== "string" || requested.length === 0 || requested.includes("\u0000")) return undefined;
-  const root = resolve(options.workspacePath);
-  const target = resolve(root, requested);
-  const relativePath = relative(root, target);
-  if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) return undefined;
-  const path = relativePath.split(sep).join("/");
+  let identity: PolicyPathIdentity;
+  try {
+    identity = await resolvePolicyPathIdentity(options.workspacePath, requested);
+  } catch (error) {
+    return { block: true, reason: `safe-agents could not resolve the real path of ${requested}: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  // Targets whose real filesystem identity lies outside the fabric workspace (including through
+  // escaping links) are not resource-coordinated; the root keeps its ordinary freedom there.
+  if (!identity.coordinated || identity.path === undefined) return undefined;
+  const path = identity.path;
   let decision: WriteDecision | undefined;
   try {
     decision = await options.client.request<WriteDecision>("resource.check_write", { path, hostGuard: true });

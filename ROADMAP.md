@@ -60,6 +60,8 @@ Actionable work is tracked here with checkboxes. Checked items mean the behavior
 - [x] Make the fabric root participate in borrowing: root `edit`/`write` calls are vetoed before mutation when a live foreign hold overlaps the target, while undeclared root paths stay writable and the root shell remains documented as trusted.
 - [x] Give `agent.spawn`/`task.create` durable `operationId` idempotency with journal-persisted dedup records, replay-on-retry, `IDEMPOTENCY_CONFLICT` on mismatched reuse, and a single bounded ambiguous-failure retry in the broker client.
 - [x] Reserve `maxTotalAgents` capacity for reconnectable actors across broker restarts so new agents cannot evict an expected reconnection.
+- [x] Resolve filesystem path identity (symlinks, junctions, alternate spellings) at the guarded write boundary so holds are enforced against the real target; unresolvable paths fail closed.
+- [ ] Optional: resolve `agent_resource` declaration paths through the same real-path identity at declaration time (enforcement side is canonical today; mismatched alias declarations currently fail closed as undeclared).
 
 ## Hardening / v1.x
 
