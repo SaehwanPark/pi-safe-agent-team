@@ -801,57 +801,74 @@
         </p>
 
         <div class="diagram-box">
-          <svg viewBox="0 0 800 360" width="800" height="360" xmlns="http://www.w3.org/2000/svg">
+          <svg viewBox="0 0 840 400" width="100%" height="auto" xmlns="http://www.w3.org/2000/svg" style="max-width: 840px; margin: 0 auto; display: block;">
+            <defs>
+              <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 1.5 L 8 5 L 0 8.5 z" class="svg-arrow" />
+              </marker>
+              <linearGradient id="hlGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="var(--text-accent)" stop-opacity="0.15" />
+                <stop offset="100%" stop-color="var(--text-accent)" stop-opacity="0.05" />
+              </linearGradient>
+            </defs>
             <style>
-              .node { fill: var(--bg-tertiary); stroke: var(--border-accent); stroke-width: 1.5; rx: 8; }
-              .node-hl { fill: rgba(56, 189, 248, 0.12); stroke: var(--text-accent); stroke-width: 2; rx: 8; }
-              .text-head { font-family: var(--font-sans); font-size: 14px; font-weight: 700; fill: var(--text-primary); text-anchor: middle; }
-              .text-sub { font-family: var(--font-mono); font-size: 11px; fill: var(--text-secondary); text-anchor: middle; }
-              .edge { stroke: var(--text-muted); stroke-width: 1.5; stroke-dasharray: 4,4; fill: none; }
-              .edge-solid { stroke: var(--text-accent); stroke-width: 2; fill: none; }
-            </svg>
-            <g transform="translate(40, 20)">
-              <!-- Top Layer: Agents -->
-              <rect x="60" y="0" width="180" height="50" class="node" />
-              <text x="150" y="24" class="text-head">Root Pi Session</text>
-              <text x="150" y="40" class="text-sub">Interactive Developer</text>
+              .svg-node { fill: var(--bg-tertiary); stroke: var(--border-accent); stroke-width: 1.5; transition: all 0.2s ease; }
+              .svg-node-hl { fill: url(#hlGradient); stroke: var(--text-accent); stroke-width: 2; transition: all 0.2s ease; }
+              .svg-node-sub { fill: var(--bg-secondary); stroke: var(--border-subtle); stroke-width: 1; }
+              .svg-head { font-family: var(--font-sans); font-size: 14px; font-weight: 700; fill: var(--text-primary); text-anchor: middle; }
+              .svg-sub { font-family: var(--font-mono); font-size: 11px; fill: var(--text-secondary); text-anchor: middle; }
+              .svg-sub-bold { font-family: var(--font-sans); font-size: 11.5px; font-weight: 600; fill: var(--text-primary); text-anchor: middle; }
+              .svg-edge { stroke: var(--text-accent); stroke-width: 2; fill: none; stroke-linecap: round; }
+              .svg-arrow { fill: var(--text-accent); }
+              .svg-node:hover, .svg-node-hl:hover { filter: drop-shadow(0 4px 12px var(--glow-accent)); }
+            </style>
 
-              <rect x="480" y="0" width="180" height="50" class="node" />
-              <text x="570" y="24" class="text-head">Managed Child Session</text>
-              <text x="570" y="40" class="text-sub">createAgentSession()</text>
+            <g>
+              <!-- Tier 1: Agents -->
+              <rect x="80" y="15" width="220" height="56" rx="8" class="svg-node" />
+              <text x="190" y="38" class="svg-head">💻 Root Pi Session</text>
+              <text x="190" y="56" class="svg-sub">Interactive Developer</text>
 
-              <!-- IPC Layer -->
-              <path d="M 150 50 L 150 90 L 360 110" class="edge-solid" />
-              <path d="M 570 50 L 570 90 L 360 110" class="edge-solid" />
+              <rect x="540" y="15" width="220" height="56" rx="8" class="svg-node" />
+              <text x="650" y="38" class="svg-head">🤖 Managed Child Session</text>
+              <text x="650" y="56" class="svg-sub">createAgentSession()</text>
 
-              <rect x="230" y="100" width="260" height="46" class="node-hl" />
-              <text x="360" y="122" class="text-head">Broker Server (Daemon)</text>
-              <text x="360" y="137" class="text-sub">Unix Socket / Windows Named Pipe</text>
+              <!-- IPC Layer Connections -->
+              <path d="M 190 71 C 190 95, 330 95, 330 118" class="svg-edge" marker-end="url(#arrow)" />
+              <path d="M 650 71 C 650 95, 510 95, 510 118" class="svg-edge" marker-end="url(#arrow)" />
 
-              <!-- Coordinator & Components -->
-              <path d="M 360 146 L 360 175" class="edge-solid" />
+              <!-- Tier 2: Broker Server -->
+              <rect x="250" y="120" width="340" height="54" rx="8" class="svg-node-hl" />
+              <text x="420" y="143" class="svg-head">⚡ Broker Server (Daemon)</text>
+              <text x="420" y="161" class="svg-sub">Unix Socket / Windows Named Pipe</text>
 
-              <rect x="60" y="175" width="600" height="70" class="node" />
-              <text x="360" y="198" class="text-head">Deterministic State Machine (Coordinator)</text>
-              
-              <rect x="80" y="210" width="120" height="25" fill="var(--bg-secondary)" stroke="var(--border-subtle)" rx="4" />
-              <text x="140" y="226" class="text-sub">Atomic Task Board</text>
+              <!-- Coordinator Connection -->
+              <path d="M 420 174 L 420 208" class="svg-edge" marker-end="url(#arrow)" />
 
-              <rect x="215" y="210" width="130" height="25" fill="var(--bg-secondary)" stroke="var(--border-subtle)" rx="4" />
-              <text x="280" y="226" class="text-sub">Durable FIFO Inboxes</text>
+              <!-- Tier 3: Deterministic Coordinator -->
+              <rect x="50" y="210" width="740" height="88" rx="8" class="svg-node" />
+              <text x="420" y="233" class="svg-head">🔒 Deterministic State Machine (Coordinator)</text>
 
-              <rect x="360" y="210" width="140" height="25" fill="var(--bg-secondary)" stroke="var(--border-subtle)" rx="4" />
-              <text x="430" y="226" class="text-sub">Borrow Checker & Leases</text>
+              <!-- 4 Sub-Boxes -->
+              <rect x="68" y="247" width="166" height="36" rx="6" class="svg-node-sub" />
+              <text x="151" y="270" class="svg-sub-bold">📋 Atomic Task Board</text>
 
-              <rect x="515" y="210" width="130" height="25" fill="var(--bg-secondary)" stroke="var(--border-subtle)" rx="4" />
-              <text x="580" y="226" class="text-sub">Append-Only Journal</text>
+              <rect x="248" y="247" width="166" height="36" rx="6" class="svg-node-sub" />
+              <text x="331" y="270" class="svg-sub-bold">📬 Durable FIFO Inboxes</text>
 
-              <!-- Bottom Layer: Filesystem Boundary -->
-              <path d="M 360 245 L 360 275" class="edge-solid" />
+              <rect x="428" y="247" width="166" height="36" rx="6" class="svg-node-sub" />
+              <text x="511" y="270" class="svg-sub-bold">⚖️ Borrow Checker &amp; Leases</text>
 
-              <rect x="180" y="275" width="360" height="50" class="node-hl" />
-              <text x="360" y="297" class="text-head">Guarded Filesystem Boundary</text>
-              <text x="360" y="313" class="text-sub">Write Fences · Realpath Aliasing · Fail-Closed Interception</text>
+              <rect x="608" y="247" width="166" height="36" rx="6" class="svg-node-sub" />
+              <text x="691" y="270" class="svg-sub-bold">📜 Append-Only Journal</text>
+
+              <!-- Filesystem Connection -->
+              <path d="M 420 298 L 420 332" class="svg-edge" marker-end="url(#arrow)" />
+
+              <!-- Tier 4: Guarded Filesystem Boundary -->
+              <rect x="130" y="334" width="580" height="54" rx="8" class="svg-node-hl" />
+              <text x="420" y="357" class="svg-head">🛡️ Guarded Filesystem Boundary</text>
+              <text x="420" y="375" class="svg-sub">Write Fences · Realpath Aliasing · Fail-Closed Interception</text>
             </g>
           </svg>
         </div>
