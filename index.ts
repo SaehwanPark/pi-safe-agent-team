@@ -12,7 +12,7 @@ export { BrokerClient } from "./src/broker/client.ts";
 export { BrokerServer, startBroker } from "./src/broker/server.ts";
 export { Journal } from "./src/broker/journal.ts";
 export { FabricRuntime, ManagedChild, taskAwareTurnStatus } from "./src/pi/runtime.ts";
-export { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, workspaceRelativePath } from "./src/pi/guards.ts";
+export { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootWriteGuard, workspaceRelativePath } from "./src/pi/guards.ts";
 export { GitWorkspaceStrategy, SharedWorkspaceStrategy } from "./src/workspace.ts";
 export * from "./src/core/types.ts";
 
@@ -84,6 +84,14 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       rootDeliveryStates.delete(removable);
     }
   }
+
+  // The root participates in borrowing too: ordinary Pi edit/write calls are
+  // vetoed before the filesystem mutation when a live hold overlaps the path.
+  // Root shell remains unguarded and is documented as trusted, not sandboxed.
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName !== "edit" && event.toolName !== "write") return undefined;
+    return await runtime.guardRootMutation(event.toolName, event.input, ctx.cwd);
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     try {

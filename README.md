@@ -86,6 +86,7 @@ npm run typecheck
 - `agent_resource` is authoritative for ownership and borrows. A prompt saying “I own this file” never changes state; even the owner must hold a mutable borrow before a guarded file mutation.
 - A task result is submitted explicitly with `agent_task(action=complete, result=...)` and is bounded by `maxTaskOutput`; a model turn ending never completes an assigned task.
 - Managed child `read`/`grep`/`find`/`ls` tools are workspace-scoped; `edit`/`write` tools also resolve their target against a declared workspace-relative file/module resource and call the coordinator at the actual filesystem write boundary. Shared-workspace shell is a conservative read-only allowlist with workspace-relative arguments; worktree shell is explicitly trusted and isolated only by the Git worktree.
+- The root session participates in borrowing: its ordinary Pi `edit`/`write` calls are vetoed before mutation whenever a live child hold overlaps the target. Undeclared root paths stay writable; the root shell stays explicitly trusted (not intercepted).
 - Model inheritance means the caller's actual in-memory `provider/model` object. Missing or excluded explicit routes fail closed.
 - Dirty worktrees are never silently deleted.
 

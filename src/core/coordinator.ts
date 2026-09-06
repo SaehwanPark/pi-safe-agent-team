@@ -1114,6 +1114,12 @@ export class Coordinator {
 
   private checkWrite(actorId: AgentId, args: Record<string, unknown>): { allowed: boolean; reason?: string; resourceId?: string } {
     const actor = this.requireActor(actorId);
+    // The fabric root may participate in borrowing through the host guard: it
+    // authorizes an external write purely by the absence of conflicting holds
+    // instead of requiring its own declared resource and mutable hold. Only
+    // the depth-0 root may claim this exemption; children keep the strict rule.
+    const hostGuard = args.hostGuard === true;
+    assertCondition(!hostGuard || actor.depth === 0, "CAPABILITY_DENIED", `Agent ${actorId} cannot use the root host write guard`);
     if (!actor.capabilities.mayWriteRepo) {
       return { allowed: false, reason: `Agent ${actorId} is not allowed to write repository files` };
     }
@@ -1129,12 +1135,14 @@ export class Coordinator {
       return { allowed: false, resourceId: selectedResource.id, reason: `Resource ${selectedResource.id} does not declare ${requestedPath}` };
     }
     if (candidates.length === 0) {
+      if (hostGuard) return { allowed: true };
       return { allowed: false, reason: `No declared resource matches ${requestedPath}` };
     }
     const conflicting = requestedPath === undefined ? undefined : candidates.find((resource) => resource.sharedHolds.length > 0 || resource.mutableHold && resource.mutableHold.agentId !== actorId);
     if (conflicting) {
       return { allowed: false, resourceId: conflicting.id, reason: `A conflicting runtime hold prevents writing ${requestedPath}` };
     }
+    if (hostGuard) return { allowed: true, resourceId: candidates[0].id };
     const allowed = candidates.find((resource) => this.hasMutableHold(resource, actorId));
     if (allowed) return { allowed: true, resourceId: allowed.id };
     return {

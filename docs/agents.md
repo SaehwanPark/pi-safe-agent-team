@@ -46,6 +46,8 @@ Each managed child has one prompt tail. New parent/peer messages are queued dura
 
 Managed `read`/`grep`/`find`/`ls` tools are scoped to the child workspace. Managed `edit`/`write` tools call `resource.check_write` immediately before their filesystem write. The target must be inside the child workspace and match a declared file/module path with a current mutable hold; logical ownership alone is insufficient. Shared-workspace `mayUseShell` is a conservative read-only allowlist with workspace-relative arguments. Worktree `mayUseShell` is an explicitly trusted shell escape limited by the Git worktree convention, not by resource locks.
 
+The root session participates too: its ordinary Pi `edit`/`write` calls are vetoed before execution when a live foreign hold overlaps the workspace-relative target (`resource.check_write` with `hostGuard: true`). Undeclared paths stay writable for the root, targets outside the root workspace are not coordinated, and the root shell is not intercepted — it remains trusted, not sandboxed.
+
 ## Failure behavior
 
 - session creation/auth error: child is cancelled and the error is returned;

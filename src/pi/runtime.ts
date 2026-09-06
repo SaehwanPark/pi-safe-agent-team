@@ -14,7 +14,7 @@ import { BrokerServer, defaultEndpoint } from "../broker/server.ts";
 import { GitWorkspaceStrategy, type WorkspaceStrategy } from "../workspace.ts";
 import { resolveChildModel, routeFromModel } from "./model-routing.ts";
 import { createCoordinationTools, type SpawnToolInput } from "./tools.ts";
-import { createGuardedChildTools, createGuardedReadOnlyTools } from "./guards.ts";
+import { createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootWriteGuard } from "./guards.ts";
 
 export interface RoleConfig {
   model?: string;
@@ -181,6 +181,12 @@ export class FabricRuntime {
   async request<T = unknown>(operation: string, args: Record<string, unknown> = {}): Promise<T> {
     if (!this.root) throw new FabricError("BROKER_UNAVAILABLE", "Fabric root is not attached");
     return this.root.client.request<T>(operation, args);
+  }
+
+  /** Coordinate a root-session file mutation against live borrowing state. */
+  async guardRootMutation(toolName: string, input: unknown, workspacePath: string): Promise<{ block: true; reason: string } | undefined> {
+    if (!this.root) return undefined;
+    return evaluateRootWriteGuard({ client: this.root.client, workspacePath }, toolName, input);
   }
 
   async status(): Promise<unknown> {

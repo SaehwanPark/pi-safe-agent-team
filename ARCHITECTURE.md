@@ -102,6 +102,8 @@ Each active hold has a lease. Hosts heartbeat while a session is active; the bro
 
 Managed `edit`/`write` tools use Pi's operation override to call `resource.check_write` immediately before the final filesystem write. The target must be inside the managed workspace and match a declared file/module path. Shared-workspace shell uses a conservative read-only allowlist; a worktree shell is explicitly trusted and isolated by the Git worktree convention, so it is documented as a semantic escape hatch rather than a mechanically resource-guarded mutation path.
 
+The root also participates in borrowing. A Pi `tool_call` veto intercepts the root session's `edit`/`write` calls before mutation and consults `resource.check_write` with `hostGuard: true`: undeclared paths remain writable (the root need not declare everything first), but any live foreign hold on an overlapping declared resource blocks the root write. The root therefore cannot mechanically race a child's borrow; only its unintercepted shell remains a trusted mutation path, and that is documented as such rather than claimed as guarded.
+
 ### Workspaces
 
 `src/workspace.ts` is a small pluggable strategy boundary. `shared` uses the caller's cwd. Explicit `worktree` mode requires a clean Git checkout and creates a detached managed worktree from a safe base ref. Worktree paths and branches are recorded in agent metadata. v1 does not auto-delete dirty worktrees: terminal artifacts remain inspectable, and cleanup is intentionally explicit.
