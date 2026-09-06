@@ -157,3 +157,36 @@ test("message dedupe returns the original message", () => {
   assert.equal(second.id, first.id);
   assert.equal(coordinator.dispatch("child", "message.inbox", {}).value.length, 1);
 });
+
+test("same-owner claim is idempotent and release requires exactly one selector", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  coordinator.dispatch("root", "resource.define", { resourceId: "file:a.ts", kind: "file", path: "a.ts" });
+  coordinator.dispatch("root", "resource.define", { resourceId: "file:b.ts", kind: "file", path: "b.ts" });
+  const defined = coordinator.dispatch("root", "resource.define", { resourceId: "file:c.ts", kind: "file", path: "c.ts" });
+  registerChild(coordinator, "worker");
+  // define makes the definer the owner at version 1; a same-owner claim must be
+  // an idempotent reaffirmation that never bumps the version.
+  assert.equal((defined.value as { version: number }).version, 1);
+  const reclaim = coordinator.dispatch("root", "resource.claim", { resourceId: "file:a.ts" });
+  assert.equal((reclaim.value as { version: number; owner: string }).owner, "root");
+  assert.equal((reclaim.value as { version: number }).version, 1);
+  assert.deepEqual(reclaim.events, []);
+  // Ownership transitions still bump, and a claim by the new owner is idempotent again.
+  coordinator.dispatch("root", "resource.transfer", { resourceId: "file:a.ts", agentId: "worker" });
+  const workerClaim = coordinator.dispatch("worker", "resource.claim", { resourceId: "file:a.ts" });
+  assert.equal((workerClaim.value as { version: number }).version, 2);
+  assert.deepEqual(workerClaim.events, []);
+  const rootReclaim = coordinator.dispatch("root", "resource.claim", { resourceId: "file:a.ts" });
+  assert.equal((rootReclaim.value as { version: number }).version, 3);
+
+  coordinator.dispatch("root", "resource.borrow", { resourceId: "file:a.ts", mode: "mutable" });
+  coordinator.dispatch("root", "resource.borrow", { resourceId: "file:b.ts", mode: "shared" });
+  expectCode(() => coordinator.dispatch("root", "resource.release", {}), "INVALID_ARGUMENT");
+  expectCode(() => coordinator.dispatch("root", "resource.release", { resourceId: "file:a.ts", all: true }), "INVALID_ARGUMENT");
+  expectCode(() => coordinator.dispatch("root", "resource.release", { all: "yes" }), "INVALID_ARGUMENT");
+  const releasedAll = coordinator.dispatch("root", "resource.release", { all: true });
+  assert.equal((releasedAll.value as { released: boolean }).released, true);
+  const again = coordinator.dispatch("root", "resource.release", { all: true });
+  assert.equal((again.value as { released: boolean }).released, false);
+});

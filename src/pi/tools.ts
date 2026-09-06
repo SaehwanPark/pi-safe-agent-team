@@ -55,6 +55,8 @@ const sharedResourceFields = {
   parentId: Type.Optional(Type.String()),
   path: Type.Optional(Type.String({ description: "Workspace-relative file path or module directory guarded by mutable borrows" })),
   version: Type.Optional(Type.Number()),
+  leaseId: Type.Optional(Type.String({ description: "Lease returned by resource.borrow; the precise selector for resource.release" })),
+  all: Type.Optional(Type.Boolean({ description: "resource.release only: release every hold this actor currently has (exactly one selector is required)" })),
 };
 
 export function createCoordinationTools(options: CoordinationToolOptions): ToolDefinition[] {

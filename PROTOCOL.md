@@ -76,7 +76,7 @@ The public tool/command layer maps to these operation families:
 - `discover.agents`;
 - `task.create`, `task.claim`, `task.update`, `task.list`, `task.show`;
 - `resource.define`, `resource.inspect`, `resource.snapshot`, `resource.borrow`, `resource.transfer`, `resource.release`, `resource.grant`, `resource.check_write`, `resource.list`;
-- `fabric.status`, `fabric.compact`.
+- `fabric.status`.
 
 The broker may add internal operations, but unknown operations fail closed.
 
@@ -158,11 +158,11 @@ A resource can have an owner, an optional workspace-relative `path`, and active 
 
 Path identity is enforced at the guarded filesystem boundary, not inside the broker: before a guarded write asks `resource.check_write`, the host resolves the target's real path (symlinks, junctions, and alternate spellings through the nearest existing ancestor; policy keys are case-folded on Windows). Declarations name real paths — a write that reaches a coordinated file through an alias is authorized only against the file's own declaration and holds. A target whose real identity escapes the workspace is denied outright for managed children and left uncoordinated for the root. Unresolvable targets (for example symlink loops) fail closed.
 
-- `own`/`claim`: logical semantic owner;
+- `own`/`claim`: logical semantic owner; a same-owner re-claim is idempotent and does not bump the resource version;
 - `borrow(shared)`: many readers if no overlapping mutable holder;
 - `borrow(mutable)`: one writer, no overlapping shared/mutable holder;
 - `transfer`: atomic owner change by an authorized owner/delegator;
-- `release`: release the caller's active hold;
+- `release`: release one of the caller's active holds, selected by exactly one of `resourceId`, `leaseId`, or `all=true` (releasing everything is explicit, never a forgotten selector);
 - `snapshot`: return `resourceId@version` for stable dependency tracking;
 - `check_write`: authorize an actual file path only when the actor has a current mutable hold on a matching declared resource. With `hostGuard: true` (accepted only from the fabric root), the root instead participates in borrowing by exemption: the write is allowed when no overlapping resource carries a live foreign hold, and undeclared paths are writable without a prior declaration.
 
