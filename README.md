@@ -1,128 +1,231 @@
 # pi-safe-agents-team
 
-A local-first Pi extension for recursive, observable multi-agent work with deterministic coordination. It keeps semantic decisions in Pi sessions and puts identity, mailboxes, tasks, resources, leases, capabilities, and lifecycle transitions behind one authoritative broker.
+[![CI](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml/badge.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Node](https://img.shields.io/badge/node-%3E%3D22.19.0-brightgreen.svg)](https://nodejs.org/)
 
-## What v1 provides
+**A local-first Pi extension for recursive, observable multi-agent coding with deterministic coordination.**
 
-- recursive child sessions with bounded depth/count/total limits;
-- Pi SDK-backed long-lived workers (`createAgentSession`), not one-shot model calls;
-- explicit provider/model/thinking routing with safe inheritance from the caller's selected model;
-- durable at-least-once parent/peer mailboxes and request/reply without synchronous deadlock;
-- atomic task claims and structured task results;
-- hierarchical ownership, declared workspace paths, shared/mutable borrows, FIFO waiters, leases, transfer, and snapshots;
-- capability checks for spawning, peer messaging, shell, repository writes, and resources;
-- append-only transaction journal and reconnect recovery;
-- shared workspaces or explicit clean Git worktrees;
-- `/agents` status/tree/tasks/resources/messages/inbox inspection.
+Agents reason about collaboration; an out-of-band broker enforces coordination correctness.
 
-## Install as a Pi package
+---
 
-From a project directory:
+## The Problem: Why Multi-Agent Coding Breaks Down
 
-```bash
-pi install npm:pi-safe-agents-team
+Most agent frameworks and subagent extensions treat coordination as a prompt-engineering problem. Subagents are given prompt instructions ("please coordinate with other agents", "do not touch file X while agent B is working on it") and left to share the same filesystem or chatroom.
+
+In practice, this architecture collapses under real coding workloads:
+
+1. **Silent File Clobbering & Race Conditions**: Two agents editing the same codebase simultaneously overwrite each other's edits. Neither git nor the LLM detects the collision until code breaks or changes disappear.
+2. **The Parent-Child Write Race**: While a child agent works on a subsystem, the user or parent agent continues making edits. Without mechanical enforcement, the parent inadvertently mutates files under the child's feet.
+3. **Synchronous Foreground Deadlocks**: When a child asks its parent for clarification, typical implementations block the parent's turn on the JavaScript call stack. If the parent needs input or spawns another agent, execution deadlocks.
+4. **Context Window Flooding**: Unscoped peer chatrooms broadcast every status message to every participant, diluting context windows with conversational noise.
+5. **Ghost Duplication on Ambiguous Failures**: When a transport hiccup or timeout occurs during agent or task creation, naive retries spawn duplicate workers or duplicate tasks.
+6. **Model Configuration Leaks**: When child agents spawn without an explicit model, fallback heuristics often read unvetted global configurations or cause runaway recursion costs.
+
+---
+
+## The Key Insight: Mechanical Coordination Invariants
+
+> **"Agents make semantic decisions. A deterministic broker enforces coordination correctness."**
+
+An LLM should never be asked to act as a mutex, a distributed lock manager, a message deduplicator, or an authority source.
+
+`pi-safe-agents-team` separates semantic reasoning from mechanical safety:
+
+```text
+                  Semantic Agents
+               (Pi AgentSession SDK)
+              ┌──────────┴──────────┐
+              │                     │
+         Root Session          Child Worker
+              │                     │
+              └──────────┬──────────┘
+                         │
+             Local IPC (Socket / Pipe)
+                         │
+                         ▼
+               Deterministic Broker
+           (Append-only Journal + Replay)
+                         │
+         ┌───────────────┼───────────────┐
+         ▼               ▼               ▼
+    Task Board       Mailboxes       Coordinator
+  (Atomic Claims)  (Durable FIFO)  (State Machine)
+                                         │
+                         ┌───────────────┴───────────────┐
+                         ▼                               ▼
+               Borrow Checker (Rust-style)         Write Fences
+            - Shared Readers (many)             - Short-lived lock
+            - Mutable Writers (exclusive)       - Excludes leases
+            - Time-bounded Leases               - Intercepts Root
+                         │                               │
+                         └───────────────┬───────────────┘
+                                         ▼
+                             Guarded Filesystem Boundary
+                          - Realpath (Symlinks/Junctions)
+                          - Volume Case-Folding Probe
+                          - Fail-Closed on Broker Outage
 ```
 
-For local development:
+1. **Rust-Inspired Ownership & Borrowing**: Files and directories are hierarchical resources. Many agents can hold shared read leases simultaneously, but only one agent may hold an exclusive mutable borrow across an overlapping hierarchy.
+2. **In-Flight Write Fencing**: Before touching disk, an authorized writer establishes a write fence (`resource.begin_write`). If its lease expires mid-mutation, the fence continues to exclude competing writers until the disk write completes (`resource.end_write`).
+3. **The Root Host Guard**: The user/root Pi session participates in borrowing without needing tedious manual declarations. Root `edit`/`write` calls are intercepted before disk mutation: undeclared paths remain writable, but any declared path currently leased or fenced by a child vetoes the root write.
+4. **Real Filesystem Identity**: Symlinks, junctions, and path aliases are canonicalized through the nearest existing ancestor before coordinator evaluation. An agent cannot sidestep another agent's hold through an alias.
+5. **Durable Idempotency & Crash Recovery**: `agent.spawn` and `task.create` require per-actor `operationId` tracking. Transactions are journaled in an append-only transaction log. Ambiguous network retries replay original results without duplicate side-effects.
+
+---
+
+## How It Compares to Other Subagent Extensions
+
+| Capability | Standard Pi Subagent Example | `nicobailon/pi-subagents` | `tmustier/pi-agent-teams` | `pi-safe-agents-team` (v0.1) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Worker Engine** | `createAgentSession()` | `createAgentSession()` | Background processes | `createAgentSession()` |
+| **Concurrency Enforcement** | None (advisory) | None (advisory) | Git branch/worktree only | **Authoritative Borrow Checker + Leases** |
+| **Filesystem Mutation Guard** | None | None | None | **Write boundary hook with Write Fences** |
+| **Root/Parent Write Interception** | None | None | None | **Root Host Guard (`hostGuard: true`)** |
+| **Symlink / Alias Disambiguation** | None | None | None | **Canonical realpath resolution** |
+| **Parent Clarification** | Not supported | Blocks JS event loop | Message poll | **Non-blocking turn termination (`waiting`)** |
+| **Messaging Architecture** | Unidirectional report | Async supervisor queue | Chat / direct messages | **Durable per-actor FIFO mailboxes** |
+| **Duplicate / Retry Safety** | None | None | None | **Journaled `operationId` idempotency** |
+| **Broker State Durability** | In-memory | In-memory | Shared files / tmux | **Append-only transaction journal** |
+| **Cross-Platform IPC** | N/A | In-process | POSIX / tmux | **Windows Named Pipes + POSIX Sockets** |
+
+*Note on research integrity: comparisons reflect public codebases and documented issue trackers (see [`PRIOR_ART.md`](PRIOR_ART.md)).*
+
+---
+
+## Installation
+
+> [!IMPORTANT]
+> **npm Registry Publishing is Currently Deferred**: Due to npm publishing credential setup, direct installation from npm is temporarily deferred.
+> **Please install directly from GitHub.**
+
+### Option A: Install via Pi Package Manager (Recommended)
+
+From your project directory:
 
 ```bash
+pi install git:github.com/SaehwanPark/pi-safe-agent-team
+```
+
+### Option B: Clone into User Extensions Directory
+
+Clone directly into your personal Pi extensions folder:
+
+```bash
+git clone https://github.com/SaehwanPark/pi-safe-agent-team ~/.pi/agent/extensions/pi-safe-agents-team
+```
+
+### Option C: Local Development
+
+```bash
+git clone https://github.com/SaehwanPark/pi-safe-agent-team.git
+cd pi-safe-agent-team
 npm install
 npm run check
 pi -e ./index.ts
 ```
 
-The extension is declared through the `pi.extensions` field in `package.json`, so the package can also be loaded from a project package manifest.
+---
 
-## Quick start
+## Quick Start
 
-1. Start Pi with the extension loaded.
-2. Ask the root agent to use `agent_spawn` with a `taskDescription`.
-3. The child starts in its own persistent Pi session and reports a bounded result to the parent.
-4. Use `/agents` or `/agents tree` to inspect the fabric.
+### 1. Launching a Managed Worker
 
-Example request to the root model:
+Start Pi with the extension loaded, and prompt the root model:
 
 ```text
-Spawn a read-only scout with role scout and taskDescription "Find the parser entry points and report file:line findings".
-Do not give it write or shell capabilities. Ask it for clarification if the task is ambiguous.
+Spawn a researcher agent to analyze src/core/coordinator.ts and list all invariants.
+Do not grant write permissions or shell access.
 ```
 
-The coordinator returns a child identity, model route source, task ID, and workspace. It does not wait for the child model turn.
-
-## Core API example
-
-The deterministic core has no model or network dependency:
-
-```ts
-import { Coordinator } from "pi-safe-agents-team";
-
-const fabric = new Coordinator({ rootId: "demo" });
-fabric.dispatch("root", "agent.register", {
-  rootId: "demo",
-  role: "root",
-  route: { provider: "local", model: "qwen", thinking: "medium" },
-  capabilities: { maySpawn: true, mayMessagePeers: true },
-});
-const task = fabric.dispatch("root", "task.create", { description: "inspect the API" }).value;
-const child = fabric.dispatch("root", "agent.spawn", {
-  route: { provider: "local", model: "qwen", thinking: "low" },
-  taskId: task.id,
-  capabilities: { mayMessagePeers: true },
-}).value;
-console.log(child.agent.id, child.token.length > 0);
+The root model calls `agent_spawn`:
+```json
+{
+  "role": "scout",
+  "taskDescription": "Analyze src/core/coordinator.ts and list invariants",
+  "mayWriteRepo": false,
+  "mayUseShell": false
+}
 ```
 
-Run the deterministic suite with:
+The coordinator immediately returns the child's identity, model route, and task ID. The child runs asynchronously in its own Pi `AgentSession`.
 
-```bash
-npm test
-npm run typecheck
-```
+### 2. Inspecting the Fabric
 
-## Safe collaboration rules
+Use slash commands to inspect the state machine in real time:
 
-- `agent_send` is durable; busy receivers do not lose messages. A message is acknowledged only after the host accepts it into its queue, and duplicate notifications are idempotent.
-- A clarification request returns `terminate: true`; the child becomes `waiting`, and a later `agent_reply` starts a fresh prompt. Pending clarification records survive broker restart; no parent turn is synchronously blocked.
-- `agent_resource` is authoritative for ownership and borrows. A prompt saying “I own this file” never changes state; even the owner must hold a mutable borrow before a guarded file mutation.
-- A task result is submitted explicitly with `agent_task(action=complete, result=...)` and is bounded by `maxTaskOutput`; a model turn ending never completes an assigned task.
-- Managed child `read`/`grep`/`find`/`ls` tools are workspace-scoped; `edit`/`write` tools resolve their target to its real filesystem path (symlinks/junctions included) and then against a declared workspace-relative file/module resource, calling the coordinator at the actual filesystem write boundary — an alias cannot bypass another agent's hold. Shared-workspace shell is a conservative read-only allowlist with workspace-relative arguments; worktree shell is explicitly trusted and isolated only by the Git worktree.
-- The root session participates in borrowing: its ordinary Pi `edit`/`write` calls are vetoed before mutation whenever a live child hold overlaps the target. Undeclared root paths stay writable; the root shell stays explicitly trusted (not intercepted).
-- `agent.spawn` and `task.create` support an idempotent `operationId`: a retry after an ambiguous transport failure replays the original response instead of creating a duplicate child or task, and the dedup record survives broker restart.
-- After a broker restart, agents awaiting their one-shot reconnect keep their capacity slots reserved: new agents cannot evict them.
-- Model inheritance means the caller's actual in-memory `provider/model` object. Missing or excluded explicit routes fail closed.
-- Dirty worktrees are never silently deleted.
+- `/agents` — Summary of active agents, running counts, and health.
+- `/agents tree` — Visual tree of parent-child hierarchy, roles, and status.
+- `/agents tasks` — Deterministic task board showing owners, status, and outputs.
+- `/agents resources` — Active ownership, shared/mutable holds, and waiters.
+- `/agents inbox` — Durable mailbox inspection for unacknowledged messages.
 
-## Configuration
+### 3. Coordinated File Modification
 
-The default state directory is under Pi's agent directory:
+When an agent needs to edit a file:
+
+1. Agent calls `agent_resource(action="borrow", resourceId="file:src/parser.ts", mode="mutable")`.
+2. The coordinator verifies no overlapping shared readers or mutable writers exist.
+3. The agent calls `edit` or `write`. The guarded write hook calls `resource.begin_write`, establishes an active write fence, performs the disk write, and calls `resource.end_write`.
+4. If the user or root agent attempts to edit `src/parser.ts` during this window, the root host guard blocks the write with a clear veto message:
+   `safe-agents root write guard: A conflicting runtime hold prevents writing src/parser.ts`
+
+---
+
+## Safe Collaboration Rules
+
+- **Durable Mailboxes**: Messages sent via `agent_send` are persisted. Receivers acknowledge only after Pi accepts the message into its prompt queue. Messages sent while an agent is busy are queued, not lost.
+- **Deadlock-Free Clarifications**: When a child asks for user/parent guidance via `agent_send(type="clarification")`, it returns `terminate: true` and transitions to `waiting`. The parent turn is never blocked. Later, `agent_reply` wakes the child with a clean prompt turn.
+- **Authoritative Ownership**: Prompts saying "I am modifying X" have zero authority. Only coordinator-granted mutable holds authorize disk writes.
+- **Bounded Shell Access**: Shared-workspace shell access is restricted to a conservative read-only allowlist (`git`, `rg`, `grep`, `cat`, etc.) with strict argument path containment. Dangerous options that read indirect files (such as `file -f` or `wc --files0-from`) are rejected.
+- **Fail-Closed Broker Guard**: If the broker process becomes unreachable during a coordinated write, the root write guard fails closed to protect in-flight child writes from being clobbered.
+
+---
+
+## Operational Boundaries & Known Caveats
+
+We believe in documenting operational boundaries honestly:
+
+1. **Write Fences Across Broker Crashes**: Write fences (`resource.begin_write`) are in-memory coordinator records. They fully protect writes during normal broker operation (including lease lapses and root writes). However, if the broker process itself crashes mid-write and restarts while the worker's disk write is still executing, the fence is not crash-durable. *(A recovery quarantine mechanism is scheduled for post-v0.1 to bridge restart survivability).*
+2. **Worktree Shell Isolation**: Shared-workspace shell is mechanically verified and read-only. Worktree shell (`workspace="worktree"`) is an explicitly trusted developer escape hatch isolated by Git worktrees, not by coordinator resource locks.
+3. **Local-First Architecture**: v0.1 is strictly designed for local multi-agent coordination via Unix domain sockets and Windows named pipes. Distributed network clustering is deferred to future v1.0 milestones.
+
+---
+
+## Configuration & Paths
+
+State files are isolated per project workspace:
 
 ```text
 ~/.pi/agent/safe-agents/<cwd-hash>/
-  events.jsonl
-  broker.lock
-  broker.sock                 # POSIX; Windows uses a named pipe
-  sessions/<agent-id>/...
-  worktrees/<agent-id>/...
+  ├── events.jsonl         # Append-only transaction journal
+  ├── broker.lock          # Process single-instance lockfile
+  ├── broker.sock          # Unix domain socket (POSIX)
+  │   └── \\.\pipe\...     # Named pipe (Windows)
+  ├── sessions/            # Persistent child session states
+  └── worktrees/           # Isolated Git worktrees
 ```
 
-See [`docs/configuration.md`](docs/configuration.md) for limits, role routes, environment variables, and workspace policy.
+See [`docs/configuration.md`](docs/configuration.md) for limits, role overrides, environment variables, and policy tuning.
+
+---
 
 ## Documentation
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md): components, data flow, invariants, risks, and deferrals.
-- [`PROTOCOL.md`](PROTOCOL.md): local JSONL frames, identity, delivery, tasks, resources, and errors.
-- [`ROADMAP.md`](ROADMAP.md): checked implementation baseline and remaining v1 work.
-- [`docs/agents.md`](docs/agents.md): lifecycle, recursion, and session behavior.
-- [`docs/messaging.md`](docs/messaging.md): mailboxes, request/reply, visibility, and busy delivery.
-- [`docs/ownership.md`](docs/ownership.md): resource hierarchy, leases, borrows, and handoff.
-- [`docs/models.md`](docs/models.md): exact provider/model routing and inheritance.
-- [`docs/configuration.md`](docs/configuration.md): state paths, limits, roles, and workspaces.
-- [`PRIOR_ART.md`](PRIOR_ART.md): Pi and agent-team lessons that shaped the design.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): Component diagrams, state invariants, failure recovery, and architectural decisions.
+- [`PROTOCOL.md`](PROTOCOL.md): Wire format, JSONL frames, coordinator operations, and error codes.
+- [`ROADMAP.md`](ROADMAP.md): Verification baseline, v0.1 release checklist, and v1.0 goals.
+- [`docs/agents.md`](docs/agents.md): Agent lifecycles, recursion constraints, and session boundaries.
+- [`docs/ownership.md`](docs/ownership.md): Hierarchical resources, borrow rules, leases, and write fencing.
+- [`docs/messaging.md`](docs/messaging.md): Mailboxes, delivery guarantees, and non-blocking clarification.
+- [`docs/models.md`](docs/models.md): Model resolution, routing precedence, and inheritance.
+- [`PRIOR_ART.md`](PRIOR_ART.md): Detailed architectural analysis of preceding agent implementations.
 
-## Status
-
-The deterministic coordinator, journal, local broker, model-routing adapter, guarded workspace mutation boundary, Pi extension surface, and adversarial hardening tests are implemented. The roadmap remains the source of truth for additional integration coverage; this is not a claim of production-distributed orchestration.
+---
 
 ## License
 
-MIT
+MIT © Saehwan Park

@@ -129,8 +129,9 @@ export interface TaskRecord {
  * fence is active the coordinator grants no conflicting lease to another
  * actor, which shrinks the formal check→write window: a hold that lapses
  * mid-write cannot be handed to a competing writer until the fence ends or
- * expires. Fences are deliberately ephemeral (never journaled): a broker
- * restart drops them, which is the conservative direction for the writer.
+ * expires. Fences are deliberately ephemeral in-memory records: write fencing
+ * protects coordinated writes during normal broker operation, including lease
+ * expiry, but is not crash-durable across an independent broker restart.
  */
 export interface WriteFenceRecord {
   id: string;
