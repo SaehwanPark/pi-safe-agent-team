@@ -44,9 +44,9 @@ Each managed child has one prompt tail. New parent/peer messages are queued dura
 
 ## Shell and mutation safety
 
-Managed `read`/`grep`/`find`/`ls` tools are scoped to the child workspace. Managed `edit`/`write` tools call `resource.check_write` immediately before their filesystem write. The target must be inside the child workspace and match a declared file/module path with a current mutable hold; logical ownership alone is insufficient. Shared-workspace `mayUseShell` is a conservative read-only allowlist with workspace-relative arguments. Worktree `mayUseShell` is an explicitly trusted shell escape limited by the Git worktree convention, not by resource locks.
+Managed `read`/`grep`/`find`/`ls` tools are scoped to the child workspace. Managed `edit`/`write` tools call `resource.check_write` immediately before their filesystem write. The target is first resolved to its real filesystem path (symlinks and junctions included), must stay inside the child workspace — even through links — and must match a declared file/module path with a current mutable hold; declaring or holding only an alias spelling is not enough, and logical ownership alone is insufficient. Shared-workspace `mayUseShell` is a conservative read-only allowlist with workspace-relative arguments. Worktree `mayUseShell` is an explicitly trusted shell escape limited by the Git worktree convention, not by resource locks.
 
-The root session participates too: its ordinary Pi `edit`/`write` calls are vetoed before execution when a live foreign hold overlaps the workspace-relative target (`resource.check_write` with `hostGuard: true`). Undeclared paths stay writable for the root, targets outside the root workspace are not coordinated, and the root shell is not intercepted — it remains trusted, not sandboxed.
+The root session participates too: its ordinary Pi `edit`/`write` calls are vetoed before execution when a live foreign hold overlaps the target's resolved real workspace path — links and alternate spellings included (`resource.check_write` with `hostGuard: true`). Undeclared paths stay writable for the root, targets outside the root workspace are not coordinated, and the root shell is not intercepted — it remains trusted, not sandboxed.
 
 ## Failure behavior
 

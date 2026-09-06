@@ -154,6 +154,7 @@ The root also participates in borrowing. A Pi `tool_call` veto intercepts the ro
 15. Root status is a bounded projection and does not copy unrelated transcripts into model context.
 16. `agent.spawn`/`task.create` carrying an `operationId` apply at most once per `(actor, operationId)`; a matching retry replays the original response, a mismatch fails `IDEMPOTENCY_CONFLICT`, and the record is journaled with its transaction (bounded window, oldest evicted).
 17. The idempotency window is bounded and durability-scoped: it is restored on replay/checkpoint within the window, but it never reconstructs pre-hardening committed transactions that lack a record.
+18. Enforced path identity is the resolved filesystem path: guarded write boundaries resolve symlinks, junctions, and alternate spellings (nearest-existing-ancestor realpath, Windows case-folding in policy keys) before asking `resource.check_write`, so one writer cannot sidestep another actor's hold through an alias. The broker itself stays filesystem-agnostic; unresolvable targets fail closed, and an alias that escapes the workspace is simply not fabric-coordinated for the root while always denied for managed children.
 
 ## Deferred by design
 
