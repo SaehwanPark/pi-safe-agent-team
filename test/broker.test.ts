@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { BrokerClient } from "../src/broker/client.ts";
 import { BrokerServer } from "../src/broker/server.ts";
 import { Journal } from "../src/broker/journal.ts";
-import type { AgentRecord, CoordinatorEvent, ModelRoute } from "../src/core/types.ts";
+import type { AgentRecord, CoordinatorEvent, IdempotencyRecord, ModelRoute } from "../src/core/types.ts";
 
 const route: ModelRoute = { provider: "test", model: "small", thinking: "medium" };
 
@@ -49,12 +49,12 @@ class GateJournal extends Journal {
     });
   }
 
-  override async append(events: readonly CoordinatorEvent[], at?: number): Promise<string> {
+  override async append(events: readonly CoordinatorEvent[], idempotency?: IdempotencyRecord, at?: number): Promise<string> {
     if (this.delayed) {
       this.entered?.();
       await this.gate;
     }
-    return super.append(events, at);
+    return super.append(events, idempotency, at);
   }
 }
 

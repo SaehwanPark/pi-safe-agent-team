@@ -2,11 +2,11 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Coordinator } from "../core/coordinator.ts";
-import type { CoordinatorEvent, PersistedCoordinatorState } from "../core/types.ts";
+import type { CoordinatorEvent, IdempotencyRecord, PersistedCoordinatorState } from "../core/types.ts";
 
 export type JournalRecord =
   | { kind: "begin"; txId: string; at: number }
-  | { kind: "events"; txId: string; events: CoordinatorEvent[] }
+  | { kind: "events"; txId: string; events: CoordinatorEvent[]; idempotency?: IdempotencyRecord }
   | { kind: "commit"; txId: string; at: number }
   | { kind: "checkpoint"; state: PersistedCoordinatorState; at: number };
 
@@ -40,11 +40,11 @@ export class Journal {
     await fs.chmod(this.filePath, 0o600).catch(() => undefined);
   }
 
-  async append(events: readonly CoordinatorEvent[], at = Date.now()): Promise<string> {
+  async append(events: readonly CoordinatorEvent[], idempotency?: IdempotencyRecord, at = Date.now()): Promise<string> {
     const txId = `tx-${randomUUID()}`;
     const records: JournalRecord[] = [
       { kind: "begin", txId, at },
-      { kind: "events", txId, events: events as CoordinatorEvent[] },
+      { kind: "events", txId, events: events as CoordinatorEvent[], ...(idempotency ? { idempotency } : {}) },
       { kind: "commit", txId, at: Date.now() },
     ];
     await this.enqueueWrite(records);
@@ -77,7 +77,7 @@ export class Journal {
     const lines = content.split("\n");
     const hasTrailingNewline = content.endsWith("\n");
     if (hasTrailingNewline) lines.pop();
-    const pending = new Map<string, CoordinatorEvent[]>();
+    const pending = new Map<string, { events: CoordinatorEvent[]; idempotency?: IdempotencyRecord }>();
     let committedTransactions = 0;
     let checkpoints = 0;
     let ignoredTail = false;
@@ -100,15 +100,17 @@ export class Journal {
         pending.clear();
         checkpoints += 1;
       } else if (record.kind === "begin") {
-        pending.set(record.txId, []);
+        pending.set(record.txId, { events: [] });
       } else if (record.kind === "events") {
-        const events = pending.get(record.txId);
-        if (!events) throw new Error(`Journal events record ${record.txId} has no begin`);
-        events.push(...record.events);
+        const transaction = pending.get(record.txId);
+        if (!transaction) throw new Error(`Journal events record ${record.txId} has no begin`);
+        transaction.events.push(...record.events);
+        if (record.idempotency) transaction.idempotency = record.idempotency;
       } else if (record.kind === "commit") {
-        const events = pending.get(record.txId);
-        if (!events) throw new Error(`Journal commit record ${record.txId} has no begin`);
-        coordinator.applyEvents(events);
+        const transaction = pending.get(record.txId);
+        if (!transaction) throw new Error(`Journal commit record ${record.txId} has no begin`);
+        coordinator.applyEvents(transaction.events);
+        if (transaction.idempotency) coordinator.restoreIdempotency(transaction.idempotency);
         pending.delete(record.txId);
         committedTransactions += 1;
       } else {

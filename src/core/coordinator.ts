@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { FabricError, assertCondition } from "./errors.ts";
 import {
   DEFAULT_FABRIC_CONFIG,
@@ -18,6 +18,8 @@ import {
   type DispatchResult,
   type FabricConfig,
   type FabricStatus,
+  type IdempotencyRecord,
+  type IdempotencyStateEntry,
   type MessagePriority,
   type MessageType,
   type ModelRoute,
@@ -256,7 +258,31 @@ function cloneConfig(config: FabricConfig): FabricConfig {
   return { ...config };
 }
 
+function idempotencyKey(actorId: string, operationId: string): string {
+  return `${actorId}\u0000${operationId}`;
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(",")}}`;
+}
+
+/** Hash of everything the request would apply; operationId itself is excluded. */
+function requestFingerprint(operation: string, args: Record<string, unknown>): string {
+  const { operationId: _operationId, ...rest } = args;
+  return createHash("sha256").update(stableStringify({ operation, args: rest })).digest("hex");
+}
+
+function normalizeClone<T>(value: T): T {
+  return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
+}
+
 export class Coordinator {
+  /** Bounded durable deduplication window; the oldest entries are evicted first. */
+  static readonly maxIdempotencyEntries = 256;
+
   readonly rootId: string;
   readonly rootAgentId?: string;
   readonly config: FabricConfig;
@@ -272,6 +298,7 @@ export class Coordinator {
   private nextMessageSequence = new Map<AgentId, number>();
   private nextBrokerSequence = 0;
   private nextResourceWaiterSequence = 0;
+  private idempotency = new Map<string, IdempotencyStateEntry>();
 
   constructor(options: CoordinatorOptions) {
     this.rootId = parseString(options.rootId, "rootId");
@@ -296,12 +323,15 @@ export class Coordinator {
 
   /** Apply a protocol operation as one synchronous, atomic state transition. */
   dispatch(actorId: AgentId | undefined, operation: string, args: Record<string, unknown> = {}): DispatchResult<any> {
+    const replay = this.idempotentReplay(actorId, operation, args);
+    if (replay) return replay;
     const before = this.exportState();
     const events: CoordinatorEvent[] = [];
     assertCondition(Boolean(args) && typeof args === "object" && !Array.isArray(args), "INVALID_ARGUMENT", "operation args must be an object");
     this.reclaimExpired(this.clock(), events);
 
     try {
+      const run = (): DispatchResult<any> => {
       switch (operation) {
       case "agent.register":
         return this.withEvents(events, this.registerAgent(actorId, args as unknown as RegisterAgentArgs, events));
@@ -369,10 +399,61 @@ export class Coordinator {
         default:
           throw new FabricError("INVALID_ARGUMENT", `Unknown coordinator operation: ${operation}`);
       }
+      };
+      const result = run();
+      this.rememberIdempotency(actorId, operation, args, result);
+      return result;
     } catch (error) {
       this.restoreState(before);
       throw error;
     }
+  }
+
+  /**
+   * Resolve a duplicate write before it can mutate state. An operationId is
+   * scoped to its actor; replaying the same request returns the original
+   * response with `replayed: true`, while reusing the operationId for
+   * different arguments is a client bug and fails closed.
+   */
+  private idempotentReplay(actorId: AgentId | undefined, operation: string, args: Record<string, unknown>): DispatchResult<any> | undefined {
+    if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+    const operationId = args.operationId;
+    if (operationId === undefined) return undefined;
+    assertCondition(operation === "agent.spawn" || operation === "task.create", "INVALID_ARGUMENT", "operationId is only supported for agent.spawn and task.create");
+    assertCondition(typeof operationId === "string" && operationId.length > 0 && operationId.length <= 128 && !operationId.includes("\u0000"), "INVALID_ARGUMENT", "operationId must be a bounded non-empty string without NUL");
+    assertCondition(actorId !== undefined, "IDENTITY_CONFLICT", "operationId requires an authenticated actor");
+    const prior = this.idempotency.get(idempotencyKey(String(actorId), operationId));
+    if (!prior) return undefined;
+    const requestHash = requestFingerprint(operation, args);
+    assertCondition(prior.operation === operation && prior.requestHash === requestHash, "IDEMPOTENCY_CONFLICT", `operationId '${operationId}' was already used for a different request`, { operationId });
+    return { value: { ...(structuredClone(prior.response) as object), replayed: true }, events: [] };
+  }
+
+  private rememberIdempotency(actorId: AgentId | undefined, operation: string, args: Record<string, unknown>, result: DispatchResult<any>): void {
+    const operationId = args.operationId;
+    if (typeof operationId !== "string" || operationId.length === 0) return;
+    const key = idempotencyKey(String(actorId), operationId);
+    const entry: IdempotencyStateEntry = { key, operation, requestHash: requestFingerprint(operation, args), response: normalizeClone(result.value) };
+    this.rememberIdempotencyEntry(entry);
+    result.idempotency = { actorId: String(actorId), operationId, operation, requestHash: entry.requestHash, response: entry.response };
+  }
+
+  private rememberIdempotencyEntry(entry: IdempotencyStateEntry): void {
+    if (this.idempotency.size >= Coordinator.maxIdempotencyEntries && !this.idempotency.has(entry.key)) {
+      const oldest = this.idempotency.keys().next();
+      if (!oldest.done) this.idempotency.delete(oldest.value);
+    }
+    this.idempotency.set(entry.key, entry);
+  }
+
+  /** Rehydrate one durable idempotency record during journal replay. */
+  restoreIdempotency(record: IdempotencyRecord): void {
+    this.rememberIdempotencyEntry({
+      key: idempotencyKey(record.actorId, record.operationId),
+      operation: record.operation,
+      requestHash: record.requestHash,
+      response: record.response,
+    });
   }
 
   registerAgent(actorId: AgentId | undefined, input: RegisterAgentArgs, events: CoordinatorEvent[] = []): { agent: Omit<AgentRecord, "authToken">; token: string } {
@@ -1222,6 +1303,7 @@ export class Coordinator {
       dedupe: [...this.dedupe.entries()],
       nextBrokerSequence: this.nextBrokerSequence,
       nextResourceWaiterSequence: this.nextResourceWaiterSequence,
+      idempotency: [...this.idempotency.values()].map((entry) => ({ ...entry })),
     };
   }
 
@@ -1254,6 +1336,8 @@ export class Coordinator {
     for (const request of state.requests) this.requests.set(request.id, cloneRequest(request));
     for (const [key, value] of state.dedupe) this.dedupe.set(key, value);
     for (const [agentId, sequence] of Object.entries(state.nextMessageSequence)) this.nextMessageSequence.set(agentId, sequence);
+    this.idempotency.clear();
+    for (const entry of state.idempotency ?? []) this.rememberIdempotencyEntry({ ...entry });
   }
 
   applyEvents(events: readonly CoordinatorEvent[]): void {

@@ -19,6 +19,12 @@ interface PendingRequest {
   timer: NodeJS.Timeout;
 }
 
+function isAmbiguousBrokerFailure(error: unknown): boolean {
+  if (error instanceof FabricError) return error.code === "BROKER_UNAVAILABLE" || error.code === "PERSISTENCE_FAILURE";
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ECONNRESET" || code === "EPIPE" || code === "ENOENT" || code === "ETIMEDOUT";
+}
+
 export class BrokerClient {
   readonly endpoint: string;
   readonly requestTimeoutMs: number;
@@ -80,6 +86,24 @@ export class BrokerClient {
         reject(new FabricError("BROKER_UNAVAILABLE", error instanceof Error ? error.message : String(error)));
       }
     });
+  }
+
+  /**
+   * Submit a write that the coordinator deduplicates by operationId. A
+   * transport-ambiguous failure (the response may have been lost after the
+   * broker applied the mutation) is retried once with the same operationId, so
+   * the retry replays the original response instead of duplicating the child
+   * or task. Deterministic business errors are never retried.
+   */
+  async requestIdempotent<T = unknown>(op: string, args: Record<string, unknown> = {}, operationId?: string): Promise<T> {
+    const id = operationId ?? `op-${randomUUID()}`;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.request<T>(op, { ...args, operationId: id });
+      } catch (error) {
+        if (attempt >= 1 || !isAmbiguousBrokerFailure(error)) throw error;
+      }
+    }
   }
 
   onEvent(listener: EventListener): () => void {

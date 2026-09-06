@@ -110,6 +110,8 @@ export interface TaskResult {
 
 export interface TaskRecord {
   id: TaskId;
+  /** True only on a response replayed from a prior request with the same operationId. */
+  replayed?: boolean;
   description: string;
   owner?: AgentId;
   creator: AgentId;
@@ -231,6 +233,8 @@ export interface PersistedCoordinatorState {
   nextBrokerSequence?: number;
   /** Optional for replay compatibility with pre-hardening journals. */
   nextResourceWaiterSequence?: number;
+  /** Optional for replay compatibility with pre-idempotency journals. */
+  idempotency?: IdempotencyStateEntry[];
 }
 
 export interface AgentSummary {
@@ -272,6 +276,28 @@ export type CoordinatorEvent =
 export interface DispatchResult<T = unknown> {
   value: T;
   events: CoordinatorEvent[];
+  /** Present when the request carried an operationId; journal it with the events. */
+  idempotency?: IdempotencyRecord;
+}
+
+/**
+ * Durable deduplication record for an idempotent write (agent.spawn, task.create).
+ * A replay of the same actor + operationId + arguments returns the original
+ * response instead of creating a second child or task.
+ */
+export interface IdempotencyRecord {
+  readonly actorId: AgentId;
+  readonly operationId: string;
+  readonly operation: string;
+  readonly requestHash: string;
+  readonly response: unknown;
+}
+
+export interface IdempotencyStateEntry {
+  readonly key: string;
+  readonly operation: string;
+  readonly requestHash: string;
+  readonly response: unknown;
 }
 
 export function cloneCapabilities(capabilities: AgentCapabilities): AgentCapabilities {

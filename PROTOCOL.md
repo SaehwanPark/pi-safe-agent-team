@@ -80,6 +80,17 @@ The public tool/command layer maps to these operation families:
 
 The broker may add internal operations, but unknown operations fail closed.
 
+## Idempotent durable writes
+
+`agent.spawn` and `task.create` accept an optional `operationId` (a bounded, non-empty string, at most 128 characters, no NUL). It lets a client safely retry a write whose response was lost to an ambiguous transport failure, so a socket error after the broker already applied the mutation cannot silently produce a second child or task.
+
+- The key is `(actor, operationId)`: one key addresses one logical request per actor, independent of the operation. Two actors may reuse the same `operationId` without collision.
+- A replay of the same actor + `operationId` + arguments returns the original response with `replayed: true` and creates nothing new.
+- Reusing an `operationId` for different arguments (or, for one actor, a different operation) raises `IDEMPOTENCY_CONFLICT`; it never returns the mismatched original response.
+- `operationId` is rejected with `INVALID_ARGUMENT` on any other operation, which are already deduplicated by message dedupe keys or are reads/claims with their own atomicity.
+- The record is journaled atomically with the transaction that applied it and is restored on replay and checkpointing, within a bounded per-coordinator window (oldest records evicted first). A legacy committed transaction with no record is not deduplicated.
+- An ambiguous client failure (`BROKER_UNAVAILABLE`/`PERSISTENCE_FAILURE`) may be retried once under the same `operationId`; deterministic business errors are never retried.
+
 ## Message types and guarantees
 
 Supported v1 types are:
@@ -202,6 +213,7 @@ REQUEST_NOT_FOUND
 REQUEST_ALREADY_RESOLVED
 BROKER_UNAVAILABLE
 PERSISTENCE_FAILURE
+IDEMPOTENCY_CONFLICT
 WORKSPACE_FAILURE
 MODEL_NOT_FOUND
 MODEL_ROUTE_INVALID
