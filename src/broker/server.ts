@@ -1,6 +1,6 @@
 import net from "node:net";
 import { createHash } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { existsSync, unlinkSync, writeFileSync, promises as fs } from "node:fs";
 import { dirname, join } from "node:path";
 import { platform } from "node:os";
 import { FabricError, asFabricError } from "../core/errors.ts";
@@ -111,6 +111,42 @@ class BrokerConnection {
 }
 
 /** One local authoritative broker for a fabric. */
+/**
+ * Resolve the broker's FabricConfig, auto-detecting policy-key case folding
+ * when unset. The probe runs against the broker state directory, which lives
+ * on the same volume policy decisions protect; an explicit config value
+ * always wins.
+ */
+export function resolveBrokerConfig(options: BrokerServerOptions): Partial<FabricConfig> {
+  const config: Partial<FabricConfig> = { ...(options.config ?? {}) };
+  if (config.caseInsensitivePaths === undefined) config.caseInsensitivePaths = detectCaseInsensitivePaths(options.directory);
+  return config;
+}
+
+/**
+ * Write a mixed-case probe file and check whether a differently-cased name
+ * resolves to it. Returns false when the probe cannot run (fail open to the
+ * non-folding, purely lexical policy keys).
+ */
+export function detectCaseInsensitivePaths(directory: string): boolean {
+  if (process.platform === "win32") return true;
+  const base = join(directory, `.pi-case-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
+  const written = `${base}.MiXeD`;
+  const probed = `${base}.UPPER`;
+  try {
+    writeFileSync(written, "");
+    return existsSync(probed);
+  } catch {
+    return false;
+  } finally {
+    try {
+      unlinkSync(written);
+    } catch {
+      // The probe name is unique; a failed unlink must not mask the result.
+    }
+  }
+}
+
 export class BrokerServer {
   readonly directory: string;
   readonly endpoint: string;
@@ -132,7 +168,7 @@ export class BrokerServer {
   constructor(options: BrokerServerOptions) {
     this.directory = options.directory;
     this.endpoint = options.endpoint ?? defaultEndpoint(options.directory);
-    this.coordinator = options.coordinator ?? new Coordinator({ rootId: options.rootId, rootAgentId: options.rootAgentId, config: options.config });
+    this.coordinator = options.coordinator ?? new Coordinator({ rootId: options.rootId, rootAgentId: options.rootAgentId, config: resolveBrokerConfig(options) });
     this.journal = options.journal ?? new Journal({ directory: options.directory });
     this.maintenanceMs = Math.max(1000, options.maintenanceMs ?? this.coordinator.config.heartbeatMs);
   }

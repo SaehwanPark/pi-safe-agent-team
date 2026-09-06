@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import net from "node:net";
 import { join } from "node:path";
 import { BrokerClient } from "../src/broker/client.ts";
-import { BrokerServer } from "../src/broker/server.ts";
+import { BrokerServer, detectCaseInsensitivePaths, resolveBrokerConfig } from "../src/broker/server.ts";
 import { Journal } from "../src/broker/journal.ts";
 import type { AgentRecord, CoordinatorEvent, IdempotencyRecord, ModelRoute } from "../src/core/types.ts";
 
@@ -181,6 +181,21 @@ test("broker coalesces duplicate request frames while the mutation is in flight"
     raw?.destroy();
     root.close();
     await server.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("filesystem case-folding detection probes the volume without leaving files", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-fabric-case-"));
+  try {
+    const detected = detectCaseInsensitivePaths(directory);
+    assert.equal(typeof detected, "boolean");
+    if (process.platform === "win32") assert.equal(detected, true);
+    assert.deepEqual(await readdir(directory), []);
+    // An explicit config value always wins over detection.
+    assert.equal(resolveBrokerConfig({ directory, rootId: "fabric", config: { caseInsensitivePaths: false } }).caseInsensitivePaths, false);
+    assert.equal(typeof resolveBrokerConfig({ directory, rootId: "fabric" }).caseInsensitivePaths, "boolean");
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });

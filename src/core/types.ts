@@ -195,6 +195,13 @@ export interface RequestRecord {
 }
 
 export interface FabricConfig {
+  /**
+   * Fold workspace-relative policy keys case-insensitively. Undefined means
+   * auto: true on Windows, false elsewhere, unless the broker probes the
+   * filesystem at startup. Set explicitly to keep policy identity aligned
+   * with a case-insensitive workspace volume (for example on macOS).
+   */
+  caseInsensitivePaths?: boolean;
   maxDepth: number;
   maxChildrenPerAgent: number;
   maxTotalAgents: number;
