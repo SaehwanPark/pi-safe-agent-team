@@ -944,6 +944,12 @@ export class Coordinator {
         assertCondition(this.canControl(actor, owner) && actor.capabilities.mayTransferOwnership, "RESOURCE_NOT_OWNER", `Overlapping resource ${overlap.id} is owned by ${overlap.owner}`);
       }
     }
+    if (resource.owner === actorId) {
+      // A same-owner claim is an idempotent reaffirmation. Owner permissions are
+      // implicit, so bumping the version here would only emit false stale-
+      // dependency signals for consumers that snapshot resourceId@version.
+      return cloneResource(resource);
+    }
     resource.owner = actorId;
     resource.grants[actorId] = [...new Set([...(resource.grants[actorId] ?? []), "read", "comment", "write", "test"] as ResourcePermission[])];
     resource.version += 1;
@@ -1008,6 +1014,13 @@ export class Coordinator {
     const actor = this.requireActor(actorId);
     const resourceId = parseOptionalString(args.resourceId, "resourceId");
     const leaseId = parseOptionalString(args.leaseId, "leaseId");
+    assertCondition(args.all === undefined || typeof args.all === "boolean", "INVALID_ARGUMENT", "all must be a boolean");
+    const all = args.all === true;
+    // Releasing every hold of an actor is deliberate, never the accidental
+    // result of forgetting a selector: exactly one of resourceId, leaseId, or
+    // all=true is required.
+    const selectors = (resourceId !== undefined ? 1 : 0) + (leaseId !== undefined ? 1 : 0) + (all ? 1 : 0);
+    assertCondition(selectors === 1, "INVALID_ARGUMENT", "resource.release requires exactly one of resourceId, leaseId, or all=true");
     let released = false;
     let releasedResourceId: string | undefined;
     let releasedLeaseId: string | undefined;
