@@ -34,6 +34,7 @@ Current defaults:
 | `leaseMs` | 30 minutes |
 | `heartbeatMs` | 1 minute |
 | `messageRetention` | 2048 recent records |
+| `fenceMs` (per `resource.begin_write`) | 30s, clamped 1s-120s | Lifetime of a guarded-write fence. Not a config field: passed per call by the guarded host. Fences are ephemeral and are never journaled. |
 | `caseInsensitivePaths` | auto | Fold policy keys so differently-cased spellings share one resource. Undefined = probe the broker volume at startup (always true on Windows). Set `false` to keep keys case-sensitive. |
 
 Limits fail closed. There is no automatic unbounded retry or fallback provider.

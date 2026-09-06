@@ -75,7 +75,7 @@ The public tool/command layer maps to these operation families:
 - `message.send`, `message.reply`, `message.ack`, `message.inbox`, `message.list`;
 - `discover.agents`;
 - `task.create`, `task.claim`, `task.update`, `task.list`, `task.show`;
-- `resource.define`, `resource.inspect`, `resource.snapshot`, `resource.borrow`, `resource.transfer`, `resource.release`, `resource.grant`, `resource.check_write`, `resource.list`;
+- `resource.define`, `resource.inspect`, `resource.snapshot`, `resource.borrow`, `resource.transfer`, `resource.release`, `resource.grant`, `resource.check_write`, `resource.begin_write`, `resource.end_write`, `resource.list`;
 - `fabric.status`.
 
 The broker may add internal operations, but unknown operations fail closed.
@@ -157,6 +157,8 @@ Cancellation releases active claims back to `pending` unless a caller explicitly
 A resource can have an owner, an optional workspace-relative `path`, and active leases:
 
 Path identity is enforced at the guarded filesystem boundary, not inside the broker: before a guarded write asks `resource.check_write`, the host resolves the target's real path (symlinks, junctions, and alternate spellings through the nearest existing ancestor; policy keys are case-folded on case-insensitive volumes, auto-probed at broker start and overridable with `FabricConfig.caseInsensitivePaths`). Declarations name real paths — a write that reaches a coordinated file through an alias is authorized only against the file's own declaration and holds. A target whose real identity escapes the workspace is denied outright for managed children and left uncoordinated for the root. Unresolvable targets (for example symlink loops) fail closed.
+
+Authorization and the filesystem mutation are not atomic, so guarded writes fence the target: `resource.begin_write` authorizes exactly like `resource.check_write` and, when allowed, places a short-lived fence (default 30s, clamped 1s-120s via `fenceMs`) on the matched resource. While a fence is active the coordinator grants no conflicting lease to any other actor — even in the gap where the writer's own hold has just lapsed — and queued waiters drain when the writer calls `resource.end_write` (idempotent, only the fencing actor may lift its fence) or the fence expires. Fences are deliberately ephemeral: never journaled, dropped by a broker restart, which is the conservative direction for the in-flight writer.
 
 - `own`/`claim`: logical semantic owner; a same-owner re-claim is idempotent and does not bump the resource version;
 - `borrow(shared)`: many readers if no overlapping mutable holder;

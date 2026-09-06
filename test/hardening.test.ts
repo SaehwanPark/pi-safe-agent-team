@@ -407,7 +407,8 @@ test("guarded edit performs the coordinator check at the filesystem write bounda
       client: {
         async request<T = unknown>(operation: string, args: Record<string, unknown> = {}): Promise<T> {
           calls.push({ operation, ...args });
-          return { allowed, resourceId: "file:a.ts", reason: "mutable hold required" } as T;
+          // A fenced grant must carry a fenceId, like the real coordinator does.
+          return (allowed ? { allowed, resourceId: "file:a.ts", fenceId: "fence-1" } : { allowed, resourceId: "file:a.ts", reason: "mutable hold required" }) as T;
         },
       },
     });
@@ -418,7 +419,7 @@ test("guarded edit performs the coordinator check at the filesystem write bounda
     allowed = true;
     await edit.execute("edit-2", { path: "a.ts", edits: [{ oldText: "one", newText: "allowed" }] }, undefined, undefined, { cwd: directory } as never);
     assert.equal(await readFile(target, "utf8"), "allowed\n");
-    assert.deepEqual(calls.map((call) => call.operation), ["resource.check_write", "resource.check_write"]);
+    assert.deepEqual(calls.map((call) => call.operation), ["resource.begin_write", "resource.begin_write", "resource.end_write"]);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -541,7 +542,7 @@ test("root write guard blocks coordinated paths, skips foreign targets, and fail
 
   // A workspace-relative edit is checked with the host-guard exemption.
   assert.equal(await evaluateRootWriteGuard({ client: guardClient({ allowed: true }), workspacePath: workspace }, "write", { path: "src/a.ts" }), undefined);
-  assert.deepEqual(requests.at(-1), { operation: "resource.check_write", args: { path: "src/a.ts", hostGuard: true } });
+  assert.deepEqual(requests.at(-1), { operation: "resource.begin_write", args: { path: "src/a.ts", hostGuard: true } });
 
   // A conflicting live hold blocks the tool call before any filesystem write.
   const blocked = await evaluateRootWriteGuard({ client: guardClient({ allowed: false, reason: "A conflicting runtime hold prevents writing src/a.ts" }), workspacePath: workspace }, "edit", { path: "src/a.ts" });

@@ -56,7 +56,7 @@ test("the root guard coordinates aliased workspace writes under their real path"
 
     const blocked = await evaluateRootWriteGuard({ client, workspacePath: directory }, "edit", { path: join("alias", "target.txt") });
     assert.equal(blocked?.block, true);
-    assert.deepEqual(requests[0], { operation: "resource.check_write", args: { path: "inner/target.txt", hostGuard: true } });
+    assert.deepEqual(requests[0], { operation: "resource.begin_write", args: { path: "inner/target.txt", hostGuard: true } });
 
     // A not-yet-existing file under an aliased directory still keys on the real directory.
     requests.length = 0;

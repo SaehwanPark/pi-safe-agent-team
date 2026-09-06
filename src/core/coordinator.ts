@@ -35,6 +35,7 @@ import {
   type TaskId,
   type TaskRecord,
   type TaskResult,
+  type WriteFenceRecord,
 } from "./types.ts";
 import {
   ACTIVE_STATUSES,
@@ -140,6 +141,8 @@ export class Coordinator {
   private nextBrokerSequence = 0;
   private nextResourceWaiterSequence = 0;
   private idempotency = new Map<string, IdempotencyStateEntry>();
+  /** Ephemeral write fences (begin_write/end_write); never persisted or replayed. */
+  private fences = new Map<string, WriteFenceRecord>();
 
   constructor(options: CoordinatorOptions) {
     this.rootId = parseString(options.rootId, "rootId");
@@ -239,6 +242,10 @@ export class Coordinator {
         return this.withEvents(events, this.releaseResource(this.requireActor(actorId).id, args, events));
       case "resource.check_write":
         return this.withEvents(events, this.checkWrite(this.requireActor(actorId).id, args), events);
+      case "resource.begin_write":
+        return this.withEvents(events, this.beginWrite(this.requireActor(actorId).id, args), events);
+      case "resource.end_write":
+        return this.withEvents(events, this.endWrite(this.requireActor(actorId).id, args, events));
       case "fabric.status":
         return this.withEvents(events, this.status(this.requireActor(actorId).id, args), events);
         default:
@@ -1091,6 +1098,51 @@ export class Coordinator {
     };
   }
 
+  /**
+   * Authorize a write exactly like `resource.check_write` and, when allowed,
+   * place a short-lived fence on the matched resource. While the fence is
+   * active no conflicting lease may be granted to another actor, so a hold
+   * that lapses mid-write cannot immediately hand the same file to a
+   * competing writer. Undeclared paths (root host-guard freedom) stay allowed
+   * with no fence because there is no resource to protect.
+   */
+  private beginWrite(actorId: AgentId, args: Record<string, unknown>): { allowed: boolean; reason?: string; resourceId?: string; fenceId?: string; expiresAt?: number } {
+    const decision = this.checkWrite(actorId, args);
+    if (!decision.allowed || decision.resourceId === undefined) return decision;
+    const fenceMs = Math.max(1_000, Math.min(120_000, Math.floor(parseNumber(args.fenceMs, "fenceMs", 30_000))));
+    const now = this.clock();
+    const fence: WriteFenceRecord = {
+      id: this.idFactory("fence"),
+      resourceId: decision.resourceId,
+      actorId,
+      createdAt: now,
+      expiresAt: now + fenceMs,
+    };
+    this.fences.set(fence.id, fence);
+    return { ...decision, fenceId: fence.id, expiresAt: fence.expiresAt };
+  }
+
+  /**
+   * Lift a fence early. Only the fencing actor may release it, ending is
+   * idempotent, and waiters excluded by the fence are drained on release.
+   */
+  private endWrite(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): { released: boolean } {
+    const fenceId = parseString(args.fenceId, "fenceId", 512);
+    const fence = this.fences.get(fenceId);
+    const released = fence !== undefined && fence.actorId === actorId && this.fences.delete(fenceId);
+    if (released) this.drainWaiters(events);
+    return { released: Boolean(released) };
+  }
+
+  private activeForeignFence(resource: ResourceRecord, actorId: AgentId): boolean {
+    const now = this.clock();
+    for (const fence of this.fences.values()) {
+      if (fence.expiresAt <= now || fence.actorId === actorId) continue;
+      if (this.overlaps(fence.resourceId, resource.id)) return true;
+    }
+    return false;
+  }
+
   private status(actorId: AgentId, args: Record<string, unknown>): FabricStatus {
     const actor = this.requireActor(actorId);
     assertCondition(actor.depth === 0, "CAPABILITY_DENIED", "Only a fabric root may request full status");
@@ -1457,6 +1509,9 @@ export class Coordinator {
       const beforeWaiters = resource.waiters.length;
       resource.waiters = resource.waiters.filter((waiter) => waiter.agentId !== agentId);
       if (resource.waiters.length !== beforeWaiters) changed = true;
+      for (const [id, fence] of this.fences) {
+        if (fence.actorId === agentId) this.fences.delete(id);
+      }
       if (changed) {
         resource.updatedAt = this.clock();
         events.push({ type: "resource_changed", resource: cloneResource(resource) });
@@ -1551,7 +1606,14 @@ export class Coordinator {
         events.push({ type: "resource_changed", resource: cloneResource(resource) });
       }
     }
-    if (events.some((event) => event.type === "resource_changed")) this.drainWaiters(events);
+    let fencesPruned = false;
+    for (const [id, fence] of this.fences) {
+      if (fence.expiresAt <= now) {
+        this.fences.delete(id);
+        fencesPruned = true;
+      }
+    }
+    if (fencesPruned || events.some((event) => event.type === "resource_changed")) this.drainWaiters(events);
   }
 
   private findHold(agentId: AgentId, resourceId: ResourceId, mode: BorrowMode): ResourceHold | undefined {
@@ -1574,6 +1636,10 @@ export class Coordinator {
   }
 
   private canAcquire(resource: ResourceRecord, agentId: AgentId, mode: BorrowMode): boolean {
+    // A write fence is a promise that no one else touches the file while a
+    // guarded write is in flight, so it excludes conflicting grants even in
+    // the gap where the writer's own lease has just lapsed.
+    if (this.activeForeignFence(resource, agentId)) return false;
     for (const overlap of this.overlappingResources(resource.id)) {
       // A holder cannot downgrade/upgrade itself behind the coordinator's
       // back: shared and mutable holds for one actor are still conflicting.

@@ -124,6 +124,22 @@ export interface TaskRecord {
   updatedAt: number;
 }
 
+/**
+ * A short-lived write fence covering one in-flight guarded write. While a
+ * fence is active the coordinator grants no conflicting lease to another
+ * actor, which shrinks the formal check→write window: a hold that lapses
+ * mid-write cannot be handed to a competing writer until the fence ends or
+ * expires. Fences are deliberately ephemeral (never journaled): a broker
+ * restart drops them, which is the conservative direction for the writer.
+ */
+export interface WriteFenceRecord {
+  id: string;
+  resourceId: ResourceId;
+  actorId: AgentId;
+  createdAt: number;
+  expiresAt: number;
+}
+
 export interface ResourceHold {
   leaseId: LeaseId;
   agentId: AgentId;

@@ -67,7 +67,7 @@ Actionable work is tracked here with checkboxes. Checked items mean the behavior
 
 ## Hardening / v1.x
 
-- [ ] Deferred write fencing: a fencing/lease epoch for guarded writes. The write-boundary `resource.check_write` already refuses expired holds, but a local filesystem write cannot enforce a fencing token against a writer that passed the check moments before its lease lapsed; genuine fencing needs cooperative file locking, which is deliberately not promised.
+- [x] Write fencing for guarded writes: `resource.begin_write` authorizes and fences the target; no conflicting lease is granted while the fence exists, even if the writer's hold lapses mid-write; `resource.end_write` (or expiry) lifts it and drains waiters. Remaining honesty: the filesystem mutation itself still cannot be atomic with coordinator state without cooperative file locking, which stays out of scope.
 - [ ] Add explicit broker health diagnostics and safe stale-lock cleanup.
 - [ ] Add journal compaction/checkpointing without losing audit metadata.
 - [ ] Add user-confirmed worktree cleanup with fresh Git safety checks.
