@@ -100,7 +100,8 @@ export class BrokerClient {
     const id = operationId ?? `op-${randomUUID()}`;
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.request<T>(op, { ...args, operationId: id }, timeoutMs);
+        const timeout = attempt === 0 ? timeoutMs : Math.max(timeoutMs ?? this.requestTimeoutMs, this.requestTimeoutMs);
+        return await this.request<T>(op, { ...args, operationId: id }, timeout);
       } catch (error) {
         if (attempt >= 1 || !isAmbiguousBrokerFailure(error)) throw error;
       }
