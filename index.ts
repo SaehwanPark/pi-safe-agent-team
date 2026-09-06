@@ -20,6 +20,8 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   const runtime = new FabricRuntime();
   const lazyClient = {
     request: <T = unknown>(operation: string, args: Record<string, unknown> = {}) => runtime.request<T>(operation, args),
+    requestIdempotent: <T = unknown>(operation: string, args: Record<string, unknown> = {}, operationId?: string, timeoutMs?: number) =>
+      runtime.requestIdempotent<T>(operation, args, operationId, timeoutMs),
   };
 
   for (const tool of createCoordinationTools({

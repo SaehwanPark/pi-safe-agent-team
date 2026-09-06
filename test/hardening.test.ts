@@ -524,7 +524,7 @@ test("root host writes participate in borrowing through the host guard", () => {
   assert.equal((coordinator.dispatch(mutableChild.id, "resource.check_write", { path: "src/a.ts" }).value as { allowed: boolean }).allowed, false);
 });
 
-test("root write guard blocks coordinated paths, skips foreign targets, and fails open only when the broker is down", async () => {
+test("root write guard blocks coordinated paths, skips foreign targets, and fails closed when the broker is down", async () => {
   const workspace = resolve(".");
   const requests: Array<{ operation: string; args: Record<string, unknown> }> = [];
   const guardClient = (decision: { allowed: boolean; reason?: string } | Error) => ({
@@ -549,9 +549,11 @@ test("root write guard blocks coordinated paths, skips foreign targets, and fail
   assert.equal(blocked?.block, true);
   assert.match(blocked?.reason ?? "", /conflicting runtime hold/);
 
-  // Broker transport loss means no actor can hold authorization, so the root is not wedged.
-  assert.equal(await evaluateRootWriteGuard({ client: guardClient(new FabricError("BROKER_UNAVAILABLE", "down")), workspacePath: workspace }, "edit", { path: "src/a.ts" }), undefined);
-  // Any other coordination error fails closed.
+  // While the broker is unavailable, an established fabric fails closed to protect in-flight writes.
+  const brokerDown = await evaluateRootWriteGuard({ client: guardClient(new FabricError("BROKER_UNAVAILABLE", "down")), workspacePath: workspace }, "edit", { path: "src/a.ts" });
+  assert.equal(brokerDown?.block, true);
+  assert.match(brokerDown?.reason ?? "", /could not coordinate the write/);
+  // Any other coordination error fails closed as well.
   const failedClosed = await evaluateRootWriteGuard({ client: guardClient(new FabricError("LIFECYCLE_CONFLICT", "root is terminal")), workspacePath: workspace }, "edit", { path: "src/a.ts" });
   assert.equal(failedClosed?.block, true);
   assert.match(failedClosed?.reason ?? "", /root is terminal/);
