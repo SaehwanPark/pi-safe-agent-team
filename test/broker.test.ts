@@ -199,3 +199,11 @@ test("filesystem case-folding detection probes the volume without leaving files"
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("broker client request timeout can be updated on client instance", () => {
+  const client = new BrokerClient({ endpoint: "mock", agentId: "test", requestTimeoutMs: 1_000 });
+  assert.equal(client.requestTimeoutMs, 1_000);
+  client.requestTimeoutMs = 2_000;
+  assert.equal(client.requestTimeoutMs, 2_000);
+});
+
