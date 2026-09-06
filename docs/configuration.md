@@ -34,6 +34,7 @@ Current defaults:
 | `leaseMs` | 30 minutes |
 | `heartbeatMs` | 1 minute |
 | `messageRetention` | 2048 recent records |
+| `caseInsensitivePaths` | auto | Fold policy keys so differently-cased spellings share one resource. Undefined = probe the broker volume at startup (always true on Windows). Set `false` to keep keys case-sensitive. |
 
 Limits fail closed. There is no automatic unbounded retry or fallback provider.
 

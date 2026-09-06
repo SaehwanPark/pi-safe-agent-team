@@ -6,7 +6,7 @@ Resource state is controlled by the broker. Agents may propose a handoff in pros
 
 A resource is an opaque ID such as `module:parser`, `file:parser.ts`, or `symbol:Parser.parse`. A definition may name one explicit parent and an optional workspace-relative `path`. File paths match exactly; module/directory paths match the path and descendants. The parent relationship is part of state, not inferred from filesystem spelling.
 
-The identity a guarded write is checked against is the target's *real* filesystem path: the boundary resolves symlinks, junctions, and alternate spellings before consulting the coordinator (policy keys are case-folded on Windows). Declare the real path of a file or module; writing through a directory alias is then authorized against the real declaration and its holds, and an alias spelling of its own no longer satisfies the declaration rule.
+The identity a guarded write is checked against is the target's *real* filesystem path: the boundary resolves symlinks, junctions, and alternate spellings before consulting the coordinator (policy keys are case-folded on case-insensitive volumes, auto-probed at broker start and overridable with `caseInsensitivePaths`). Declare the real path of a file or module; writing through a directory alias is then authorized against the real declaration and its holds, and an alias spelling of its own no longer satisfies the declaration rule.
 
 Two resources overlap when they are equal or one is an ancestor of the other; declared file/module paths also establish overlap when hierarchy links are omitted. That makes a mutable borrow on `module:parser` conflict with a shared borrow on `file:parser.ts`, even if the two agents named different IDs.
 
