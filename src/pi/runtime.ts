@@ -14,7 +14,7 @@ import { BrokerServer, defaultEndpoint } from "../broker/server.ts";
 import { GitWorkspaceStrategy, type WorkspaceStrategy } from "../workspace.ts";
 import { resolveChildModel, routeFromModel } from "./model-routing.ts";
 import { createCoordinationTools, type SpawnToolInput } from "./tools.ts";
-import { createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootWriteGuard } from "./guards.ts";
+import { createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootWriteGuard, releaseRootWriteFence, type RootWriteGuardOutcome } from "./guards.ts";
 
 export interface RoleConfig {
   model?: string;
@@ -184,9 +184,15 @@ export class FabricRuntime {
   }
 
   /** Coordinate a root-session file mutation against live borrowing state. */
-  async guardRootMutation(toolName: string, input: unknown, workspacePath: string): Promise<{ block: true; reason: string } | undefined> {
+  async guardRootMutation(toolName: string, input: unknown, workspacePath: string): Promise<RootWriteGuardOutcome | undefined> {
     if (!this.root) return undefined;
     return evaluateRootWriteGuard({ client: this.root.client, workspacePath }, toolName, input);
+  }
+
+  /** Best-effort lift of a root write fence taken by guardRootMutation. */
+  async releaseRootFence(fenceId: string): Promise<void> {
+    if (!this.root) return;
+    await releaseRootWriteFence(this.root.client, fenceId);
   }
 
   async status(): Promise<unknown> {

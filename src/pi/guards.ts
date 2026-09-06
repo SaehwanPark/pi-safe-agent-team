@@ -36,6 +36,7 @@ interface WriteDecision {
   allowed: boolean;
   reason?: string;
   resourceId?: string;
+  fenceId?: string;
 }
 
 /**
@@ -105,7 +106,7 @@ export function createGuardedChildTools(options: GuardedChildToolOptions): AnyTo
     tools.push(createBashToolDefinition(options.workspacePath, { operations: shellOperations }));
   }
   if (options.mayWriteRepo === true) {
-    const authorize = (absolutePath: string): Promise<void> => authorizeWrite(options.client, options.workspacePath, absolutePath);
+    const authorize = (absolutePath: string): Promise<() => Promise<void>> => authorizeWrite(options.client, options.workspacePath, absolutePath);
     const editOperations: EditOperations = {
       access: async (absolutePath) => {
         await assertFilesystemTargetWithinWorkspace(options.workspacePath, absolutePath);
@@ -116,8 +117,12 @@ export function createGuardedChildTools(options: GuardedChildToolOptions): AnyTo
         return fsReadFile(absolutePath);
       },
       writeFile: async (absolutePath, content) => {
-        await authorize(absolutePath);
-        await writeFileWithoutFollowingSymlink(absolutePath, content);
+        const releaseFence = await authorize(absolutePath);
+        try {
+          await writeFileWithoutFollowingSymlink(absolutePath, content);
+        } finally {
+          await releaseFence();
+        }
       },
     };
     const writeOperations: WriteOperations = {
@@ -125,9 +130,13 @@ export function createGuardedChildTools(options: GuardedChildToolOptions): AnyTo
       // creation until after the target file has passed the resource check.
       mkdir: async () => undefined,
       writeFile: async (absolutePath, content) => {
-        await authorize(absolutePath);
-        await ensureDirectoryWithoutFollowingSymlinks(options.workspacePath, dirname(absolutePath));
-        await writeFileWithoutFollowingSymlink(absolutePath, content);
+        const releaseFence = await authorize(absolutePath);
+        try {
+          await ensureDirectoryWithoutFollowingSymlinks(options.workspacePath, dirname(absolutePath));
+          await writeFileWithoutFollowingSymlink(absolutePath, content);
+        } finally {
+          await releaseFence();
+        }
       },
     };
     tools.push(createEditToolDefinition(options.workspacePath, { operations: editOperations }));
@@ -196,19 +205,30 @@ async function ensureDirectoryWithoutFollowingSymlinks(workspacePath: string, di
   }
 }
 
-async function authorizeWrite(client: WriteAuthorizationClient, workspacePath: string, absolutePath: string): Promise<void> {
+/**
+ * Authorize a guarded child write and fence the target resource for the
+ * duration of the filesystem mutation. The returned callback lifts the fence;
+ * release is best-effort because fences are short-lived and expire on their
+ * own if the release RPC is lost.
+ */
+async function authorizeWrite(client: WriteAuthorizationClient, workspacePath: string, absolutePath: string): Promise<() => Promise<void>> {
   await assertFilesystemTargetWithinWorkspace(workspacePath, absolutePath);
   const identity = await resolvePolicyPathIdentity(workspacePath, absolutePath);
   if (!identity.coordinated || identity.path === undefined) {
     throw new FabricError("CAPABILITY_DENIED", `Target ${absolutePath} resolves outside the managed workspace`, { workspacePath, absolutePath });
   }
-  const decision = await client.request<WriteDecision>("resource.check_write", { path: identity.path });
+  const decision = await client.request<WriteDecision>("resource.begin_write", { path: identity.path });
   if (decision?.allowed !== true) {
     throw new FabricError("CAPABILITY_DENIED", typeof decision?.reason === "string" ? decision.reason : `No mutable resource hold authorizes ${identity.path}`, {
       path: identity.path,
       resourceId: typeof decision?.resourceId === "string" ? decision.resourceId : undefined,
     });
   }
+  const fenceId = decision.fenceId;
+  if (typeof fenceId !== "string") return async () => undefined;
+  return async () => {
+    await client.request("resource.end_write", { fenceId }).catch(() => undefined);
+  };
 }
 
 /**
@@ -303,7 +323,23 @@ export interface RootWriteGuardOptions {
  * or obtain authorization, so the write fails open; any other coordinator
  * error fails closed.
  */
-export async function evaluateRootWriteGuard(options: RootWriteGuardOptions, toolName: string, input: unknown): Promise<{ block: true; reason: string } | undefined> {
+export interface RootWriteGuardOutcome {
+  /** Set when the write must be vetoed before touching the filesystem. */
+  block?: true;
+  reason?: string;
+  /**
+   * Set when the write is allowed and fenced; the caller must lift the fence
+   * once the tool call finishes. Fences expire on their own if the release is
+   * lost, so a dropped release degrades to the pre-fence behaviour.
+   */
+  fenceId?: string;
+}
+
+export async function releaseRootWriteFence(client: WriteAuthorizationClient, fenceId: string): Promise<void> {
+  await client.request("resource.end_write", { fenceId }).catch(() => undefined);
+}
+
+export async function evaluateRootWriteGuard(options: RootWriteGuardOptions, toolName: string, input: unknown): Promise<RootWriteGuardOutcome | undefined> {
   if (toolName !== "edit" && toolName !== "write") return undefined;
   const requested = (input as { path?: unknown } | undefined)?.path;
   if (typeof requested !== "string" || requested.length === 0 || requested.includes("\u0000")) return undefined;
@@ -319,12 +355,12 @@ export async function evaluateRootWriteGuard(options: RootWriteGuardOptions, too
   const path = identity.path;
   let decision: WriteDecision | undefined;
   try {
-    decision = await options.client.request<WriteDecision>("resource.check_write", { path, hostGuard: true });
+    decision = await options.client.request<WriteDecision>("resource.begin_write", { path, hostGuard: true });
   } catch (error) {
     if (error instanceof FabricError && error.code === "BROKER_UNAVAILABLE") return undefined;
     return { block: true, reason: `safe-agents could not coordinate the write to ${path}: ${error instanceof Error ? error.message : String(error)}` };
   }
-  if (decision?.allowed === true) return undefined;
+  if (decision?.allowed === true) return decision.fenceId ? { fenceId: decision.fenceId } : undefined;
   return { block: true, reason: `safe-agents root write guard: ${decision?.reason ?? `a coordinated resource hold blocks writing ${path}`}` };
 }
 

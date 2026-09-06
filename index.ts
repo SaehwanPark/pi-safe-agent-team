@@ -86,11 +86,25 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   }
 
   // The root participates in borrowing too: ordinary Pi edit/write calls are
-  // vetoed before the filesystem mutation when a live hold overlaps the path.
-  // Root shell remains unguarded and is documented as trusted, not sandboxed.
+  // vetoed before the filesystem mutation when a live hold overlaps the path,
+  // and allowed writes take a short-lived fence so a hold that lapses
+  // mid-write cannot be handed to a competing writer. Root shell stays
+  // unguarded and is documented as trusted, not sandboxed.
+  const pendingRootFences = new Map<string, string>();
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "edit" && event.toolName !== "write") return undefined;
-    return await runtime.guardRootMutation(event.toolName, event.input, ctx.cwd);
+    const outcome = await runtime.guardRootMutation(event.toolName, event.input, ctx.cwd);
+    if (outcome?.block) return outcome;
+    if (outcome?.fenceId) pendingRootFences.set(event.toolCallId, outcome.fenceId);
+    return undefined;
+  });
+
+  pi.on("tool_result", (event) => {
+    const fenceId = pendingRootFences.get(event.toolCallId);
+    if (fenceId === undefined) return undefined;
+    pendingRootFences.delete(event.toolCallId);
+    void runtime.releaseRootFence(fenceId);
+    return undefined;
   });
 
   pi.on("session_start", async (_event, ctx) => {
