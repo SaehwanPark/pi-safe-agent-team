@@ -185,6 +185,8 @@ Terminal states are idempotent and permanently terminal. Only the explicit broke
 
 Only the broker writes `events.jsonl`. Mutations are transaction-framed. Recovery applies committed transactions and ignores a partial trailing transaction. Broker restart marks previously live sessions as liveness-unknown/reconnectable, releases their active leases and requeues their non-terminal task claims, and permits matching session identities to re-register once. It does not fail pending clarification records. No model transcript is replicated in the broker journal.
 
+A reconnectable actor keeps its `maxTotalAgents` slot reserved while its reconnect window is open: new registrations and spawns are refused rather than allowed to evict an expected reconnection, and the reservation is released when the actor reconnects, resolves its turn, or is cancelled. `maxConcurrentAgents` bounds concurrently running turns and is deliberately not reserved; a turn start that finds the fabric full is retryable and reports a structured limit error.
+
 ## Error codes
 
 The public layer should preserve these stable categories where applicable:

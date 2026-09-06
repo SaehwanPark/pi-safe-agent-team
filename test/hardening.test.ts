@@ -200,6 +200,30 @@ test("terminal agents cannot reconnect, while the explicit broker-recovery windo
   assert.equal(coordinator.dispatch(recoverable.agent.id, "agent.register", { rootId: "fabric", parentId: "root", route, token: recoverable.token }).value.agent.status, "ready");
 });
 
+test("reconnectable agents reserve capacity so newcomers cannot evict them", () => {
+  const coordinator = new Coordinator({
+    rootId: "fabric",
+    config: { maxTotalAgents: 2, maxChildrenPerAgent: 4 },
+    clock: () => 1_000,
+  });
+  const rootRegistration = coordinator.dispatch("root", "agent.register", { rootId: "fabric", route, capabilities: { maySpawn: true } });
+  const rootToken = rootRegistration.value.token as string;
+  const spawned = coordinator.dispatch("root", "agent.spawn", { role: "worker", route, capabilities: {} }) as { value: { agent: AgentRecord; token: string } };
+  coordinator.recover();
+  // Both agents are failed+reconnectable; the root reclaims its own slot first.
+  coordinator.dispatch("root", "agent.register", { rootId: "fabric", route, token: rootToken });
+  // The child's slot stays reserved: a newcomer spawn cannot take it while the
+  // reconnect window is open.
+  expectCode(() => coordinator.dispatch("root", "agent.spawn", { role: "squatter", route, capabilities: {} }), "AGENT_LIMIT_REACHED");
+  const reconnected = coordinator.dispatch(spawned.value.agent.id, "agent.register", { rootId: "fabric", parentId: "root", route, token: spawned.value.token });
+  assert.equal(reconnected.value.agent.status, "ready");
+  expectCode(() => coordinator.dispatch("root", "agent.spawn", { role: "squatter", route, capabilities: {} }), "AGENT_LIMIT_REACHED");
+  // Cancelling the dead child releases its reservation permanently.
+  coordinator.dispatch(spawned.value.agent.id, "agent.cancel", { agentId: spawned.value.agent.id });
+  const admitted = coordinator.dispatch("root", "agent.spawn", { role: "replacement", route, capabilities: {} }) as { value: { agent: AgentRecord } };
+  assert.equal(admitted.value.agent.role, "replacement");
+});
+
 test("missing persisted credentials fail closed", () => {
   const coordinator = makeCoordinator();
   registerRoot(coordinator);

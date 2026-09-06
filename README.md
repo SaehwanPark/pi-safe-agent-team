@@ -88,6 +88,7 @@ npm run typecheck
 - Managed child `read`/`grep`/`find`/`ls` tools are workspace-scoped; `edit`/`write` tools also resolve their target against a declared workspace-relative file/module resource and call the coordinator at the actual filesystem write boundary. Shared-workspace shell is a conservative read-only allowlist with workspace-relative arguments; worktree shell is explicitly trusted and isolated only by the Git worktree.
 - The root session participates in borrowing: its ordinary Pi `edit`/`write` calls are vetoed before mutation whenever a live child hold overlaps the target. Undeclared root paths stay writable; the root shell stays explicitly trusted (not intercepted).
 - `agent.spawn` and `task.create` support an idempotent `operationId`: a retry after an ambiguous transport failure replays the original response instead of creating a duplicate child or task, and the dedup record survives broker restart.
+- After a broker restart, agents awaiting their one-shot reconnect keep their capacity slots reserved: new agents cannot evict them.
 - Model inheritance means the caller's actual in-memory `provider/model` object. Missing or excluded explicit routes fail closed.
 - Dirty worktrees are never silently deleted.
 
