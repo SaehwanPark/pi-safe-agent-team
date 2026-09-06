@@ -120,7 +120,7 @@ The root also participates in borrowing. A Pi `tool_call` veto intercepts the ro
 ## Failure behavior
 
 - model lookup/auth/session creation failure: child spawn fails and the coordinator-created identity is cancelled/released;
-- broker failure: clients report a structured unavailable error and reconnect without replaying mutations automatically; a broker restart preserves pending semantic requests while marking live actors reconnectable for one matching-token reattach;
+- broker failure: clients report a structured unavailable error and reconnect; only `agent.spawn`/`task.create` retry automatically, once, under the same `operationId`, so an ambiguous failure replays instead of duplicating; a broker restart preserves pending semantic requests while marking live actors reconnectable for one matching-token reattach, and those actors keep their capacity slots reserved until they reconnect, resolve, or are cancelled;
 - malformed journal tail: committed transactions before the tail remain usable; the tail is ignored and surfaced in diagnostics;
 - child crash: host marks it failed, releases task/resource runtime state, and sends a compact `agent_failed` notice to its parent;
 - parent shutdown: the managed subtree is cancelled, leases are released, and the broker retains bounded audit metadata;
@@ -145,7 +145,7 @@ The root also participates in borrowing. A Pi `tool_call` veto intercepts the ro
 6. Message IDs are stable; sends are at-least-once and deduplicable by client key.
 7. Per-sender message sequence is FIFO; no global ordering is promised.
 8. Asking for a reply changes agent state to `waiting`; it never blocks the broker or parent turn, and broker restart does not discard the pending request.
-9. Expired/dead agent leases are reclaimable and cannot permanently lock resources; broker-recovery liveness failures are reconnectable once, while semantic terminal states are not.
+9. Expired/dead agent leases are reclaimable and cannot permanently lock resources; broker-recovery liveness failures are reconnectable once, while semantic terminal states are not; a reconnectable actor's `maxTotalAgents` slot stays reserved during its reconnect window so new agents cannot evict it.
 10. Cancellation is idempotent and releases runtime-owned task/resource state.
 11. A child cannot exceed depth, child-count, total-agent, or capability limits.
 12. An explicit model route wins over role/default/inheritance and never silently changes provider.

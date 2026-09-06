@@ -524,7 +524,7 @@ export class Coordinator {
     assertCondition(Number.isInteger(depth), "INVALID_ARGUMENT", "depth must be an integer");
     assertCondition(parent || depth === 0, "IDENTITY_CONFLICT", "A root agent must have depth 0");
     assertCondition(depth >= 0 && depth <= this.config.maxDepth, "AGENT_LIMIT_REACHED", `Agent depth ${depth} exceeds maxDepth ${this.config.maxDepth}`);
-    assertCondition(this.activeAgentCount() < this.config.maxTotalAgents, "AGENT_LIMIT_REACHED", "The fabric has reached maxTotalAgents");
+    assertCondition(this.reservedAgentCount() < this.config.maxTotalAgents, "AGENT_LIMIT_REACHED", "The fabric has reached maxTotalAgents (slots awaiting reconnecting agents stay reserved)");
     if (parent) {
       assertCondition(parent.rootId === this.rootId, "IDENTITY_CONFLICT", "Parent belongs to another fabric");
       assertCondition(parent.childrenCreated < this.config.maxChildrenPerAgent, "AGENT_LIMIT_REACHED", `Agent ${parent.id} reached maxChildrenPerAgent`);
@@ -567,7 +567,7 @@ export class Coordinator {
     assertCondition(!isTerminal(parent.status), "LIFECYCLE_CONFLICT", `Agent ${actorId} is terminal`);
     assertCondition(parent.depth < this.config.maxDepth, "AGENT_LIMIT_REACHED", "Maximum recursion depth reached");
     assertCondition(parent.childrenCreated < this.config.maxChildrenPerAgent, "AGENT_LIMIT_REACHED", "Maximum child count reached");
-    assertCondition(this.activeAgentCount() < this.config.maxTotalAgents, "AGENT_LIMIT_REACHED", "The fabric has reached maxTotalAgents");
+    assertCondition(this.reservedAgentCount() < this.config.maxTotalAgents, "AGENT_LIMIT_REACHED", "The fabric has reached maxTotalAgents (slots awaiting reconnecting agents stay reserved)");
     const requestedCapabilities = input.capabilities ?? {};
     const childId = this.idFactory("agent");
     const result = this.registerAgent(childId, {
@@ -1905,8 +1905,15 @@ export class Coordinator {
     return task.dependencies.every((dependency) => this.tasks.get(dependency)?.status === "completed");
   }
 
-  private activeAgentCount(): number {
-    return [...this.agents.values()].filter((agent) => ACTIVE_STATUSES.has(agent.status)).length;
+  /**
+   * Capacity accounting for admitting new agents. A broker-recovery failure
+   * keeps an agent's maxTotalAgents slot reserved while its one-shot reconnect
+   * window stays open, so a newcomer can never evict an expected reconnection
+   * by filling the fabric. The reservation ends when the agent reconnects,
+   * resolves its turn, or is cancelled.
+   */
+  private reservedAgentCount(): number {
+    return [...this.agents.values()].filter((agent) => ACTIVE_STATUSES.has(agent.status) || agent.reconnectable === true).length;
   }
 
   private runningAgentCount(): number {
