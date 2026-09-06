@@ -6,6 +6,8 @@ import { FabricError } from "../core/errors.ts";
 import type { MessageType, ModelRoute } from "../core/types.ts";
 export interface BrokerRequestClient {
   request<T = unknown>(operation: string, args?: Record<string, unknown>): Promise<T>;
+  /** Optional: coordinators that deduplicate spawns/creates by operationId. */
+  requestIdempotent?<T = unknown>(operation: string, args?: Record<string, unknown>, operationId?: string): Promise<T>;
 }
 
 export interface SpawnToolInput {
@@ -152,7 +154,13 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
       }),
       async execute(_toolCallId, params: any): Promise<AgentToolResult<unknown>> {
         const { action, ...rest } = params;
-        return textResult(await client.request(action === "claim" ? "task.claim" : action === "list" ? "task.list" : action === "show" ? "task.show" : action === "create" ? "task.create" : "task.update", action === "list" || action === "show" ? rest : { ...rest, action }));
+        const operation = action === "claim" ? "task.claim" : action === "list" ? "task.list" : action === "show" ? "task.show" : action === "create" ? "task.create" : "task.update";
+        const args = action === "list" || action === "show" ? rest : { ...rest, action };
+        // Only creation is duplicate-prone after an ambiguous transport failure.
+        const create = action === "create" && client.requestIdempotent
+          ? client.requestIdempotent(operation, args)
+          : client.request(operation, args);
+        return textResult(await create);
       },
     },
     {

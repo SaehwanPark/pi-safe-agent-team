@@ -22,7 +22,7 @@ The first release is a local Pi extension and a small broker process:
 - exact model/provider/thinking resolution using the caller's in-memory Pi model for inheritance;
 - compact `/agents` status views and a small tool surface;
 - optional Git worktree creation for managed coding children;
-- append-only broker journal with transaction markers and crash-tail recovery.
+- append-only broker journal with transaction markers, crash-tail recovery, and durable write-idempotency records.
 
 The v1 implementation deliberately does not attempt a distributed service, remote agents, automatic merge/release policy, transcript replication, or unrestricted extension propagation into managed children.
 
@@ -58,12 +58,12 @@ A broker transaction is written as:
 
 ```text
 begin(txId)
-event(txId, ...)
+event(txId, ... [, idempotency])
 event(txId, ...)
 commit(txId)
 ```
 
-Recovery replays only committed transactions and ignores an incomplete final transaction. The broker is the sole journal writer; agents never edit state files.
+Recovery replays only committed transactions and ignores an incomplete final transaction. When an `event` record carries a write-idempotency record, its dedup entry is restored on commit alongside the events, so an ambiguous client retry after restart still resolves to the original response. The broker is the sole journal writer; agents never edit state files.
 
 ### `FabricRuntime` and `AgentHandle`
 
@@ -152,6 +152,8 @@ The root also participates in borrowing. A Pi `tool_call` veto intercepts the ro
 13. Model-generated payloads cannot set `from`, capabilities, ownership, or task authorship.
 14. Incoming messages are retained until accepted and acknowledged; busy receivers do not drop them, and same-sender inbox replay is ordered by `senderSequence` rather than timestamps or random IDs.
 15. Root status is a bounded projection and does not copy unrelated transcripts into model context.
+16. `agent.spawn`/`task.create` carrying an `operationId` apply at most once per `(actor, operationId)`; a matching retry replays the original response, a mismatch fails `IDEMPOTENCY_CONFLICT`, and the record is journaled with its transaction (bounded window, oldest evicted).
+17. The idempotency window is bounded and durability-scoped: it is restored on replay/checkpoint within the window, but it never reconstructs pre-hardening committed transactions that lack a record.
 
 ## Deferred by design
 

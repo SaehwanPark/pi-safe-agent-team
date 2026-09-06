@@ -293,7 +293,8 @@ export class FabricRuntime {
       model: input.model,
       thinking: input.thinking as ThinkingLevel | undefined,
     }, role, this.options.defaults, parentModel, parentThinking as ThinkingLevel);
-    const spawned = await parentClient.request<{ agent: AgentRecord; token: string; taskId?: string }>("agent.spawn", {
+    // Idempotent: an ambiguous transport failure here must not create a second child.
+    const spawned = await parentClient.requestIdempotent<{ agent: AgentRecord; token: string; taskId?: string }>("agent.spawn", {
       role: input.role ?? "agent",
       route: resolved.route,
       capabilities: { ...(role?.capabilities ?? {}), ...this.booleanCapabilities(input) },

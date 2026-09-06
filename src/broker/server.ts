@@ -276,7 +276,9 @@ export class BrokerServer {
         throw new FabricError("IDENTITY_CONFLICT", "child registration requires a coordinator-issued identity and reconnect credential");
       }
       const result = this.coordinator.dispatch(actorId, request.op, request.args ?? {});
-      if (result.events.length > 0) await this.journal.append(result.events);
+      if (result.events.length > 0 || result.idempotency !== undefined) {
+        await this.journal.append(result.events, result.idempotency);
+      }
       response = { id: request.id, version: PROTOCOL_VERSION, ok: true, result: result.value };
       this.broadcast(result.events);
     } catch (error) {
