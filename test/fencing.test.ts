@@ -142,3 +142,34 @@ test("root host-guard writes fence declared paths but leave undeclared paths unf
   const granted = coordinator.dispatch("worker", "resource.borrow", { resourceId: "file:m.ts", mode: "mutable", wait: true }).value as { status: string };
   assert.equal(granted.status, "granted");
 });
+
+test("foreign write fences protect against root host guard writes after the writer's lease expires", () => {
+  const { coordinator, now } = makeCoordinator();
+  registerRoot(coordinator);
+  registerChild(coordinator, "worker", { mayWriteRepo: true });
+  coordinator.dispatch("root", "resource.define", { resourceId: "file:m.ts", kind: "file", path: "m.ts", permissions: ["write"] });
+  coordinator.dispatch("root", "resource.grant", { resourceId: "file:m.ts", agentId: "worker", permissions: ["read", "write"] });
+
+  // Worker acquires mutable lease and establishes a write fence
+  coordinator.dispatch("worker", "resource.borrow", { resourceId: "file:m.ts", mode: "mutable", leaseMs: 5_000 });
+  const childFence = coordinator.dispatch("worker", "resource.begin_write", { path: "m.ts", fenceMs: 30_000 }).value as WriteDecision;
+  assert.equal(childFence.allowed, true);
+  assert.equal(typeof childFence.fenceId, "string");
+
+  // Time passes: worker's mutable lease lapses mid-write, but the fence is still active
+  now.value += 10_000;
+  coordinator.maintenance();
+
+  // Root tries to write with hostGuard. Even though the foreign hold is gone, the foreign fence must block the root.
+  const rootBlocked = coordinator.dispatch("root", "resource.begin_write", { path: "m.ts", hostGuard: true }).value as WriteDecision;
+  assert.equal(rootBlocked.allowed, false);
+  assert.match(rootBlocked.reason ?? "", /in-flight write prevents writing/);
+
+  // Once the worker finishes its write and ends the fence, root is allowed to write
+  const ended = coordinator.dispatch("worker", "resource.end_write", { fenceId: childFence.fenceId as string }).value as { released: boolean };
+  assert.equal(ended.released, true);
+
+  const rootAllowed = coordinator.dispatch("root", "resource.begin_write", { path: "m.ts", hostGuard: true }).value as WriteDecision;
+  assert.equal(rootAllowed.allowed, true);
+  assert.equal(rootAllowed.resourceId, "file:m.ts");
+});

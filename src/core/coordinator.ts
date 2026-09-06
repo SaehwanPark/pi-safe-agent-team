@@ -127,7 +127,7 @@ export class Coordinator {
   readonly rootAgentId?: string;
   readonly config: FabricConfig;
   /** Whether workspace-relative policy keys are case-folded (see FabricConfig.caseInsensitivePaths). */
-  readonly caseFoldPaths: boolean;
+  caseFoldPaths: boolean;
 
   private readonly clock: () => number;
   private readonly idFactory: (prefix: string) => string;
@@ -167,6 +167,11 @@ export class Coordinator {
     assertCondition(this.config.messageRetention > 0, "INVALID_ARGUMENT", "messageRetention must be positive");
     assertCondition(this.config.leaseMs > 0, "INVALID_ARGUMENT", "leaseMs must be positive");
     assertCondition(this.config.heartbeatMs > 0, "INVALID_ARGUMENT", "heartbeatMs must be positive");
+  }
+
+  setCaseInsensitivePaths(caseInsensitive: boolean): void {
+    this.caseFoldPaths = caseInsensitive;
+    this.config.caseInsensitivePaths = caseInsensitive;
   }
 
   /** Apply a protocol operation as one synchronous, atomic state transition. */
@@ -1083,6 +1088,14 @@ export class Coordinator {
     if (candidates.length === 0) {
       if (hostGuard) return { allowed: true };
       return { allowed: false, reason: `No declared resource matches ${requestedPath}` };
+    }
+    const fenced = candidates.find((resource) => this.activeForeignFence(resource, actorId));
+    if (fenced) {
+      return {
+        allowed: false,
+        resourceId: fenced.id,
+        reason: `An in-flight write prevents writing ${requestedPath ?? fenced.id}`,
+      };
     }
     const conflicting = requestedPath === undefined ? undefined : candidates.find((resource) => resource.sharedHolds.length > 0 || resource.mutableHold && resource.mutableHold.agentId !== actorId);
     if (conflicting) {

@@ -192,9 +192,24 @@ test("filesystem case-folding detection probes the volume without leaving files"
     assert.equal(typeof detected, "boolean");
     if (process.platform === "win32") assert.equal(detected, true);
     assert.deepEqual(await readdir(directory), []);
+    // Probing a directory that does not exist yet auto-creates it cleanly.
+    const nonExistent = join(directory, "nested", "probe-dir");
+    const detectedNonExistent = detectCaseInsensitivePaths(nonExistent);
+    assert.equal(typeof detectedNonExistent, "boolean");
+    if (process.platform === "win32") assert.equal(detectedNonExistent, true);
     // An explicit config value always wins over detection.
     assert.equal(resolveBrokerConfig({ directory, rootId: "fabric", config: { caseInsensitivePaths: false } }).caseInsensitivePaths, false);
     assert.equal(typeof resolveBrokerConfig({ directory, rootId: "fabric" }).caseInsensitivePaths, "boolean");
+    // policyRoot takes precedence over broker state directory.
+    const policyDir = join(directory, "workspace");
+    const brokerDir = join(directory, "broker-state");
+    const resolved = resolveBrokerConfig({ directory: brokerDir, policyRoot: policyDir, rootId: "fabric" });
+    assert.equal(typeof resolved.caseInsensitivePaths, "boolean");
+    // BrokerServer.start() finalizes coordinator case policy using policyRoot
+    const server = new BrokerServer({ directory: brokerDir, policyRoot: policyDir, rootId: "fabric", rootAgentId: "root", maintenanceMs: 60_000 });
+    await server.start();
+    assert.equal(typeof server.coordinator.caseFoldPaths, "boolean");
+    await server.stop();
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

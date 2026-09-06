@@ -183,6 +183,16 @@ export class FabricRuntime {
     return this.root.client.request<T>(operation, args);
   }
 
+  async requestIdempotent<T = unknown>(
+    operation: string,
+    args: Record<string, unknown> = {},
+    operationId?: string,
+    timeoutMs?: number,
+  ): Promise<T> {
+    if (!this.root) throw new FabricError("BROKER_UNAVAILABLE", "Fabric root is not attached");
+    return this.root.client.requestIdempotent<T>(operation, args, operationId, timeoutMs);
+  }
+
   /** Coordinate a root-session file mutation against live borrowing state. */
   async guardRootMutation(toolName: string, input: unknown, workspacePath: string): Promise<RootWriteGuardOutcome | undefined> {
     if (!this.root) return undefined;
@@ -268,7 +278,7 @@ export class FabricRuntime {
     if (this.server?.isStarted()) return;
     const shouldStart = this.options.startBroker !== false;
     if (shouldStart) {
-      const candidate = new BrokerServer({ directory: this.stateDirectory, rootId: this.fabricId, rootAgentId: `root-${createHash("sha256").update(this.fabricId).digest("hex").slice(0, 24)}`, config: this.config, endpoint: this.endpoint });
+      const candidate = new BrokerServer({ directory: this.stateDirectory, policyRoot: this.cwd, rootId: this.fabricId, rootAgentId: `root-${createHash("sha256").update(this.fabricId).digest("hex").slice(0, 24)}`, config: this.config, endpoint: this.endpoint });
       try {
         await candidate.start();
         this.server = candidate;

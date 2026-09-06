@@ -1,6 +1,6 @@
 import net from "node:net";
 import { createHash } from "node:crypto";
-import { existsSync, unlinkSync, writeFileSync, promises as fs } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync, promises as fs } from "node:fs";
 import { dirname, join } from "node:path";
 import { platform } from "node:os";
 import { FabricError, asFabricError } from "../core/errors.ts";
@@ -12,6 +12,7 @@ export const PROTOCOL_VERSION = 1;
 
 export interface BrokerServerOptions {
   directory: string;
+  policyRoot?: string;
   rootId: string;
   rootAgentId?: string;
   config?: Partial<FabricConfig>;
@@ -113,13 +114,15 @@ class BrokerConnection {
 /** One local authoritative broker for a fabric. */
 /**
  * Resolve the broker's FabricConfig, auto-detecting policy-key case folding
- * when unset. The probe runs against the broker state directory, which lives
- * on the same volume policy decisions protect; an explicit config value
- * always wins.
+ * when unset. The probe runs against policyRoot (the project workspace volume)
+ * or falls back to the broker state directory; an explicit config value always
+ * wins.
  */
 export function resolveBrokerConfig(options: BrokerServerOptions): Partial<FabricConfig> {
   const config: Partial<FabricConfig> = { ...(options.config ?? {}) };
-  if (config.caseInsensitivePaths === undefined) config.caseInsensitivePaths = detectCaseInsensitivePaths(options.directory);
+  if (config.caseInsensitivePaths === undefined) {
+    config.caseInsensitivePaths = detectCaseInsensitivePaths(options.policyRoot ?? options.directory);
+  }
   return config;
 }
 
@@ -130,9 +133,14 @@ export function resolveBrokerConfig(options: BrokerServerOptions): Partial<Fabri
  */
 export function detectCaseInsensitivePaths(directory: string): boolean {
   if (process.platform === "win32") return true;
+  try {
+    mkdirSync(directory, { recursive: true });
+  } catch {
+    return false;
+  }
   const base = join(directory, `.pi-case-${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
   const written = `${base}.MiXeD`;
-  const probed = `${base}.UPPER`;
+  const probed = `${base}.MIXED`;
   try {
     writeFileSync(written, "");
     return existsSync(probed);
@@ -149,6 +157,7 @@ export function detectCaseInsensitivePaths(directory: string): boolean {
 
 export class BrokerServer {
   readonly directory: string;
+  readonly policyRoot: string;
   readonly endpoint: string;
   readonly coordinator: Coordinator;
   readonly journal: Journal;
@@ -164,10 +173,15 @@ export class BrokerServer {
   private lockHandle?: fs.FileHandle;
   private started = false;
   private stopping = false;
+  private readonly rawConfig?: Partial<FabricConfig>;
+  private readonly autoCoordinator: boolean;
 
   constructor(options: BrokerServerOptions) {
     this.directory = options.directory;
+    this.policyRoot = options.policyRoot ?? options.directory;
     this.endpoint = options.endpoint ?? defaultEndpoint(options.directory);
+    this.rawConfig = options.config;
+    this.autoCoordinator = options.coordinator === undefined;
     this.coordinator = options.coordinator ?? new Coordinator({ rootId: options.rootId, rootAgentId: options.rootAgentId, config: resolveBrokerConfig(options) });
     this.journal = options.journal ?? new Journal({ directory: options.directory });
     this.maintenanceMs = Math.max(1000, options.maintenanceMs ?? this.coordinator.config.heartbeatMs);
@@ -179,6 +193,9 @@ export class BrokerServer {
     this.inFlightRequests.clear();
     this.requestOrder.length = 0;
     await this.acquireLock();
+    if (this.rawConfig?.caseInsensitivePaths === undefined && this.autoCoordinator) {
+      this.coordinator.setCaseInsensitivePaths(detectCaseInsensitivePaths(this.policyRoot));
+    }
     try {
       await this.journal.replay(this.coordinator);
       const recovery = this.coordinator.recover();

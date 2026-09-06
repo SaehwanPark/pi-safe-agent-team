@@ -319,9 +319,9 @@ export interface RootWriteGuardOptions {
  * to managed children, but it may not race a live runtime hold: a path with
  * no conflicting hold is writable, and any overlapping shared or foreign
  * mutable hold blocks the write. Targets outside the fabric workspace are
- * not resource-coordinated. If the broker is unreachable, no actor can hold
- * or obtain authorization, so the write fails open; any other coordinator
- * error fails closed.
+ * not resource-coordinated. If the broker is unreachable, an established
+ * fabric fails closed so a broker outage cannot expose in-flight child writes
+ * to a race with the root.
  */
 export interface RootWriteGuardOutcome {
   /** Set when the write must be vetoed before touching the filesystem. */
@@ -342,7 +342,7 @@ export async function releaseRootWriteFence(client: WriteAuthorizationClient, fe
 export async function evaluateRootWriteGuard(options: RootWriteGuardOptions, toolName: string, input: unknown): Promise<RootWriteGuardOutcome | undefined> {
   if (toolName !== "edit" && toolName !== "write") return undefined;
   const requested = (input as { path?: unknown } | undefined)?.path;
-  if (typeof requested !== "string" || requested.length === 0 || requested.includes("\u0000")) return undefined;
+  if (typeof requested !== "string" || requested.length === 0 || requested.includes("\0")) return undefined;
   let identity: PolicyPathIdentity;
   try {
     identity = await resolvePolicyPathIdentity(options.workspacePath, requested);
@@ -357,7 +357,6 @@ export async function evaluateRootWriteGuard(options: RootWriteGuardOptions, too
   try {
     decision = await options.client.request<WriteDecision>("resource.begin_write", { path, hostGuard: true });
   } catch (error) {
-    if (error instanceof FabricError && error.code === "BROKER_UNAVAILABLE") return undefined;
     return { block: true, reason: `safe-agents could not coordinate the write to ${path}: ${error instanceof Error ? error.message : String(error)}` };
   }
   if (decision?.allowed === true) return decision.fenceId ? { fenceId: decision.fenceId } : undefined;
