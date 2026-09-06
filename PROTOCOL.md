@@ -156,7 +156,7 @@ Cancellation releases active claims back to `pending` unless a caller explicitly
 
 A resource can have an owner, an optional workspace-relative `path`, and active leases:
 
-Path identity is enforced at the guarded filesystem boundary, not inside the broker: before a guarded write asks `resource.check_write`, the host resolves the target's real path (symlinks, junctions, and alternate spellings through the nearest existing ancestor; policy keys are case-folded on Windows). Declarations name real paths — a write that reaches a coordinated file through an alias is authorized only against the file's own declaration and holds. A target whose real identity escapes the workspace is denied outright for managed children and left uncoordinated for the root. Unresolvable targets (for example symlink loops) fail closed.
+Path identity is enforced at the guarded filesystem boundary, not inside the broker: before a guarded write asks `resource.check_write`, the host resolves the target's real path (symlinks, junctions, and alternate spellings through the nearest existing ancestor; policy keys are case-folded on case-insensitive volumes, auto-probed at broker start and overridable with `FabricConfig.caseInsensitivePaths`). Declarations name real paths — a write that reaches a coordinated file through an alias is authorized only against the file's own declaration and holds. A target whose real identity escapes the workspace is denied outright for managed children and left uncoordinated for the root. Unresolvable targets (for example symlink loops) fail closed.
 
 - `own`/`claim`: logical semantic owner; a same-owner re-claim is idempotent and does not bump the resource version;
 - `borrow(shared)`: many readers if no overlapping mutable holder;
