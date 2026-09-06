@@ -57,6 +57,7 @@ Actionable work is tracked here with checkboxes. Checked items mean the behavior
 - [x] Add deterministic broker ordering and host-side in-flight message deduplication.
 - [x] Tighten peer/resource capability ceilings and private worker message history.
 - [x] Add adversarial regression coverage and a GitHub Actions check workflow.
+- [x] Run the CI check workflow on a Linux/macOS/Windows matrix.
 - [x] Make the fabric root participate in borrowing: root `edit`/`write` calls are vetoed before mutation when a live foreign hold overlaps the target, while undeclared root paths stay writable and the root shell remains documented as trusted.
 - [x] Give `agent.spawn`/`task.create` durable `operationId` idempotency with journal-persisted dedup records, replay-on-retry, `IDEMPOTENCY_CONFLICT` on mismatched reuse, and a single bounded ambiguous-failure retry in the broker client.
 - [x] Reserve `maxTotalAgents` capacity for reconnectable actors across broker restarts so new agents cannot evict an expected reconnection.
