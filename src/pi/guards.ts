@@ -235,6 +235,42 @@ async function assertFilesystemTargetWithinWorkspace(workspacePath: string, targ
   }
 }
 
+export interface RootWriteGuardOptions {
+  client: WriteAuthorizationClient;
+  workspacePath: string;
+}
+
+/**
+ * Evaluate the root host's ordinary Pi `edit`/`write` tool call against the
+ * borrowing protocol before the tool performs its filesystem mutation. The
+ * root is exempt from the declaration/mutable-hold requirement that applies
+ * to managed children, but it may not race a live runtime hold: a path with
+ * no conflicting hold is writable, and any overlapping shared or foreign
+ * mutable hold blocks the write. Targets outside the fabric workspace are
+ * not resource-coordinated. If the broker is unreachable, no actor can hold
+ * or obtain authorization, so the write fails open; any other coordinator
+ * error fails closed.
+ */
+export async function evaluateRootWriteGuard(options: RootWriteGuardOptions, toolName: string, input: unknown): Promise<{ block: true; reason: string } | undefined> {
+  if (toolName !== "edit" && toolName !== "write") return undefined;
+  const requested = (input as { path?: unknown } | undefined)?.path;
+  if (typeof requested !== "string" || requested.length === 0 || requested.includes("\u0000")) return undefined;
+  const root = resolve(options.workspacePath);
+  const target = resolve(root, requested);
+  const relativePath = relative(root, target);
+  if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) return undefined;
+  const path = relativePath.split(sep).join("/");
+  let decision: WriteDecision | undefined;
+  try {
+    decision = await options.client.request<WriteDecision>("resource.check_write", { path, hostGuard: true });
+  } catch (error) {
+    if (error instanceof FabricError && error.code === "BROKER_UNAVAILABLE") return undefined;
+    return { block: true, reason: `safe-agents could not coordinate the write to ${path}: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (decision?.allowed === true) return undefined;
+  return { block: true, reason: `safe-agents root write guard: ${decision?.reason ?? `a coordinated resource hold blocks writing ${path}`}` };
+}
+
 export function workspaceRelativePath(workspacePath: string, targetPath: string): string {
   if (targetPath.includes("\u0000")) throw new FabricError("CAPABILITY_DENIED", "Filesystem paths must not contain NUL characters");
   const root = resolve(workspacePath);

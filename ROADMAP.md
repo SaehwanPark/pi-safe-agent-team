@@ -57,6 +57,7 @@ Actionable work is tracked here with checkboxes. Checked items mean the behavior
 - [x] Add deterministic broker ordering and host-side in-flight message deduplication.
 - [x] Tighten peer/resource capability ceilings and private worker message history.
 - [x] Add adversarial regression coverage and a GitHub Actions check workflow.
+- [x] Make the fabric root participate in borrowing: root `edit`/`write` calls are vetoed before mutation when a live foreign hold overlaps the target, while undeclared root paths stay writable and the root shell remains documented as trusted.
 
 ## Hardening / v1.x
 

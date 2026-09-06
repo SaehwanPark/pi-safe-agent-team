@@ -151,7 +151,7 @@ A resource can have an owner, an optional workspace-relative `path`, and active 
 - `transfer`: atomic owner change by an authorized owner/delegator;
 - `release`: release the caller's active hold;
 - `snapshot`: return `resourceId@version` for stable dependency tracking;
-- `check_write`: authorize an actual file path only when the actor has a current mutable hold on a matching declared resource.
+- `check_write`: authorize an actual file path only when the actor has a current mutable hold on a matching declared resource. With `hostGuard: true` (accepted only from the fabric root), the root instead participates in borrowing by exemption: the write is allowed when no overlapping resource carries a live foreign hold, and undeclared paths are writable without a prior declaration.
 
 Resource hierarchy uses explicit parent links. Equality and ancestor/descendant overlap are conflict candidates. A conflict returns a structured busy/waiting result; it is never silently granted. A waiting mutable request is ordered FIFO and wakes after a release or lease reclamation.
 

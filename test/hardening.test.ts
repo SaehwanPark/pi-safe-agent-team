@@ -9,7 +9,7 @@ import { Coordinator } from "../src/core/coordinator.ts";
 import { FabricError } from "../src/core/errors.ts";
 import { BrokerClient } from "../src/broker/client.ts";
 import { BrokerServer } from "../src/broker/server.ts";
-import { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, workspaceRelativePath } from "../src/pi/guards.ts";
+import { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootWriteGuard, workspaceRelativePath } from "../src/pi/guards.ts";
 import { ManagedChild, taskAwareTurnStatus } from "../src/pi/runtime.ts";
 import type { AgentRecord, AgentMessage, ModelRoute, ResourceRecord } from "../src/core/types.ts";
 
@@ -452,6 +452,84 @@ test("guarded edit accepts a declared path only while the coordinator grants a m
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("root host writes participate in borrowing through the host guard", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  const mutableChild = registerChild(coordinator, "mutable-child", { mayWriteRepo: true });
+  const sharedChild = registerChild(coordinator, "shared-child", { mayWriteRepo: true });
+  coordinator.dispatch("root", "resource.define", { resourceId: "module:src", kind: "module", path: "src" });
+  coordinator.dispatch("root", "resource.define", { resourceId: "file:src/a.ts", kind: "file", path: "src/a.ts", parentId: "module:src" });
+  coordinator.dispatch("root", "resource.grant", { resourceId: "file:src/a.ts", agentId: mutableChild.id, permissions: ["read", "write"] });
+  coordinator.dispatch("root", "resource.grant", { resourceId: "file:src/a.ts", agentId: sharedChild.id, permissions: ["read"] });
+
+  // Undeclared or unheld paths are writable by the root without a declaration.
+  assert.deepEqual(coordinator.dispatch("root", "resource.check_write", { path: "docs/untracked.md", hostGuard: true }).value, { allowed: true });
+  assert.equal((coordinator.dispatch("root", "resource.check_write", { path: "src/a.ts", hostGuard: true }).value as { allowed: boolean }).allowed, true);
+
+  // A child's shared read hold blocks the root, matching mutable-acquisition rules.
+  coordinator.dispatch(sharedChild.id, "resource.borrow", { resourceId: "file:src/a.ts", mode: "shared" });
+  const blockedByShared = coordinator.dispatch("root", "resource.check_write", { path: "src/a.ts", hostGuard: true }).value as { allowed: boolean; reason?: string };
+  assert.equal(blockedByShared.allowed, false);
+  coordinator.dispatch(sharedChild.id, "resource.release", { resourceId: "file:src/a.ts" });
+
+  // A narrow file-level mutable hold blocks only that file, not siblings.
+  coordinator.dispatch(mutableChild.id, "resource.borrow", { resourceId: "file:src/a.ts", mode: "mutable" });
+  const blockedByMutable = coordinator.dispatch("root", "resource.check_write", { path: "src/a.ts", hostGuard: true }).value as { allowed: boolean; resourceId?: string };
+  assert.equal(blockedByMutable.allowed, false);
+  assert.equal(blockedByMutable.resourceId, "file:src/a.ts");
+  assert.equal((coordinator.dispatch("root", "resource.check_write", { path: "src/nested/deep.ts", hostGuard: true }).value as { allowed: boolean }).allowed, true);
+  coordinator.dispatch(mutableChild.id, "resource.release", { resourceId: "file:src/a.ts" });
+
+  // A module-level mutable hold blocks the root across its whole declared subtree.
+  coordinator.dispatch("root", "resource.grant", { resourceId: "module:src", agentId: mutableChild.id, permissions: ["read", "write"] });
+  coordinator.dispatch(mutableChild.id, "resource.borrow", { resourceId: "module:src", mode: "mutable" });
+  const blockedByModule = coordinator.dispatch("root", "resource.check_write", { path: "src/a.ts", hostGuard: true }).value as { allowed: boolean; resourceId?: string };
+  assert.equal(blockedByModule.allowed, false);
+  assert.equal(blockedByModule.resourceId, "module:src");
+  assert.equal((coordinator.dispatch("root", "resource.check_write", { path: "src/nested/deep.ts", hostGuard: true }).value as { allowed: boolean; resourceId?: string }).resourceId, "module:src");
+
+  // Only the fabric root may claim the host-guard exemption.
+  expectCode(() => coordinator.dispatch(mutableChild.id, "resource.check_write", { path: "src/a.ts", hostGuard: true }), "CAPABILITY_DENIED");
+
+  // After release the root may write again, and children keep strict guards.
+  coordinator.dispatch(mutableChild.id, "resource.release", { resourceId: "module:src" });
+  assert.deepEqual(coordinator.dispatch("root", "resource.check_write", { path: "src/a.ts", hostGuard: true }).value, { allowed: true, resourceId: "file:src/a.ts" });
+  assert.equal((coordinator.dispatch(mutableChild.id, "resource.check_write", { path: "src/a.ts" }).value as { allowed: boolean }).allowed, false);
+});
+
+test("root write guard blocks coordinated paths, skips foreign targets, and fails open only when the broker is down", async () => {
+  const workspace = resolve(".");
+  const requests: Array<{ operation: string; args: Record<string, unknown> }> = [];
+  const guardClient = (decision: { allowed: boolean; reason?: string } | Error) => ({
+    request: async <T>(operation: string, args: Record<string, unknown> = {}): Promise<T> => {
+      requests.push({ operation, args });
+      if (decision instanceof Error) throw decision;
+      return decision as T;
+    },
+  });
+
+  // Non-write tools and foreign/absolute targets never reach the broker.
+  assert.equal(await evaluateRootWriteGuard({ client: guardClient({ allowed: true }), workspacePath: workspace }, "read", { path: "src/a.ts" }), undefined);
+  assert.equal(await evaluateRootWriteGuard({ client: guardClient({ allowed: true }), workspacePath: workspace }, "edit", { path: join(resolve(".."), "outside.ts") }), undefined);
+  assert.equal(requests.length, 0);
+
+  // A workspace-relative edit is checked with the host-guard exemption.
+  assert.equal(await evaluateRootWriteGuard({ client: guardClient({ allowed: true }), workspacePath: workspace }, "write", { path: "src/a.ts" }), undefined);
+  assert.deepEqual(requests.at(-1), { operation: "resource.check_write", args: { path: "src/a.ts", hostGuard: true } });
+
+  // A conflicting live hold blocks the tool call before any filesystem write.
+  const blocked = await evaluateRootWriteGuard({ client: guardClient({ allowed: false, reason: "A conflicting runtime hold prevents writing src/a.ts" }), workspacePath: workspace }, "edit", { path: "src/a.ts" });
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /conflicting runtime hold/);
+
+  // Broker transport loss means no actor can hold authorization, so the root is not wedged.
+  assert.equal(await evaluateRootWriteGuard({ client: guardClient(new FabricError("BROKER_UNAVAILABLE", "down")), workspacePath: workspace }, "edit", { path: "src/a.ts" }), undefined);
+  // Any other coordination error fails closed.
+  const failedClosed = await evaluateRootWriteGuard({ client: guardClient(new FabricError("LIFECYCLE_CONFLICT", "root is terminal")), workspacePath: workspace }, "edit", { path: "src/a.ts" });
+  assert.equal(failedClosed?.block, true);
+  assert.match(failedClosed?.reason ?? "", /root is terminal/);
 });
 
 test("duplicate unacknowledged notifications are queued and executed once", async () => {
