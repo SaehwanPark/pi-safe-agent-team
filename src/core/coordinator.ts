@@ -125,6 +125,8 @@ export class Coordinator {
   readonly rootId: string;
   readonly rootAgentId?: string;
   readonly config: FabricConfig;
+  /** Whether workspace-relative policy keys are case-folded (see FabricConfig.caseInsensitivePaths). */
+  readonly caseFoldPaths: boolean;
 
   private readonly clock: () => number;
   private readonly idFactory: (prefix: string) => string;
@@ -148,6 +150,10 @@ export class Coordinator {
       ...DEFAULT_FABRIC_CONFIG,
       ...(options.config ?? {}),
     };
+    // Policy-key case folding follows the resolved config; undefined keeps the
+    // historical platform rule (Windows folds, others do not) unless the
+    // broker probed the actual volume at startup and injected the result.
+    this.caseFoldPaths = this.config.caseInsensitivePaths ?? process.platform === "win32";
     assertCondition(this.config.maxDepth >= 0, "INVALID_ARGUMENT", "maxDepth must be non-negative");
     assertCondition(this.config.maxChildrenPerAgent >= 0, "INVALID_ARGUMENT", "maxChildrenPerAgent must be non-negative");
     assertCondition(this.config.maxTotalAgents > 0, "INVALID_ARGUMENT", "maxTotalAgents must be positive");
@@ -868,7 +874,7 @@ export class Coordinator {
     const id = parseString(args.resourceId, "resourceId", 1024);
     const kind = parseString(args.kind ?? "resource", "kind", 128);
     const parentId = parseOptionalString(args.parentId, "parentId", 1024);
-    const resourcePath = args.path === undefined ? undefined : normalizeResourcePath(args.path);
+    const resourcePath = args.path === undefined ? undefined : normalizeResourcePath(args.path, "path", this.caseFoldPaths);
     const existing = this.resources.get(id);
     if (existing) {
       assertCondition(existing.kind === kind && existing.parentId === parentId && (args.path === undefined || existing.path === resourcePath), "IDENTITY_CONFLICT", `Resource ${id} already has a different definition`);
@@ -1057,7 +1063,7 @@ export class Coordinator {
       return { allowed: false, reason: `Agent ${actorId} is not allowed to write repository files` };
     }
     const resourceId = parseOptionalString(args.resourceId, "resourceId");
-    const requestedPath = args.path === undefined ? undefined : normalizeResourcePath(args.path);
+    const requestedPath = args.path === undefined ? undefined : normalizeResourcePath(args.path, "path", this.caseFoldPaths);
     assertCondition(resourceId || requestedPath, "INVALID_ARGUMENT", "resource.check_write requires resourceId or path");
 
     const selectedResource = resourceId ? this.requireResource(resourceId) : undefined;
@@ -1679,7 +1685,7 @@ export class Coordinator {
     if (resource.path) return resource.path;
     if (resource.kind === "file" && resource.id.startsWith("file:")) {
       try {
-        return normalizeResourcePath(resource.id.slice("file:".length));
+        return normalizeResourcePath(resource.id.slice("file:".length), "path", this.caseFoldPaths);
       } catch {
         return undefined;
       }

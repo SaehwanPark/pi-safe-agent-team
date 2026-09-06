@@ -108,16 +108,16 @@ export function mergeCapabilities(requested: Partial<AgentCapabilities> | undefi
   return { ...base, ...result };
 }
 
-export function normalizeResourcePath(value: unknown, name = "path"): string {
+export function normalizeResourcePath(value: unknown, name = "path", caseInsensitive: boolean = process.platform === "win32"): string {
   const raw = parseString(value, name, 4096).replaceAll("\\", "/");
   assertCondition(!raw.startsWith("/") && !/^[A-Za-z]:/.test(raw), "INVALID_ARGUMENT", `${name} must be workspace-relative`);
   const parts = raw.split("/").filter((part) => part.length > 0 && part !== ".");
   assertCondition(parts.length > 0 && !parts.includes(".."), "INVALID_ARGUMENT", `${name} must not escape the workspace`);
   const normalized = parts.join("/");
-  // Windows workspace paths are case-insensitive even when the declared
-  // resource spelling is not. Canonicalize the policy key so casing cannot
-  // bypass a matching file resource.
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+  // Case-insensitive workspace volumes treat differently-cased spellings as
+  // the same file. Canonicalize the policy key so casing cannot split a
+  // resource's identity and bypass a matching file resource.
+  return caseInsensitive ? normalized.toLowerCase() : normalized;
 }
 
 export function parseString(value: unknown, name: string, maxLength = 512): string {

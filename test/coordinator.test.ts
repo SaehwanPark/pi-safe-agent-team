@@ -190,3 +190,25 @@ test("same-owner claim is idempotent and release requires exactly one selector",
   const again = coordinator.dispatch("root", "resource.release", { all: true });
   assert.equal((again.value as { released: boolean }).released, false);
 });
+
+test("case-insensitive policy config folds declarations and checks together", () => {
+  const registerFabric = (config: Record<string, unknown>) => {
+    const coordinator = new Coordinator({ rootId: "fabric", config: config as never, clock: () => 1_000 });
+    registerRoot(coordinator);
+    registerChild(coordinator, "worker", "root", { mayWriteRepo: true });
+    coordinator.dispatch("root", "resource.define", { resourceId: "file:foo", kind: "file", path: "src/Foo.ts", permissions: ["write"] });
+    coordinator.dispatch("root", "resource.grant", { resourceId: "file:foo", agentId: "worker", permissions: ["write"] });
+    coordinator.dispatch("worker", "resource.borrow", { resourceId: "file:foo", mode: "mutable" });
+    return coordinator;
+  };
+  const folding = registerFabric({ caseInsensitivePaths: true });
+  const hit = folding.dispatch("worker", "resource.check_write", { path: "SRC/FOO.TS" });
+  assert.equal((hit.value as { allowed: boolean }).allowed, true);
+  assert.equal((hit.value as { resourceId?: string }).resourceId, "file:foo");
+  // A strictly case-sensitive coordinator must keep the two spellings apart.
+  const strict = registerFabric({ caseInsensitivePaths: false });
+  const miss = strict.dispatch("worker", "resource.check_write", { path: "SRC/FOO.TS" });
+  assert.equal((miss.value as { allowed: boolean }).allowed, false);
+  const exact = strict.dispatch("worker", "resource.check_write", { path: "src/Foo.ts" });
+  assert.equal((exact.value as { allowed: boolean }).allowed, true);
+});
