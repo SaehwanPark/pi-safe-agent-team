@@ -150,6 +150,7 @@ export class FabricRuntime {
       },
       sessionId,
       workspace: { mode: "shared", root: ctx.cwd, path: ctx.cwd },
+      token: this.rootToken,
     });
     this.rootToken = result.token;
     await this.saveRootToken(result.token);

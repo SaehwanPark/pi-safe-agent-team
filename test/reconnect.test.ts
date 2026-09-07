@@ -5,9 +5,47 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BrokerClient } from "../src/broker/client.ts";
 import { BrokerServer } from "../src/broker/server.ts";
+import { FabricRuntime } from "../src/pi/runtime.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRecord, ModelRoute } from "../src/core/types.ts";
 
 const route: ModelRoute = { provider: "test", model: "small", thinking: "medium" };
+
+function runtimeContext(cwd: string, sessionId: string): ExtensionContext {
+  return {
+    cwd,
+    model: { provider: route.provider, id: route.model },
+    thinkingLevel: route.thinking,
+    sessionManager: { getSessionId: () => sessionId },
+  } as unknown as ExtensionContext;
+}
+
+test("Pi root reattaches with its persisted reconnect credential", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "safe-agents-root-reconnect-"));
+  const stateDirectory = join(directory, "state");
+  const options = {
+    cwd: directory,
+    fabricId: "fabric-root-reconnect",
+    stateDirectory,
+    agentDir: directory,
+    config: { heartbeatMs: 1_000 },
+  };
+  const firstRuntime = new FabricRuntime(options);
+  const secondRuntime = new FabricRuntime(options);
+  try {
+    await firstRuntime.ensureRoot({} as ExtensionAPI, runtimeContext(directory, "session-1"));
+    await firstRuntime.stop();
+    await secondRuntime.ensureRoot({} as ExtensionAPI, runtimeContext(directory, "session-2"));
+
+    const status = await secondRuntime.status() as { agents: AgentRecord[] };
+    const root = status.agents.find((agent) => agent.id === secondRuntime.rootAgentId);
+    assert.equal(root?.status, "ready");
+  } finally {
+    await secondRuntime.stop();
+    await firstRuntime.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("a child reconnects with its credential and recovers an unacknowledged inbox", async () => {
   const directory = await mkdtemp(join(tmpdir(), "safe-agents-reconnect-"));
