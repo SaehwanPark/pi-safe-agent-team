@@ -3,6 +3,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { FabricError, asFabricError } from "./src/core/errors.ts";
 import type { AgentMessage, FabricStatus } from "./src/core/types.ts";
 import { FabricRuntime } from "./src/pi/runtime.ts";
+import { LifecycleQueue } from "./src/pi/lifecycle.ts";
 import { createCoordinationTools } from "./src/pi/tools.ts";
 
 export { Coordinator } from "./src/core/coordinator.ts";
@@ -51,6 +52,23 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
 
   const rootDeliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
   let rootDeliveryTail: Promise<void> = Promise.resolve();
+  const lifecycleQueue = new LifecycleQueue();
+
+  const enqueueLifecycle = (generation: number, operation: () => Promise<void>): Promise<void> =>
+    lifecycleQueue.enqueue(generation, operation);
+
+  const notifyLifecycleFailure = (
+    ctx: ExtensionContext,
+    error: unknown,
+    severity: "error" | "warning",
+    generation?: number,
+  ): void => {
+    // A late host callback from an older generation is expected during shutdown
+    // or reload; it must not surface as a failure in the next session.
+    if (generation !== undefined && generation !== lifecycleQueue.currentGeneration) return;
+    const fabricError = asFabricError(error);
+    ctx.ui.notify(`safe-agents: ${fabricError.message}`, severity);
+  };
   const rootDelivery = (api: ExtensionAPI) => (message: AgentMessage): void => {
     const state = rootDeliveryStates.get(message.id);
     if (state === "acknowledged" || state === "delivering") return;
@@ -110,24 +128,39 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    const generation = lifecycleQueue.beginSession();
     try {
-      await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
-      ctx.ui.setStatus("safe-agents", `fabric ${runtime.rootAgentId ?? "starting"}`);
+      await enqueueLifecycle(generation, async () => {
+        await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
+        if (generation !== lifecycleQueue.currentGeneration) return;
+        ctx.ui.setStatus("safe-agents", `fabric ${runtime.rootAgentId ?? "starting"}`);
+      });
     } catch (error) {
-      ctx.ui.notify(`safe-agents: ${asFabricError(error).message}`, "error");
+      notifyLifecycleFailure(ctx, error, "error", generation);
     }
   });
 
   pi.on("agent_start", (_event, ctx) => {
-    void runtime.ensureRoot(pi, ctx, rootDelivery(pi)).then(() => runtime.request("agent.begin_turn", {})).catch((error) => ctx.ui.notify(`safe-agents: ${asFabricError(error).message}`, "warning"));
+    const generation = lifecycleQueue.currentGeneration;
+    void enqueueLifecycle(generation, async () => {
+      await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
+      if (generation !== lifecycleQueue.currentGeneration) return;
+      await runtime.request("agent.begin_turn", {});
+    }).catch((error) => notifyLifecycleFailure(ctx, error, "warning", generation));
   });
 
   pi.on("agent_end", (_event, ctx) => {
-    void runtime.request("agent.end_turn", { status: "ready" }).catch((error) => ctx.ui.notify(`safe-agents: ${asFabricError(error).message}`, "warning"));
+    const generation = lifecycleQueue.currentGeneration;
+    void enqueueLifecycle(generation, async () => {
+      if (!runtime.rootAgentId) return;
+      await runtime.request("agent.end_turn", { status: "ready" });
+    }).catch((error) => notifyLifecycleFailure(ctx, error, "warning", generation));
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    await runtime.stop().catch((error) => ctx.ui.notify(`safe-agents shutdown: ${asFabricError(error).message}`, "warning"));
+    const pendingLifecycle = lifecycleQueue.shutdown();
+    await pendingLifecycle.catch(() => undefined);
+    await runtime.stop().catch((error) => notifyLifecycleFailure(ctx, error, "warning"));
   });
 
   pi.registerCommand("agents", {
