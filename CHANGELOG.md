@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Fixed Pi root reattachment by forwarding the persisted reconnect credential during root registration, eliminating the recurring `requires its reconnect credential` startup error.
+- Added an integration regression test covering root reattachment across broker restart.
+
 ## 0.2.0
 
 - Finalize the root broker turn on Pi's `agent_settled` event instead of `agent_end`, ensuring queued continuations, auto-retries, or compactions complete before turn finalization.
