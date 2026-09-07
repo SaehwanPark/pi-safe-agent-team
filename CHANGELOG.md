@@ -1,8 +1,14 @@
 # Changelog
 
+## 0.1.2
+
+- Finalize the root broker turn on Pi's `agent_settled` event instead of `agent_end`, which may be followed by automatic retry, compaction, or queued continuation.
+- Added integration coverage for one settled finalization and shutdown waiting for an in-flight settled handler.
+- Documented that session-control methods belong in commands/`withSession`, not lifecycle event handlers.
+
 ## 0.1.1
 
-- Serialized root lifecycle attachment and turn-boundary requests so `agent_start` and `agent_end` cannot race a pending root registration.
+- Serialized root lifecycle attachment and turn-boundary requests so `agent_start` and `agent_settled` cannot race a pending root registration.
 - Ignored stale lifecycle callbacks after shutdown/reload and suppressed the expected detached-root warning during teardown.
 - Added a lifecycle-safe coordination failure boundary without changing broker task semantics.
 
