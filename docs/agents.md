@@ -55,7 +55,8 @@ The root session participates too: its ordinary Pi `edit`/`write` calls are veto
 - lost socket: the host reconnects with its credential and syncs the inbox;
 - broker restart: old live actors are marked failed/reconnectable, leases are released, pending clarification records survive, matching sessions can re-register once, and each waiting actor keeps its `maxTotalAgents` slot reserved until it reconnects, resolves, or is cancelled (so newcomers cannot evict it);
 - parent cancellation: descendants are cancelled recursively;
-- host lifecycle race: root attach, begin-turn, and end-turn requests are serialized; callbacks from an older session are ignored after shutdown, and a detached root during teardown is treated as a nonfatal unavailable-fabric condition.
+- host lifecycle race: root attach, begin-turn, and final end-turn requests are serialized; the root ends its broker turn on Pi's `agent_settled` event rather than `agent_end` because Pi may retry, compact, or continue after `agent_end`. Callbacks from an older session are ignored after shutdown, and a detached root during teardown is treated as a nonfatal unavailable-fabric condition.
+- Pi session-control methods such as `newSession`, `fork`, and `switchSession` are command-only operations. Do not call them from lifecycle event handlers, where they can deadlock; use a command/`withSession` flow and let lifecycle handlers remain best-effort.
 
 ## Workspace modes
 

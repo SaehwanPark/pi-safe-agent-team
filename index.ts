@@ -149,7 +149,10 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     }).catch((error) => notifyLifecycleFailure(ctx, error, "warning", generation));
   });
 
-  pi.on("agent_end", (_event, ctx) => {
+  // agent_end can be followed by Pi's automatic retry, compaction, or queued
+  // continuation. End the broker turn only after Pi confirms the run is
+  // settled, so the root never advertises readiness during another run.
+  pi.on("agent_settled", (_event, ctx) => {
     const generation = lifecycleQueue.currentGeneration;
     void enqueueLifecycle(generation, async () => {
       if (!runtime.rootAgentId) return;
