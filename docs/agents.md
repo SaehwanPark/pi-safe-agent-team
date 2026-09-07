@@ -54,7 +54,8 @@ The root session participates too: its ordinary Pi `edit`/`write` calls are veto
 - model turn error: child becomes `failed`, task ownership is released/requeued, and the parent receives `agent_failed`;
 - lost socket: the host reconnects with its credential and syncs the inbox;
 - broker restart: old live actors are marked failed/reconnectable, leases are released, pending clarification records survive, matching sessions can re-register once, and each waiting actor keeps its `maxTotalAgents` slot reserved until it reconnects, resolves, or is cancelled (so newcomers cannot evict it);
-- parent cancellation: descendants are cancelled recursively.
+- parent cancellation: descendants are cancelled recursively;
+- host lifecycle race: root attach, begin-turn, and end-turn requests are serialized; callbacks from an older session are ignored after shutdown, and a detached root during teardown is treated as a nonfatal unavailable-fabric condition.
 
 ## Workspace modes
 

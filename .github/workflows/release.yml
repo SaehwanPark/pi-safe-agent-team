@@ -1,0 +1,38 @@
+name: Publish npm package
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify release version
+        run: test "$(node -p 'require("./package.json").version')" = "${GITHUB_REF_NAME#v}"
+
+      - name: Verify package
+        run: npm run check && npm run build && npm pack --dry-run
+
+      - name: Publish with npm trusted publishing
+        run: npm publish --access public

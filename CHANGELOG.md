@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- Serialized root lifecycle attachment and turn-boundary requests so `agent_start` and `agent_end` cannot race a pending root registration.
+- Ignored stale lifecycle callbacks after shutdown/reload and suppressed the expected detached-root warning during teardown.
+- Added a lifecycle-safe coordination failure boundary without changing broker task semantics.
+
 ## 0.1.0
 
 - Added the deterministic coordinator for recursive agents, tasks, typed mailboxes, resources, leases, capabilities, cancellation, and model-route policy.
