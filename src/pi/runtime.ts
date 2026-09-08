@@ -325,7 +325,7 @@ export class FabricRuntime {
     }
     const caseInsensitive = this.caseInsensitivePaths;
     const normalizeScopePath = (p: string): string => {
-      const resolved = resolve(p);
+      const resolved = canonicalWorkspacePath(p);
       return caseInsensitive ? resolved.toLowerCase() : resolved;
     };
     if (normalizeScopePath(request.cwd) !== normalizeScopePath(this.cwd)) {
@@ -928,15 +928,15 @@ export class ManagedChild {
     this.eventUnsubscribe?.();
     this.closeUnsubscribe?.();
     try {
-      this.embeddedManager?.dispose();
-    } catch {}
-    this.embeddedManager = undefined;
-    try {
       await this.session?.abort();
     } catch {
       // Cancellation is best effort; the coordinator still releases on the explicit request.
     }
     this.session?.dispose();
+    try {
+      this.embeddedManager?.dispose();
+    } catch {}
+    this.embeddedManager = undefined;
     this.client.close();
   }
 
