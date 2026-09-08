@@ -313,15 +313,20 @@ Safe-agent-team binds managed child agents to the active root Pi session lifetim
 - On `session_shutdown`, the runtime cancels all managed descendant agents and tasks and unregisters its interop provider.
 - Companion extensions (e.g. `local-context-manager`) that replace, reset, or rewind root sessions **must** query `safe-agent-team.fabric-state.v1` first and wait until `sessionReplacementSafe === true` (or prompt the user) before resetting the session, preventing unexpected mid-flight child cancellation.
 
+The default fabric is scoped to the canonical workspace and the attached root Pi
+session ID. A new concurrent Pi session in the same workspace therefore creates a
+separate broker namespace; only an explicit fabric/state/endpoint override opts into
+sharing.
+
 ### `local-context-manager.embedded-context.v1`
 
 When registered by a context manager, safe-agent-team's `ManagedChild` requests an embedded context manager:
 
 - Wraps tool outputs with adaptive compaction and token budgeting.
 - Observes turn boundaries (`observeTurnStart`, `observeTurnEnd`, `observeSettled`).
-- Context usage and compactions delegate to upstream Pi `AgentSession.compact(customInstructions?: string)`, passing `customInstructions` or `reason` strictly as `string | undefined` (never an object).
+- Context usage and compactions delegate to upstream Pi `AgentSession.compact(customInstructions?: string)`, passing only explicit `customInstructions` (the `reason` field remains diagnostic metadata).
 - Runs strictly inside the managed child session without ambient extension loading (`noExtensions: true`).
-- Fails soft: any error or throwing provider drops back to `native` context management, disposing the embedded controller (`embeddedManager.dispose()`), clearing its reference, and notifying the coordinator broker with `agent.update({ contextMode: "native" })` without crashing the child agent. Reconnecting children preserve this degraded (or active) `contextMode` during `agent.register`.
+- Fails soft: any error or throwing provider drops back to `native` context management, deactivating the embedded controller while retaining its reference and recovery artifacts, and notifying the coordinator broker with `agent.update({ contextMode: "native" })` without crashing the child agent. Final child shutdown disposes the manager and cleans those artifacts. Reconnecting children preserve this degraded (or active) `contextMode` during `agent.register`.
 
 ## Root Shell Mutator Preflight Guard
 
@@ -342,4 +347,3 @@ The root `bash` tool call is preflighted in `index.ts` using `classifyRootShellC
     - Path-scoped mutators on completely unrelated paths remain allowed when active fence paths are known.
     - If active write fences exist but fence path details are omitted (e.g. older coordinator projections), path mutations fail closed to protect pending child writes while read-only commands continue unimpeded.
 - Root shell remains a trusted developer escape hatch and is not represented as an infallible security sandbox.
-

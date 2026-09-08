@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Session-Scoped Default Fabrics**: Lazily finalize the default fabric identity from the canonical workspace and root Pi session ID, isolating concurrent sessions in one repository while preserving same-session reconnects. Explicit fabric/state/endpoint options remain advanced sharing overrides.
+- **Recovery-Safe Embedded Degradation**: Deactivate embedded context managers during native fallback so recovery files referenced by prior reduced tool output remain available until child shutdown; final disposal still cleans manager-owned storage.
+- **Compaction Metadata Separation**: Pass only explicit `customInstructions` to child Pi compaction; diagnostic `reason` values no longer become model instructions.
+- **Managed-Child Integration Smoke**: Extend the opt-in model-backed smoke to load both projects, provision disposable auth/model fixtures, spawn a real child, require the `lcm-embedded` context mode, and verify a completed child task plus root quiescence marker; credential-free load smokes remain unchanged.
+
 ## 0.2.2
 
 - **Canonical Agent Directory Resolution**: Resolved agent directory via `@earendil-works/pi-coding-agent`'s `getAgentDir()` honoring `PI_CODING_AGENT_DIR` uniformly for root and all managed children, deprecating legacy `PI_AGENT_DIR`. Added full-isolation test verifying child session paths, auth/models paths, and broker state stay under `PI_CODING_AGENT_DIR` without leaking into `~/.pi/agent`.
@@ -72,4 +79,3 @@
 - Wired `requestIdempotent` into root `agent_task(create)` via `FabricRuntime` and `lazyClient`.
 - Made root write guard fail closed on `BROKER_UNAVAILABLE` for coordinated workspace writes to protect in-flight child writes during broker outages.
 - Rejected indirect file-list options (`file -f`, `--files0-from`) in read-only shell inspection.
-

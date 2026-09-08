@@ -148,6 +148,8 @@ export interface EmbeddedContextManager {
   observeSettled(): Promise<void>;
   transformToolResult(result: EmbeddedToolResult): Promise<EmbeddedToolResult>;
   snapshot(): EmbeddedContextSnapshot;
+  /** Stop context behavior while retaining manager-owned recovery artifacts. */
+  deactivate?(): void;
   dispose(): void;
 }
 
