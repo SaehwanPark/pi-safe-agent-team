@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml/badge.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue.svg)](https://saehwanpark.github.io/pi-safe-agent-team/)
-[![Version](https://img.shields.io/badge/version-0.2.2-blue.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/releases/tag/v0.2.2)
+[![Version](https://img.shields.io/badge/version-0.2.3-blue.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/releases/tag/v0.2.3)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node](https://img.shields.io/badge/node-%3E%3D22.19.0-brightgreen.svg)](https://nodejs.org/)
 

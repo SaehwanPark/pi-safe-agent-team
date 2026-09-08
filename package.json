@@ -1,6 +1,6 @@
 {
   "name": "pi-safe-agents-team",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Deterministic local coordination for recursive Pi agents",
   "type": "module",
   "main": "./dist/index.js",

@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.3 - 2026-09-08
+
+This patch completes the joint hardening pass with `local-context-manager`, isolating concurrent Pi roots and preserving embedded recovery across native fallback.
 
 - **Session-Scoped Default Fabrics**: Lazily finalize the default fabric identity from the canonical workspace and root Pi session ID, isolating concurrent sessions in one repository while preserving same-session reconnects. Explicit fabric/state/endpoint options remain advanced sharing overrides.
 - **Recovery-Safe Embedded Degradation**: Deactivate embedded context managers during native fallback so recovery files referenced by prior reduced tool output remain available until child shutdown; final disposal still cleans manager-owned storage.
