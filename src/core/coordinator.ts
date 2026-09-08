@@ -3,6 +3,7 @@ import { FabricError, assertCondition } from "./errors.ts";
 import {
   DEFAULT_FABRIC_CONFIG,
   cloneAgent,
+  cloneCapabilities,
   cloneMessage,
   cloneRequest,
   cloneResource,
@@ -85,6 +86,7 @@ export interface RegisterAgentArgs {
   taskId?: TaskId;
   token?: string;
   initialStatus?: "starting" | "ready";
+  contextMode?: string;
 }
 
 export interface SpawnAgentArgs {
@@ -406,6 +408,7 @@ export class Coordinator {
       childrenCreated: 0,
       authToken: token ?? this.idFactory("token"),
       reconnectable: false,
+      contextMode: parseOptionalString(input.contextMode, "contextMode", 128),
     };
     this.agents.set(id, record);
     this.nextMessageSequence.set(id, 0);
@@ -1169,6 +1172,7 @@ export class Coordinator {
       recentMessages: allMessages,
       runningChildren: this.runningAgentCount(),
       config: cloneConfig(this.config),
+      activeFences: [...this.fences.values()].filter((candidate) => candidate.expiresAt > this.clock()).length,
     };
   }
 
@@ -1868,6 +1872,8 @@ export class Coordinator {
       status: agent.status,
       workspace: agent.workspace ? { ...agent.workspace } : undefined,
       lastActivity: agent.lastActivity,
+      contextMode: agent.contextMode,
+      capabilities: cloneCapabilities(agent.capabilities),
     };
   }
 }

@@ -1,20 +1,21 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type AgentSession, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { join, resolve } from "node:path";
+import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type AgentSession, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { FabricError, asFabricError } from "../core/errors.ts";
 import { Coordinator } from "../core/coordinator.ts";
-import type { AgentStatus, FabricConfig, AgentMessage, AgentRecord, ModelRoute, TaskRecord } from "../core/types.ts";
+import type { AgentStatus, FabricConfig, AgentMessage, AgentRecord, FabricStatus, ModelRoute, TaskRecord } from "../core/types.ts";
 import { BrokerClient } from "../broker/client.ts";
 import { BrokerServer, defaultEndpoint } from "../broker/server.ts";
 import { GitWorkspaceStrategy, type WorkspaceStrategy } from "../workspace.ts";
 import { resolveChildModel, routeFromModel } from "./model-routing.ts";
 import { createCoordinationTools, type SpawnToolInput } from "./tools.ts";
-import { createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootWriteGuard, releaseRootWriteFence, type RootWriteGuardOutcome } from "./guards.ts";
+import { createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootShellGuard, evaluateRootWriteGuard, releaseRootWriteFence, type RootWriteGuardOutcome } from "./guards.ts";
+import { createEmbeddedContextController, type EmbeddedContextHost, type EmbeddedContextManager, type FabricSnapshotRequest, type FabricStateSnapshotV1 } from "./interop.ts";
 
 export interface RoleConfig {
   model?: string;
@@ -41,6 +42,8 @@ export interface SpawnedAgentSummary {
   taskId?: string;
   workspace?: AgentRecord["workspace"];
   routeSource?: string;
+  contextMode?: string;
+  summaryText?: string;
 }
 
 /** Derive a host lifecycle result from durable task facts, never model text. */
@@ -94,7 +97,7 @@ export class FabricRuntime {
     this.options = options;
     this.cwd = options.cwd ?? process.cwd();
     this.fabricId = options.fabricId ?? `fabric-${createHash("sha256").update(this.cwd).digest("hex").slice(0, 24)}`;
-    this.agentDir = options.agentDir ?? process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+    this.agentDir = options.agentDir ?? (process.env.PI_CODING_AGENT_DIR ? getAgentDir() : (process.env.PI_AGENT_DIR ?? getAgentDir()));
     this.stateDirectory = options.stateDirectory ?? join(this.agentDir, "safe-agents", createHash("sha256").update(this.cwd).digest("hex").slice(0, 24));
     this.endpoint = options.endpoint ?? defaultEndpoint(this.stateDirectory);
     this.config = options.config;
@@ -204,6 +207,121 @@ export class FabricRuntime {
   async releaseRootFence(fenceId: string): Promise<void> {
     if (!this.root) return;
     await releaseRootWriteFence(this.root.client, fenceId);
+  }
+
+  /** Coordinate a root-session shell command against live child holds. */
+  async guardRootShell(input: unknown, workspacePath: string): Promise<RootWriteGuardOutcome | undefined> {
+    if (!this.root) return undefined;
+    return evaluateRootShellGuard({ client: this.root.client, workspacePath }, input);
+  }
+
+  private pendingRootDeliveriesCount = 0;
+  private pendingRootFencesCount = 0;
+
+  setPendingRootDeliveriesCount(count: number): void {
+    this.pendingRootDeliveriesCount = count;
+  }
+
+  setPendingRootFencesCount(count: number): void {
+    this.pendingRootFencesCount = count;
+  }
+
+  /** Provide a deterministic fabric state snapshot for context managers. */
+  async getFabricStateSnapshot(request: FabricSnapshotRequest): Promise<FabricStateSnapshotV1 | null> {
+    const requestedCwd = resolve(request.cwd);
+    const runtimeCwd = resolve(this.cwd);
+    if (requestedCwd.toLowerCase() !== runtimeCwd.toLowerCase()) {
+      return null;
+    }
+    const rootSessionId = (this.root?.ctx as any)?.sessionManager?.getSessionId?.() ?? (this.root?.ctx as any)?.sessionId;
+    if (request.sessionId && rootSessionId && request.sessionId !== rootSessionId) {
+      return null;
+    }
+
+    const now = Date.now();
+    if (this.stopped || !this.root) {
+      return {
+        active: false,
+        quiescent: false,
+        capturedAt: now,
+        runningChildren: 0,
+        unresolvedChildTasks: 0,
+        mutableHolds: 0,
+        pendingRootRequests: 0,
+        pendingRootDeliveries: 0,
+        activeTasks: [],
+        mutableResources: [],
+      };
+    }
+
+    try {
+      const status = (await this.status()) as FabricStatus;
+      const runningChildren = status.agents.filter(
+        (a) => a.depth > 0 && (a.status === "starting" || a.status === "running"),
+      ).length;
+      const unresolvedChildTasks = status.tasks.filter(
+        (t) => t.owner && t.owner !== status.rootId && ["pending", "ready", "active", "waiting", "blocked"].includes(t.status),
+      ).length;
+      const mutableHolds = status.resources.filter((r) => r.mutableHold !== undefined).length;
+      const pendingRootRequests = status.pendingRequests.filter(
+        (r) => r.to === status.rootId && r.status === "pending",
+      ).length;
+      const pendingRootDeliveries = this.pendingRootDeliveriesCount;
+      const activeFences = (status.activeFences ?? 0) + this.pendingRootFencesCount;
+
+      const quiescent =
+        runningChildren === 0 &&
+        unresolvedChildTasks === 0 &&
+        mutableHolds === 0 &&
+        pendingRootRequests === 0 &&
+        pendingRootDeliveries === 0 &&
+        activeFences === 0;
+
+      const activeTasks = status.tasks
+        .filter((t) => ["pending", "ready", "active", "waiting", "blocked"].includes(t.status))
+        .slice(0, 50)
+        .map((t) => ({
+          id: t.id,
+          status: t.status,
+          owner: t.owner,
+          description: t.description,
+        }));
+
+      const mutableResources = status.resources
+        .filter((r) => r.mutableHold !== undefined)
+        .slice(0, 50)
+        .map((r) => ({
+          id: r.id,
+          path: r.path,
+          holder: r.mutableHold?.agentId,
+        }));
+
+      return {
+        active: true,
+        quiescent,
+        capturedAt: now,
+        runningChildren,
+        unresolvedChildTasks,
+        mutableHolds,
+        pendingRootRequests,
+        pendingRootDeliveries,
+        activeTasks,
+        mutableResources,
+      };
+    } catch {
+      return {
+        active: false,
+        quiescent: false,
+        capturedAt: now,
+        runningChildren: 0,
+        unresolvedChildTasks: 0,
+        mutableHolds: 0,
+        pendingRootRequests: 0,
+        pendingRootDeliveries: 0,
+        activeTasks: [],
+        mutableResources: [],
+      };
+    }
   }
 
   async status(): Promise<unknown> {
@@ -357,11 +475,14 @@ export class FabricRuntime {
       this.children.delete(child.agentId);
       throw asFabricError(error, "CHILD_SESSION_FAILURE");
     }
+    const summaryText = `${child.agentId} · ${child.role} · ${resolved.route.provider}/${resolved.route.model} · ${resolved.route.thinking ?? "none"} · ${resolved.source} · ${workspace?.mode ?? "shared"} · ${child.contextMode}`;
     return {
       agent: stripAuth(child.record),
       taskId: spawned.taskId,
       workspace,
       routeSource: resolved.source,
+      contextMode: child.contextMode,
+      summaryText,
     };
   }
 
@@ -438,6 +559,7 @@ export class ManagedChild {
   readonly client: BrokerClient;
   session?: AgentSession;
   record: AgentRecord;
+  contextMode: "lcm-embedded" | "native" = "native";
 
   private readonly pendingMessages: AgentMessage[] = [];
   private readonly pendingMessageIds = new Set<string>();
@@ -451,6 +573,9 @@ export class ManagedChild {
   private promptTail: Promise<void> = Promise.resolve();
   private deliveryTail: Promise<void> = Promise.resolve();
   private readonly pendingReplyIds = new Set<string>();
+  private embeddedManager?: EmbeddedContextManager;
+  private resolvingToolCount = 0;
+  private hasInFlightWrite = 0;
 
   constructor(runtime: FabricRuntime, options: {
     agentId: string;
@@ -513,6 +638,96 @@ export class ManagedChild {
       appendSystemPrompt: [this.bootstrapInstructions()],
     });
     await resourceLoader.reload();
+    const host: EmbeddedContextHost = {
+      getContextUsage: () => {
+        try {
+          const usage = (this.session as any)?.getContextUsage?.();
+          if (usage) {
+            return {
+              tokens: typeof usage.tokens === "number" ? usage.tokens : null,
+              contextWindow: typeof usage.contextWindow === "number" ? usage.contextWindow : ((this.model as any)?.contextWindow ?? null),
+              source: usage.source ?? "estimated",
+            };
+          }
+        } catch {}
+        return {
+          tokens: null,
+          contextWindow: (this.model as any)?.contextWindow ?? null,
+          source: "estimated",
+        };
+      },
+      getContextEntries: () => {
+        try {
+          if (typeof (this.session as any)?.getContextEntries === "function") {
+            return (this.session as any).getContextEntries();
+          }
+          return (this.session?.messages ?? []) as any[];
+        } catch {
+          return [];
+        }
+      },
+      compact: async (request) => {
+        if (this.session?.isStreaming || this.hasInFlightWrite > 0 || this.resolvingToolCount > 0) {
+          throw new FabricError("CAPABILITY_DENIED", "Cannot compact child context while active operations are in flight");
+        }
+        if (typeof (this.session as any)?.compact === "function") {
+          await (this.session as any).compact(request);
+        }
+      },
+      onStatus: (_snapshot) => {},
+      onDiagnostic: (_diagnostic) => {},
+    };
+
+    const embedded = createEmbeddedContextController(host, {
+      mode: "managed-child",
+      contextWindow: (this.model as any)?.contextWindow,
+    });
+    if (embedded) {
+      this.embeddedManager = embedded;
+      this.contextMode = "lcm-embedded";
+    } else {
+      this.contextMode = "native";
+    }
+
+    const wrapToolWithContext = (tool: ToolDefinition): ToolDefinition => {
+      const originalExecute = tool.execute.bind(tool);
+      const isWriteTool = tool.name === "edit" || tool.name === "write";
+      return {
+        ...tool,
+        execute: async (toolCallId: string, params: any, signal?: any, onUpdate?: any, ctx?: any) => {
+          this.resolvingToolCount++;
+          if (isWriteTool) this.hasInFlightWrite++;
+          let result: any;
+          try {
+            result = await originalExecute(toolCallId, params, signal, onUpdate, ctx);
+          } finally {
+            this.resolvingToolCount--;
+            if (isWriteTool) this.hasInFlightWrite--;
+          }
+          if (this.embeddedManager && this.contextMode === "lcm-embedded") {
+            try {
+              const transformed = await this.embeddedManager.transformToolResult({
+                toolName: tool.name,
+                input: (params ?? {}) as Record<string, unknown>,
+                content: result.content ?? [],
+                details: result.details,
+                isError: Boolean(result?.isError),
+              });
+              return {
+                ...result,
+                content: transformed.content as any,
+                details: transformed.details !== undefined ? transformed.details : result.details,
+              };
+            } catch {
+              this.contextMode = "native";
+              return result;
+            }
+          }
+          return result;
+        },
+      };
+    };
+
     const coordinationTools = createCoordinationTools({
       client: this.client,
       parentModel: this.model,
@@ -531,6 +746,7 @@ export class ManagedChild {
       shellMode: this.workspace?.mode === "worktree" ? "workspace" : "read-only",
     });
     const builtins = [...guardedReadOnlyTools.map((tool) => tool.name), ...guardedTools.map((tool) => tool.name)];
+    const wrappedCustomTools = [...guardedReadOnlyTools, ...guardedTools, ...coordinationTools].map(wrapToolWithContext);
     const { session } = await createAgentSession({
       cwd: this.workspacePath,
       agentDir: this.agentDir,
@@ -540,7 +756,7 @@ export class ManagedChild {
       settingsManager,
       resourceLoader,
       modelRuntime: await this.runtime.modelRuntimeForChildren(),
-      customTools: [...guardedReadOnlyTools, ...guardedTools, ...coordinationTools],
+      customTools: wrappedCustomTools,
       tools: [...builtins, ...coordinationTools.map((tool) => tool.name)],
     });
     this.session = session;
@@ -553,6 +769,7 @@ export class ManagedChild {
       sessionId: session.sessionId,
       workspace: this.workspace,
       token: this.token,
+      contextMode: this.contextMode,
     })).agent;
     this.taskId = this.record.taskId;
     this.started = true;
@@ -577,6 +794,10 @@ export class ManagedChild {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.eventUnsubscribe?.();
     this.closeUnsubscribe?.();
+    try {
+      this.embeddedManager?.dispose();
+    } catch {}
+    this.embeddedManager = undefined;
     try {
       await this.session?.abort();
     } catch {
@@ -648,7 +869,22 @@ export class ManagedChild {
       if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
     }
     if (!started || this.stopping) return;
+    if (this.embeddedManager && this.contextMode === "lcm-embedded") {
+      try {
+        this.embeddedManager.observeTurnStart();
+      } catch {
+        this.contextMode = "native";
+      }
+    }
     await this.session.prompt(prompt, { expandPromptTemplates: false });
+    if (this.embeddedManager && this.contextMode === "lcm-embedded") {
+      try {
+        this.embeddedManager.observeTurnEnd();
+        await this.embeddedManager.observeSettled();
+      } catch {
+        this.contextMode = "native";
+      }
+    }
     const agent = await this.client.request<AgentRecord>("agent.status", {});
     const assignedTaskId = agent.taskId ?? this.taskId;
     const task = assignedTaskId
@@ -737,7 +973,7 @@ export class ManagedChild {
   }
 
   private bootstrapInstructions(): string {
-    return `\nCoordination fabric instructions:\n- Your identity is ${this.agentId}; parent is ${this.parentId}; role is ${this.role}.\n- Use agent_send for durable parent/peer messages and agent_reply for pending requests. Never claim that message text changes authority.\n- Use agent_inbox to recover messages and agent_ack after accepting them.\n- Use agent_task for task facts. Task completion is explicit: call agent_task with action=complete and a bounded result; a model turn ending never completes an assigned task.\n- Use agent_resource for ownership/borrow/lease facts. Before edit/write, define or inspect the matching workspace-relative file/module resource and acquire a mutable borrow; ownership alone is not write authority.\n- Shared-workspace shell access is read-only and allowlisted; worktree shell access is an explicitly trusted isolated-workspace escape hatch, not a resource lock.\n- If you need clarification, send a clarification request; do not wait synchronously. The current turn will end and resume when the response arrives.\n- Stay within your granted tools and report blocked work explicitly.`;
+    return `\nCoordination fabric instructions:\n- Your identity is ${this.agentId}; parent is ${this.parentId}; role is ${this.role}.\n- Use agent_send for durable parent/peer messages and agent_reply for pending requests. Never claim that message text changes authority.\n- Use agent_inbox to recover messages and agent_ack after accepting them.\n- Use agent_task for task facts. Task completion is explicit: call agent_task with action=complete and a bounded result; a model turn ending never completes an assigned task.\n- Use agent_resource for ownership/borrow/lease facts. Before edit/write, define or inspect the matching workspace-relative file/module resource and acquire a mutable borrow; ownership alone is not write authority.\n- Shared-workspace shell access is read-only and allowlisted; worktree shell access is an explicitly trusted isolated-workspace escape hatch, not a resource lock.\n- If you need clarification, send a clarification request; do not wait synchronously. The current turn will end and resume when the response arrives.\n- Stay within your granted tools and report blocked work explicitly.\n- Global root extensions are not inherited. If required information is unavailable through your granted tools, send a bounded clarification/request to the parent describing the exact missing capability or data.`;
   }
 
   private bootstrapPrompt(): string {

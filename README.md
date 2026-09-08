@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml/badge.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue.svg)](https://saehwanpark.github.io/pi-safe-agent-team/)
-[![Version](https://img.shields.io/badge/version-0.2.1-blue.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/releases/tag/v0.2.1)
+[![Version](https://img.shields.io/badge/version-0.2.2-blue.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/releases/tag/v0.2.2)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node](https://img.shields.io/badge/node-%3E%3D22.19.0-brightgreen.svg)](https://nodejs.org/)
 
@@ -38,6 +38,9 @@ An LLM should never be asked to act as a mutex, a distributed lock manager, a me
 4. **Durable Idempotency & Crash Recovery**: `agent.spawn` and `task.create` enforce unique per-actor `operationId` records committed to an append-only transaction journal (`events.jsonl`). Ambiguous network/timeout retries replay original responses safely without duplicating agents or tasks.
 5. **Non-Blocking Clarifications**: When a child asks for parent or user input via `agent_send(type="clarification")`, it yields its turn (`terminate: true`) and transitions to `waiting`. The parent is never blocked on the JavaScript event loop.
 6. **Hardened Sandboxing**: Shared-workspace shell access is strictly read-only (`git`, `rg`, `grep`, `cat`, etc.) and rejects indirect file-list expansion flags (such as `file -f` or `wc --files0-from`).
+7. **Root Shell Mutator Preflight Guard**: Root shell execution is intercepted before process spawn to detect broad mutations (`git checkout`, `git restore`, `rm -rf`, `prettier --write`, `sed -i`, `black`, `ruff format`, etc.) or pipe/redirection writes. If active child mutable holds or write fences exist in the workspace, the mutator is safely vetoed before damaging child work.
+8. **Ecosystem Interop & Embedded Context**: Exposes conservative fabric quiescence via `Symbol.for("pi.extension-interop.v1")` as `safe-agent-team.fabric-state.v1` for extensions like `local-context-manager` (LCM). Consumes LCM embedded context policy (`local-context-manager.embedded-context.v1`) for child output reduction and compact turn state while strictly maintaining `noExtensions: true`.
+9. **Centralized Delivery & Turn Discipline**: Pure table-driven root delivery policy routes background progress and informational messages directly into model-visible context without triggering redundant root model wakeups. Clarifications, escalations, blocks, and task completions wake the root immediately.
 
 ---
 
@@ -120,7 +123,9 @@ When an agent needs to edit a file:
 ## Operational Boundaries
 
 - **Write Fences Across Broker Crashes**: Write fences (`resource.begin_write`) are in-memory coordinator records. They strictly protect writes during normal broker operation (including lease lapses and root writes). A recovery quarantine mechanism is scheduled post-v0.1 to bridge crash durability if the broker restarts mid-write.
-- **Shell Isolation Scope**: Shared-workspace shell is mechanically verified and read-only. Worktree shell (`workspace="worktree"`) is an explicitly trusted developer escape hatch isolated by Git worktrees.
+- **Borrowing Guarantee & Root Shell Escape Hatch**: Guarded Pi writes participate in borrowing and write fencing. Root shell remains a trusted escape hatch with best-effort preflight blocking of recognized broad mutators when live child holds exist. Shell commands are not mechanically sandbox-guaranteed.
+- **Child Capability Boundary**: Managed children run with `noExtensions: true` and receive only guarded tools. External web access, browser, MCP tools, and computer-use actions are root capabilities not inherited by children; children request external information through parent messages.
+- **Context Integration**: When an embedded context provider (`local-context-manager.embedded-context.v1`) is discovered via interop, children safely utilize adaptive output reduction and compaction without loading external extensions. If absent, children fall back cleanly to native Pi context behavior.
 - **Local-First IPC**: v0.1 is designed for local multi-agent coordination via Unix domain sockets and Windows named pipes. Distributed network clustering is planned for future milestones.
 
 ---

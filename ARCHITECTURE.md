@@ -78,7 +78,25 @@ Recovery replays only committed transactions and ignores an incomplete final tra
 
 A handle owns at most one active `session.prompt()` call. Incoming messages are queued in the broker and then delivered through Pi's `steer`, `followUp`, or a fresh prompt. Acknowledgement follows host queue acceptance, and an in-flight/accepted ID set makes notification plus inbox replay idempotent within the host process. A clarification request is not awaited by the caller's JavaScript stack: the ask tool records a request and returns `terminate: true`; the child becomes `waiting`; a reply later starts a new prompt. This is the deadlock-free pause/resume path.
 
-Managed children do not load the parent extension set a second time. They retain Pi's built-in tools, project context files, and skills, while the host supplies only the scoped coordination and guarded built-in operations. Arbitrary child extension inheritance is deferred because it can duplicate registrations and reintroduce unsafe orchestration paths.
+Managed children do not load the parent extension set a second time (`noExtensions: true`). They retain Pi's built-in tools, project context files, and skills, while the host supplies only the scoped coordination and guarded built-in operations.
+
+### Canonical agent directory resolution
+
+The runtime uses `@earendil-works/pi-coding-agent`'s `getAgentDir()` so `PI_CODING_AGENT_DIR` is honored uniformly across the root session and all child `AgentSession` instances. Precedence is: `options.agentDir` -> canonical Pi `getAgentDir()` (respecting `PI_CODING_AGENT_DIR`) -> legacy `PI_AGENT_DIR` fallback.
+
+### Child capability boundaries and root asymmetry
+
+Root capabilities such as web access, browser automation, MCP tools, and computer use are deliberately omitted from child toolsets. Managed children receive only safe, guarded coordination and workspace tools. When a child requires external information or actions outside its local workspace, it sends a clarification or request message to its parent rather than failing silently.
+
+### Extension interop and embedded context
+
+A process-local interop registry via `Symbol.for("pi.extension-interop.v1")` allows safe cooperation between extensions without hard dependencies:
+- **`safe-agent-team.fabric-state.v1`**: The fabric runtime exports a conservative quiescence snapshot (`quiescent: boolean`, child tasks, active holds, write fences, pending requests). Companion context managers (like `local-context-manager`) consume this to defer destructive compaction or semantic resets until the multi-agent fabric is completely idle.
+- **`local-context-manager.embedded-context.v1`**: When present, `ManagedChild` obtains an embedded context controller. It applies adaptive output reduction and turn compaction to child tool outputs while retaining `noExtensions: true`. Any provider failure degrades cleanly to `native` context management without failing the child's task.
+
+### Root message delivery policy
+
+Root message delivery is centralized in `src/pi/delivery.ts` (`classifyRootDelivery`). Background notifications (`progress`, `inform`) append silently to the session history for the next natural model turn without waking the model (`triggerTurn: false`). High-priority notifications (`clarification`, `escalation`, `blocked`, `agent_failed`, `task_result`, `steer`, `urgent`) steer and trigger a root model turn immediately.
 
 ### Model routing
 
@@ -102,7 +120,9 @@ Each active hold has a lease. Hosts heartbeat while a session is active; the bro
 
 Managed `edit`/`write` tools use Pi's operation override to execute a guarded write flow: `resource.begin_write` authorizes the write and places an active write fence on the matched resource, the filesystem mutation completes, and `resource.end_write` releases the fence. The target must be inside the managed workspace and match a declared file/module path. The write fence ensures that even if an agent's lease lapses mid-write, competing borrowers are excluded from clobbering the file. Shared-workspace shell uses a conservative read-only allowlist with argument path containment and indirect file-list exclusions (`file -f`, `--files0-from`); a worktree shell is explicitly trusted and isolated by the Git worktree convention, so it is documented as a semantic escape hatch rather than a mechanically resource-guarded mutation path.
 
-The root also participates in borrowing. A Pi `tool_call` veto intercepts the root session's `edit`/`write` calls before mutation and invokes `resource.begin_write` with `hostGuard: true`: undeclared paths remain writable (the root need not declare everything first), but any live foreign hold or active foreign write fence on an overlapping declared resource blocks the root write. Coordinated writes fail closed if the broker is unavailable, protecting in-flight child writes during outages. Only the root's unintercepted shell remains a trusted mutation path, and that is documented as such rather than claimed as guarded.
+The root also participates in borrowing. A Pi `tool_call` veto intercepts the root session's `edit`/`write` calls before mutation and invokes `resource.begin_write` with `hostGuard: true`: undeclared paths remain writable (the root need not declare everything first), but any live foreign hold or active foreign write fence on an overlapping declared resource blocks the root write. Coordinated writes fail closed if the broker is unavailable, protecting in-flight child writes during outages.
+
+Guarded Pi writes participate in borrowing and fencing. Root shell remains a trusted escape hatch, with best-effort preflight blocking of recognized broad mutators (`git checkout`, `git restore`, `rm -rf`, `prettier --write`, `sed -i`, `black`, `ruff format`, etc.) or pipe/redirection writes when live child mutable holds or write fences exist. Root shell commands are not claimed to be a fully sandboxed or formally complete barrier.
 
 > **Durability boundary note**: Write fencing protects coordinated writes during normal broker operation, including lease expiry and root interception. However, write fences are in-memory coordinator records and are not crash-durable across an independent broker restart. A post-v0.1 recovery quarantine will temporarily fence resources that had active mutable leases at the time of broker failure to bridge crash survivability.
 
