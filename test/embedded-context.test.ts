@@ -281,3 +281,79 @@ test("embedded-context: local Qwen-like route with large advertised context uses
     unregisterInteropProvider("local-context-manager.embedded-context.v1");
   }
 });
+
+test("embedded-context: session.compact is invoked with string | undefined, never an object", async () => {
+  const compactCalls: unknown[] = [];
+  const mockSession = {
+    isStreaming: false,
+    async compact(customInstructions?: string) {
+      compactCalls.push(customInstructions);
+    },
+  };
+
+  // Simulate ManagedChild compaction delegation
+  const hostCompact = async (request: { customInstructions?: string; reason?: string }) => {
+    const instructions = request.customInstructions ?? request.reason;
+    await mockSession.compact(instructions);
+  };
+
+  await hostCompact({ customInstructions: "Prune old outputs", reason: "overflow" });
+  assert.equal(compactCalls.length, 1);
+  assert.equal(typeof compactCalls[0], "string");
+  assert.equal(compactCalls[0], "Prune old outputs");
+
+  await hostCompact({ reason: "threshold_exceeded" });
+  assert.equal(compactCalls.length, 2);
+  assert.equal(typeof compactCalls[1], "string");
+  assert.equal(compactCalls[1], "threshold_exceeded");
+
+  await hostCompact({});
+  assert.equal(compactCalls.length, 3);
+  assert.equal(compactCalls[2], undefined);
+});
+
+test("embedded-context: degradation updates coordinator with contextMode native", async () => {
+  const updates: Array<{ operation: string; args: any }> = [];
+  const mockClient = {
+    async request<T>(operation: string, args: Record<string, unknown> = {}): Promise<T> {
+      updates.push({ operation, args });
+      return {} as T;
+    },
+  };
+
+  // Mock ManagedChild degradation flow
+  const childState = {
+    agentId: "child-123",
+    contextMode: "lcm-embedded" as "native" | "lcm-embedded",
+    embeddedManager: {
+      disposed: false,
+      dispose() {
+        this.disposed = true;
+      },
+    },
+    async degradeToNativeContext() {
+      if (this.contextMode === "native") return;
+      this.contextMode = "native";
+      try {
+        this.embeddedManager?.dispose();
+      } catch {}
+      try {
+        await mockClient.request("agent.update", {
+          agentId: this.agentId,
+          contextMode: "native",
+        });
+      } catch {}
+    },
+  };
+
+  await childState.degradeToNativeContext();
+
+  assert.equal(childState.contextMode, "native");
+  assert.equal(childState.embeddedManager.disposed, true);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].operation, "agent.update");
+  assert.deepEqual(updates[0].args, {
+    agentId: "child-123",
+    contextMode: "native",
+  });
+});

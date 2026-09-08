@@ -1,13 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { FabricRuntime } from "../src/pi/runtime.ts";
 
-test("PI_CODING_AGENT_DIR contains all child-derived state and ~/.pi/agent remains untouched", async () => {
-  const testDir = await fs.mkdtemp(join(process.cwd(), "test-agent-dir-"));
+test("PI_CODING_AGENT_DIR contains all state and ~/.pi/agent remains untouched", async () => {
+  const tmpBase = process.platform === "darwin" ? "/tmp" : tmpdir();
+  const testDir = await fs.mkdtemp(join(tmpBase, "pi-ag-"));
+  const workspaceDir = join(testDir, "workspace");
+  await fs.mkdir(workspaceDir, { recursive: true });
+
   const realAgentDir = join(homedir(), ".pi", "agent");
+  let realDirBefore: string[] = [];
+  try {
+    realDirBefore = await fs.readdir(realAgentDir);
+  } catch {
+    realDirBefore = [];
+  }
+
   const previousEnv = process.env.PI_CODING_AGENT_DIR;
   const previousLegacyEnv = process.env.PI_AGENT_DIR;
 
@@ -16,23 +27,30 @@ test("PI_CODING_AGENT_DIR contains all child-derived state and ~/.pi/agent remai
     delete process.env.PI_AGENT_DIR;
 
     const runtime = new FabricRuntime({
-      cwd: join(testDir, "workspace"),
-      startBroker: false,
+      cwd: workspaceDir,
+      startBroker: true,
     });
 
     assert.equal(runtime.agentDir, testDir);
     assert.ok(runtime.stateDirectory.startsWith(testDir));
 
-    // Confirm real ~/.pi/agent does not have new safe-agents files
-    let realDirHasSafeAgents = false;
+    // Initialize broker state under testDir
+    await (runtime as any).ensureBroker();
+
+    // Verify broker files exist under testDir
+    const filesUnderStateDir = await fs.readdir(runtime.stateDirectory);
+    assert.ok(filesUnderStateDir.includes("broker.lock") || filesUnderStateDir.includes("events.jsonl"));
+
+    await runtime.stop();
+
+    // Verify ~/.pi/agent was not mutated
+    let realDirAfter: string[] = [];
     try {
-      await fs.stat(join(realAgentDir, "safe-agents"));
-      realDirHasSafeAgents = true;
+      realDirAfter = await fs.readdir(realAgentDir);
     } catch {
-      realDirHasSafeAgents = false;
+      realDirAfter = [];
     }
-    // If ~/.pi/agent/safe-agents didn't exist before, it must not exist now
-    // And runtime.stateDirectory must be within testDir
+    assert.deepEqual(realDirAfter, realDirBefore);
     assert.ok(!runtime.stateDirectory.startsWith(realAgentDir));
   } finally {
     if (previousEnv !== undefined) process.env.PI_CODING_AGENT_DIR = previousEnv;
@@ -45,35 +63,24 @@ test("PI_CODING_AGENT_DIR contains all child-derived state and ~/.pi/agent remai
   }
 });
 
-test("precedence: options.agentDir > PI_CODING_AGENT_DIR > PI_AGENT_DIR", async () => {
+test("precedence: options.agentDir > PI_CODING_AGENT_DIR (getAgentDir)", async () => {
   const explicitDir = "/explicit/agent/dir";
   const codingEnvDir = "/coding/env/dir";
-  const legacyEnvDir = "/legacy/env/dir";
 
   const previousEnv = process.env.PI_CODING_AGENT_DIR;
-  const previousLegacy = process.env.PI_AGENT_DIR;
 
   try {
     process.env.PI_CODING_AGENT_DIR = codingEnvDir;
-    process.env.PI_AGENT_DIR = legacyEnvDir;
 
     // 1. options.agentDir wins when provided
     const runtime1 = new FabricRuntime({ agentDir: explicitDir, startBroker: false });
     assert.equal(runtime1.agentDir, explicitDir);
 
-    // 2. PI_CODING_AGENT_DIR wins over PI_AGENT_DIR when options.agentDir is omitted
+    // 2. PI_CODING_AGENT_DIR via getAgentDir() is used when options.agentDir is omitted
     const runtime2 = new FabricRuntime({ startBroker: false });
     assert.equal(runtime2.agentDir, codingEnvDir);
-
-    // 3. PI_AGENT_DIR is used if PI_CODING_AGENT_DIR is not set
-    delete process.env.PI_CODING_AGENT_DIR;
-    const runtime3 = new FabricRuntime({ startBroker: false });
-    assert.equal(runtime3.agentDir, legacyEnvDir);
   } finally {
     if (previousEnv !== undefined) process.env.PI_CODING_AGENT_DIR = previousEnv;
     else delete process.env.PI_CODING_AGENT_DIR;
-
-    if (previousLegacy !== undefined) process.env.PI_AGENT_DIR = previousLegacy;
-    else delete process.env.PI_AGENT_DIR;
   }
 });

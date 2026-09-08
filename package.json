@@ -44,6 +44,7 @@
     "build": "tsc -p tsconfig.build.json",
     "prepack": "npm run build",
     "check": "npm run typecheck && npm test",
+    "smoke:pi": "bash scripts/smoke-isolated-pi.sh",
     "example:core": "node --experimental-strip-types examples/core-demo.ts",
     "example:broker": "node --experimental-strip-types examples/broker-demo.ts"
   },

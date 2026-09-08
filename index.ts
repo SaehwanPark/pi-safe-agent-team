@@ -6,7 +6,7 @@ import { FabricRuntime } from "./src/pi/runtime.ts";
 import { LifecycleQueue } from "./src/pi/lifecycle.ts";
 import { createCoordinationTools } from "./src/pi/tools.ts";
 import { classifyRootDelivery } from "./src/pi/delivery.ts";
-import { registerInteropProvider, type FabricSnapshotRequest, type FabricStateSnapshotV1 } from "./src/pi/interop.ts";
+import { registerInteropProvider, unregisterInteropProvider, type FabricSnapshotRequest, type FabricStateProviderV1, type FabricStateSnapshotV1 } from "./src/pi/interop.ts";
 
 export { Coordinator } from "./src/core/coordinator.ts";
 export { FabricError } from "./src/core/errors.ts";
@@ -31,9 +31,10 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       runtime.requestIdempotent<T>(operation, args, operationId, timeoutMs),
   };
 
-  registerInteropProvider("safe-agent-team.fabric-state.v1", {
+  const interopProvider: FabricStateProviderV1 = {
     getSnapshot: (request: FabricSnapshotRequest) => runtime.getFabricStateSnapshot(request),
-  });
+  };
+  registerInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);
 
   for (const tool of createCoordinationTools({
     client: lazyClient,
@@ -101,7 +102,10 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     rootDeliveryTail = rootDeliveryTail.then(async () => {
       try {
         const content = `[${message.type} from ${message.from}]\n${message.body}`;
-        const decision = classifyRootDelivery(message);
+        const hasPendingRootRequest = message.type === "resource_granted"
+          ? await runtime.hasPendingRootRequest(message)
+          : false;
+        const decision = classifyRootDelivery(message, { hasPendingRootRequest });
         await api.sendMessage({ customType: "safe-agents.message", content, display: decision.display, details: message }, {
           triggerTurn: decision.triggerTurn,
           deliverAs: decision.deliverAs,
@@ -204,6 +208,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    unregisterInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);
     const pendingLifecycle = lifecycleQueue.shutdown();
     await pendingLifecycle.catch(() => undefined);
     await runtime.stop().catch((error) => notifyLifecycleFailure(ctx, error, "warning"));

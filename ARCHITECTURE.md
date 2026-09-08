@@ -82,7 +82,7 @@ Managed children do not load the parent extension set a second time (`noExtensio
 
 ### Canonical agent directory resolution
 
-The runtime uses `@earendil-works/pi-coding-agent`'s `getAgentDir()` so `PI_CODING_AGENT_DIR` is honored uniformly across the root session and all child `AgentSession` instances. Precedence is: `options.agentDir` -> canonical Pi `getAgentDir()` (respecting `PI_CODING_AGENT_DIR`) -> legacy `PI_AGENT_DIR` fallback.
+The runtime uses `@earendil-works/pi-coding-agent`'s canonical `getAgentDir()` so `PI_CODING_AGENT_DIR` is honored uniformly across the root session and all child `AgentSession` instances. Precedence is simply: `options.agentDir ?? getAgentDir()`, where `getAgentDir()` natively checks `PI_CODING_AGENT_DIR` and falls back to `~/.pi/agent`.
 
 ### Child capability boundaries and root asymmetry
 
@@ -91,8 +91,8 @@ Root capabilities such as web access, browser automation, MCP tools, and compute
 ### Extension interop and embedded context
 
 A process-local interop registry via `Symbol.for("pi.extension-interop.v1")` allows safe cooperation between extensions without hard dependencies:
-- **`safe-agent-team.fabric-state.v1`**: The fabric runtime exports a conservative quiescence snapshot (`quiescent: boolean`, child tasks, active holds, write fences, pending requests). Companion context managers (like `local-context-manager`) consume this to defer destructive compaction or semantic resets until the multi-agent fabric is completely idle.
-- **`local-context-manager.embedded-context.v1`**: When present, `ManagedChild` obtains an embedded context controller. It applies adaptive output reduction and turn compaction to child tool outputs while retaining `noExtensions: true`. Any provider failure degrades cleanly to `native` context management without failing the child's task.
+- **`safe-agent-team.fabric-state.v1`**: The fabric runtime exports a deterministic and conservative state snapshot (`quiescent: boolean`, `state: "known" | "uncertain"`, `sessionReplacementSafe: boolean`, active tasks, mutable holds, write fences, pending requests). Root session replacement (`session_shutdown`) cancels managed child agents; companion context managers (like `local-context-manager`) consume this to defer destructive compaction, semantic resets, or root session rewinds until `sessionReplacementSafe === true`.
+- **`local-context-manager.embedded-context.v1`**: When present, `ManagedChild` obtains an embedded context controller. It applies adaptive output reduction and turn compaction to child tool outputs while retaining `noExtensions: true`. Compaction instructions are delegated as `string | undefined` to upstream Pi's `AgentSession.compact(customInstructions?: string)`. Any provider failure degrades cleanly to `native` context management, synchronizing to the coordinator with `agent.update({ contextMode: "native" })`.
 
 ### Root message delivery policy
 
@@ -122,7 +122,7 @@ Managed `edit`/`write` tools use Pi's operation override to execute a guarded wr
 
 The root also participates in borrowing. A Pi `tool_call` veto intercepts the root session's `edit`/`write` calls before mutation and invokes `resource.begin_write` with `hostGuard: true`: undeclared paths remain writable (the root need not declare everything first), but any live foreign hold or active foreign write fence on an overlapping declared resource blocks the root write. Coordinated writes fail closed if the broker is unavailable, protecting in-flight child writes during outages.
 
-Guarded Pi writes participate in borrowing and fencing. Root shell remains a trusted escape hatch, with best-effort preflight blocking of recognized broad mutators (`git checkout`, `git restore`, `rm -rf`, `prettier --write`, `sed -i`, `black`, `ruff format`, etc.) or pipe/redirection writes when live child mutable holds or write fences exist. Root shell commands are not claimed to be a fully sandboxed or formally complete barrier.
+Guarded Pi writes participate in borrowing and fencing. Root shell remains a trusted escape hatch, with best-effort preflight blocking of recognized broad mutators (`git checkout`, `git restore`, `rm -rf`, `cargo fmt`, `prettier --write`, `sed -i`, `black`, `ruff format`, etc.) or pipe/redirection writes (including `tee` and no-space `>file` redirections) when live child mutable holds or write fences exist. Observational commands (`git status`, `git diff`, `rg`, `cat`) are classified as read-only, while arbitrary code/test execution (`cargo test`, `npm test`, `pytest`, `node`, `dotnet run`) is classified as unknown, preserving the escape hatch without falsely labeling code execution as read-only. Path comparisons use canonical path identities and filesystem case folding. Root shell commands are not claimed to be a fully sandboxed or formally complete barrier.
 
 > **Durability boundary note**: Write fencing protects coordinated writes during normal broker operation, including lease expiry and root interception. However, write fences are in-memory coordinator records and are not crash-durable across an independent broker restart. A post-v0.1 recovery quarantine will temporarily fence resources that had active mutable leases at the time of broker failure to bridge crash survivability.
 

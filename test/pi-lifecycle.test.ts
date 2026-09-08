@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import safeAgentsTeam from "../index.ts";
 import { FabricRuntime } from "../src/pi/runtime.ts";
+import { unregisterInteropProvider } from "../src/pi/interop.ts";
 
 type Handler = (event: unknown, context: unknown) => unknown;
 
@@ -59,6 +60,7 @@ async function withRuntimeSpies(
   try {
     await run();
   } finally {
+    unregisterInteropProvider("safe-agent-team.fabric-state.v1");
     prototype.ensureRoot = originals.ensureRoot;
     prototype.request = originals.request;
     prototype.stop = originals.stop;

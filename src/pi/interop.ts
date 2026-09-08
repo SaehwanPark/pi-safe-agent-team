@@ -16,12 +16,25 @@ export function getInteropRegistry(): PiExtensionInteropRegistryV1 {
 }
 
 export function registerInteropProvider(name: string, provider: unknown): void {
+  if (!name || typeof name !== "string") {
+    throw new Error("Invalid provider name for interop registration");
+  }
   const registry = getInteropRegistry();
+  const existing = registry.providers.get(name);
+  if (existing !== undefined) {
+    if (existing === provider) return;
+    throw new Error(`Interop provider '${name}' is already registered with a different instance`);
+  }
   registry.providers.set(name, provider);
 }
 
-export function unregisterInteropProvider(name: string): void {
+export function unregisterInteropProvider(name: string, provider?: unknown): void {
+  if (!name) return;
   const registry = getInteropRegistry();
+  if (provider !== undefined) {
+    const existing = registry.providers.get(name);
+    if (existing !== provider) return;
+  }
   registry.providers.delete(name);
 }
 
@@ -36,29 +49,39 @@ export interface FabricSnapshotRequest {
   sessionId?: string;
 }
 
+export interface FabricTaskSnapshot {
+  id: string;
+  status: string;
+  owner?: string;
+  description?: string;
+}
+
+export interface FabricResourceSnapshot {
+  id: string;
+  path?: string;
+  holder?: string;
+}
+
 export interface FabricStateSnapshotV1 {
+  version: 1;
   active: boolean;
   quiescent: boolean;
+  state: "known" | "uncertain";
+  sessionReplacementSafe: boolean;
   capturedAt: number;
+  rootSessionId?: string;
+  cwd?: string;
 
   runningChildren: number;
   unresolvedChildTasks: number;
   mutableHolds: number;
+  activeWriteFences: number;
   pendingRootRequests: number;
   pendingRootDeliveries: number;
 
-  activeTasks: Array<{
-    id: string;
-    status: string;
-    owner?: string;
-    description?: string;
-  }>;
-
-  mutableResources: Array<{
-    id: string;
-    path?: string;
-    holder?: string;
-  }>;
+  activeTasks: FabricTaskSnapshot[];
+  mutableResources: FabricResourceSnapshot[];
+  quiescenceReasons: string[];
 }
 
 export interface FabricStateProviderV1 {
@@ -73,8 +96,8 @@ export interface EmbeddedContextUsage {
 }
 
 export interface EmbeddedCompactionRequest {
-  targetTokens?: number;
   reason?: string;
+  customInstructions?: string;
 }
 
 export interface EmbeddedContextSnapshot {
