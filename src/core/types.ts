@@ -277,6 +277,13 @@ export interface AgentSummary {
   capabilities?: AgentCapabilities;
 }
 
+export interface ActiveFenceSummary {
+  id: string;
+  resourceId: ResourceId;
+  path?: string;
+  actorId: AgentId;
+}
+
 export interface FabricStatus {
   rootId: RootId;
   agents: AgentSummary[];
@@ -287,6 +294,7 @@ export interface FabricStatus {
   runningChildren: number;
   config: FabricConfig;
   activeFences?: number;
+  fences?: ActiveFenceSummary[];
 }
 
 export type CoordinatorEvent =

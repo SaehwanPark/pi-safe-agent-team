@@ -1,7 +1,7 @@
 import net from "node:net";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync, promises as fs } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { platform } from "node:os";
 import { FabricError, asFabricError } from "../core/errors.ts";
 import { Coordinator } from "../core/coordinator.ts";
@@ -126,13 +126,23 @@ export function resolveBrokerConfig(options: BrokerServerOptions): Partial<Fabri
   return config;
 }
 
+const caseSensitivityCache = new Map<string, boolean>();
+
+export function clearCaseSensitivityCache(): void {
+  caseSensitivityCache.clear();
+}
+
 /**
  * Write a mixed-case probe file and check whether a differently-cased name
  * resolves to it. Returns false when the probe cannot run (fail open to the
- * non-folding, purely lexical policy keys).
+ * non-folding, purely lexical policy keys). Probes once per directory and caches.
  */
 export function detectCaseInsensitivePaths(directory: string): boolean {
   if (process.platform === "win32") return true;
+  const key = resolve(directory);
+  const cached = caseSensitivityCache.get(key);
+  if (cached !== undefined) return cached;
+
   try {
     mkdirSync(directory, { recursive: true });
   } catch {
@@ -143,7 +153,9 @@ export function detectCaseInsensitivePaths(directory: string): boolean {
   const probed = `${base}.MIXED`;
   try {
     writeFileSync(written, "");
-    return existsSync(probed);
+    const result = existsSync(probed);
+    caseSensitivityCache.set(key, result);
+    return result;
   } catch {
     return false;
   } finally {

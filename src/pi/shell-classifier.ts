@@ -113,9 +113,37 @@ function classifySingleCommand(tokens: string[]): RootShellRisk {
   }
   if (idx >= tokens.length) return { kind: "read-only" };
 
-  const rawBin = tokens[idx];
+  // Unwrap execution wrappers like npx, bunx, pnpm exec, yarn exec, uv run, poetry run, python -m
+  let remainingTokens = tokens.slice(idx);
+  while (remainingTokens.length > 0) {
+    const rawFirst = remainingTokens[0];
+    const first = rawFirst.includes("/") ? rawFirst.split("/").pop()! : rawFirst;
+    if ((first === "npx" || first === "bunx") && remainingTokens.length > 1) {
+      remainingTokens = remainingTokens.slice(1);
+      while (remainingTokens.length > 0 && remainingTokens[0].startsWith("-")) {
+        remainingTokens = remainingTokens.slice(1);
+      }
+      continue;
+    }
+    if ((first === "pnpm" || first === "yarn") && remainingTokens[1] === "exec" && remainingTokens.length > 2) {
+      remainingTokens = remainingTokens.slice(2);
+      continue;
+    }
+    if ((first === "uv" || first === "poetry" || first === "pipenv") && remainingTokens[1] === "run" && remainingTokens.length > 2) {
+      remainingTokens = remainingTokens.slice(2);
+      continue;
+    }
+    if ((first === "python" || first === "python3" || first === "py") && remainingTokens[1] === "-m" && remainingTokens.length > 2) {
+      remainingTokens = remainingTokens.slice(2);
+      continue;
+    }
+    break;
+  }
+  if (remainingTokens.length === 0) return { kind: "read-only" };
+
+  const rawBin = remainingTokens[0];
   const bin = rawBin.includes("/") ? rawBin.split("/").pop()! : rawBin;
-  const args = tokens.slice(idx + 1);
+  const args = remainingTokens.slice(1);
 
   // Check known broad mutators
   if (bin === "cargo") {

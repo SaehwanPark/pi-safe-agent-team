@@ -42,8 +42,8 @@ export function classifyRootDelivery(
 
     case "resource_granted":
       return {
-        triggerTurn: Boolean(state?.hasPendingRootRequest),
-        deliverAs: "followUp",
+        triggerTurn: true,
+        deliverAs: "steer",
         modelVisible: true,
         display: true,
       };

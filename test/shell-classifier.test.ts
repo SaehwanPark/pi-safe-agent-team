@@ -105,3 +105,60 @@ test("shell-classifier: chained commands and pipelines", () => {
   assert.equal(cdMutator.kind, "known-mutator");
   assert.equal((cdMutator as any).scope, "broad");
 });
+
+test("shell-classifier: execution wrappers (npx, pnpm exec, uv run, python -m, etc.) unwrapping", () => {
+  // Scoped mutators under wrappers
+  const npxPrettier = classifyRootShellCommand("npx prettier --write src");
+  assert.equal(npxPrettier.kind, "known-mutator");
+  assert.equal((npxPrettier as any).scope, "path");
+  assert.deepEqual((npxPrettier as any).paths, ["src"]);
+
+  const pnpmPrettier = classifyRootShellCommand("pnpm exec prettier --write src");
+  assert.equal(pnpmPrettier.kind, "known-mutator");
+  assert.equal((pnpmPrettier as any).scope, "path");
+  assert.deepEqual((pnpmPrettier as any).paths, ["src"]);
+
+  const yarnPrettier = classifyRootShellCommand("yarn exec prettier --write src");
+  assert.equal(yarnPrettier.kind, "known-mutator");
+  assert.equal((yarnPrettier as any).scope, "path");
+  assert.deepEqual((yarnPrettier as any).paths, ["src"]);
+
+  const yarnEslint = classifyRootShellCommand("yarn exec eslint --fix src");
+  assert.equal(yarnEslint.kind, "known-mutator");
+  assert.equal((yarnEslint as any).scope, "broad");
+
+  const bunxPrettier = classifyRootShellCommand("bunx prettier --write src");
+  assert.equal(bunxPrettier.kind, "known-mutator");
+  assert.equal((bunxPrettier as any).scope, "path");
+  assert.deepEqual((bunxPrettier as any).paths, ["src"]);
+
+  // Broad mutators under wrappers
+  const uvRuff = classifyRootShellCommand("uv run ruff format .");
+  assert.equal(uvRuff.kind, "known-mutator");
+  assert.equal((uvRuff as any).scope, "broad");
+
+  const poetryBlack = classifyRootShellCommand("poetry run black .");
+  assert.equal(poetryBlack.kind, "known-mutator");
+  assert.equal((poetryBlack as any).scope, "broad");
+
+  const pipenvBlack = classifyRootShellCommand("pipenv run black .");
+  assert.equal(pipenvBlack.kind, "known-mutator");
+  assert.equal((pipenvBlack as any).scope, "broad");
+
+  const pythonBlack = classifyRootShellCommand("python -m black .");
+  assert.equal(pythonBlack.kind, "known-mutator");
+  assert.equal((pythonBlack as any).scope, "broad");
+
+  const python3Black = classifyRootShellCommand("python3 -m black .");
+  assert.equal(python3Black.kind, "known-mutator");
+  assert.equal((python3Black as any).scope, "broad");
+
+  // Read-only under wrappers
+  const npxGit = classifyRootShellCommand("npx git status");
+  assert.equal(npxGit.kind, "read-only");
+
+  // Arbitrary execution under wrapper remains unknown
+  const uvPytest = classifyRootShellCommand("uv run pytest");
+  assert.equal(uvPytest.kind, "unknown");
+});
+
