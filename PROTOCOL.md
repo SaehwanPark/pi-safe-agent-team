@@ -130,7 +130,7 @@ When messages are delivered to the root session, `classifyRootDelivery` routes t
 | `request` | `steer` | **Yes** | Correlated request |
 | `response` | `steer` | **Yes** | Correlated response |
 | `resource_request` | `steer` | **Yes** | Child requests resource access |
-| `resource_granted` | `appendOnly` / `steer` | Conditional | Triggers turn only if resolving a pending root request |
+| `resource_granted` | `steer` | **Yes** | Immediate wakeup when a resource hold is granted to root |
 | `result` | `steer` | **Yes** | Child emits a major result |
 | `task_result` | `steer` | **Yes** | Child completes an assigned task with structured output |
 | `handoff` | `steer` | **Yes** | Work handoff notification |
@@ -321,18 +321,25 @@ When registered by a context manager, safe-agent-team's `ManagedChild` requests 
 - Observes turn boundaries (`observeTurnStart`, `observeTurnEnd`, `observeSettled`).
 - Context usage and compactions delegate to upstream Pi `AgentSession.compact(customInstructions?: string)`, passing `customInstructions` or `reason` strictly as `string | undefined` (never an object).
 - Runs strictly inside the managed child session without ambient extension loading (`noExtensions: true`).
-- Fails soft: any error or throwing provider drops back to `native` context management, notifying the coordinator broker with `agent.update({ contextMode: "native" })` without crashing the child agent.
+- Fails soft: any error or throwing provider drops back to `native` context management, disposing the embedded controller (`embeddedManager.dispose()`), clearing its reference, and notifying the coordinator broker with `agent.update({ contextMode: "native" })` without crashing the child agent. Reconnecting children preserve this degraded (or active) `contextMode` during `agent.register`.
 
 ## Root Shell Mutator Preflight Guard
 
 The root `bash` tool call is preflighted in `index.ts` using `classifyRootShellCommand`:
 
+- **Execution Wrapper Unwrapping**:
+  - Automatically unwraps execution prefixes such as `npx`, `pnpm exec`, `yarn exec`, `bunx`, `uv run`, `poetry run`, `pipenv run`, `python -m`, and `python3 -m` before classification, accurately evaluating the underlying command and its target paths (e.g. `npx prettier --write src` is classified as a path-scoped mutator on `src`).
 - **Classification**:
   - `read-only`: Purely observational commands without arbitrary code execution (`git status`, `git diff`, `git log`, `rg`, `grep`, `cat`, `head`, `ls`, etc.) — always allowed.
   - `unknown`: Arbitrary code/test execution (`cargo test`, `cargo check`, `npm test`, `pytest`, `node`, `dotnet run`) and unrecognized tools. These serve as the trusted developer escape hatch and are permitted when unblocked, but are not falsely classified as read-only.
   - `known-mutator` with `scope: "broad"`: Workspace-wide mutators (`git checkout .`, `git restore .`, `git reset --hard`, `git clean`, `cargo fmt`, `ruff format`, `black`, `dotnet format`, `mix format`, etc.) or chained commands that change directory (`cd`, `pushd`).
   - `known-mutator` with `scope: "path"`: Targeted in-place mutators (`prettier --write src/foo.ts`, `sed -i`, `rm file`, `mv file`, `tee file`), output redirections (`> file`, `>> file`), and no-space redirections (`echo x>file.ts`).
 - **Evaluation**:
-  - If no child holds mutable resources and no active write fences exist, execution proceeds unhindered.
-  - If an active child mutable hold or write fence exists, any broad mutator, pipe/redirection write, or write overlapping the held path (compared using canonical path identities and filesystem case folding) is blocked with a structured, user-actionable message.
+  - If no child holds mutable resources and no active child write fences exist, execution proceeds unhindered.
+  - If active child mutable holds or active write fences exist:
+    - Broad mutators are blocked with a clear reason mentioning the active hold or write fence.
+    - Path-scoped mutators colliding with a held or fenced path (compared using canonical path identities and cached filesystem case folding) are blocked with structured, user-actionable reasons.
+    - Path-scoped mutators on completely unrelated paths remain allowed when active fence paths are known.
+    - If active write fences exist but fence path details are omitted (e.g. older coordinator projections), path mutations fail closed to protect pending child writes while read-only commands continue unimpeded.
 - Root shell remains a trusted developer escape hatch and is not represented as an infallible security sandbox.
+

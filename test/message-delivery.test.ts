@@ -27,7 +27,7 @@ test("message-delivery: table-driven classification over all MESSAGE_TYPES", () 
     request: { triggerTurn: true, deliverAs: "followUp" },
     response: { triggerTurn: true, deliverAs: "followUp" },
     resource_request: { triggerTurn: true, deliverAs: "followUp" },
-    resource_granted: { triggerTurn: false, deliverAs: "followUp" },
+    resource_granted: { triggerTurn: true, deliverAs: "steer" },
     result: { triggerTurn: true, deliverAs: "followUp" },
     task_result: { triggerTurn: true, deliverAs: "followUp" },
     handoff: { triggerTurn: true, deliverAs: "followUp" },
@@ -68,16 +68,12 @@ test("message-delivery: urgent priority always becomes steer + triggerTurn regar
   }
 });
 
-test("message-delivery: resource_granted triggers turn only when resolving pending root request", () => {
+test("message-delivery: resource_granted acts as an internal urgent wakeup", () => {
   const message = makeMessage("resource_granted");
-
-  // Default: unsolicited resource_granted does not trigger turn
-  const normalDecision = classifyRootDelivery(message, { hasPendingRootRequest: false });
-  assert.equal(normalDecision.triggerTurn, false);
-  assert.equal(normalDecision.deliverAs, "followUp");
-
-  // When resolving a pending root request: triggers turn
-  const resolvingDecision = classifyRootDelivery(message, { hasPendingRootRequest: true });
-  assert.equal(resolvingDecision.triggerTurn, true);
-  assert.equal(resolvingDecision.deliverAs, "followUp");
+  const decision = classifyRootDelivery(message);
+  assert.equal(decision.triggerTurn, true);
+  assert.equal(decision.deliverAs, "steer");
+  assert.equal(decision.modelVisible, true);
+  assert.equal(decision.display, true);
 });
+

@@ -8,6 +8,7 @@ import {
   cloneRequest,
   cloneResource,
   cloneTask,
+  type ActiveFenceSummary,
   type AgentCapabilities,
   type AgentId,
   type AgentMessage,
@@ -1175,6 +1176,17 @@ export class Coordinator {
       runningChildren: this.runningAgentCount(),
       config: cloneConfig(this.config),
       activeFences: [...this.fences.values()].filter((candidate) => candidate.expiresAt > this.clock()).length,
+      fences: [...this.fences.values()]
+        .filter((candidate) => candidate.expiresAt > this.clock())
+        .map((fence) => {
+          const res = this.resources.get(fence.resourceId);
+          return {
+            id: fence.id,
+            resourceId: fence.resourceId,
+            path: res?.path,
+            actorId: fence.actorId,
+          };
+        }),
     };
   }
 

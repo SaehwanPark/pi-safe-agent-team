@@ -92,6 +92,7 @@ export class FabricRuntime {
   private rootReconnectPromise?: Promise<void>;
   private stopped = false;
   private rootDelivery?: (message: AgentMessage) => void;
+  private caseInsensitivePaths?: boolean;
 
   constructor(options: FabricRuntimeOptions = {}) {
     this.options = options;
@@ -101,9 +102,11 @@ export class FabricRuntime {
     this.stateDirectory = options.stateDirectory ?? join(this.agentDir, "safe-agents", createHash("sha256").update(this.cwd).digest("hex").slice(0, 24));
     this.endpoint = options.endpoint ?? defaultEndpoint(this.stateDirectory);
     this.config = options.config;
+    this.caseInsensitivePaths = options.config?.caseInsensitivePaths;
     this.workspaceStrategy = options.workspaceStrategy ?? new GitWorkspaceStrategy();
     this.roles = options.roles ?? {};
   }
+
 
   async attachRoot(api: ExtensionAPI, ctx: ExtensionContext, rootDelivery?: (message: AgentMessage) => void): Promise<RootBinding> {
     // A Pi process may start another session after session_shutdown. The
@@ -226,26 +229,12 @@ export class FabricRuntime {
     this.pendingRootFencesCount = count;
   }
 
-  async hasPendingRootRequest(message?: AgentMessage): Promise<boolean> {
-    if (!this.root) return false;
-    try {
-      const status = (await this.status()) as FabricStatus;
-      const rootId = status.rootId;
-      if (!rootId) return false;
-      const rootRequests = (status.pendingRequests ?? []).filter((r) => r.from === rootId && r.status === "pending");
-      if (!message) return rootRequests.length > 0;
-      if (message.replyTo || message.requestId) {
-        return rootRequests.some((r) => r.messageId === message.replyTo || r.id === message.requestId);
-      }
-      return rootRequests.length > 0;
-    } catch {
-      return false;
-    }
-  }
-
   /** Provide a deterministic fabric state snapshot for context managers. */
   async getFabricStateSnapshot(request: FabricSnapshotRequest): Promise<FabricStateSnapshotV1 | null> {
-    const caseInsensitive = detectCaseInsensitivePaths(this.cwd);
+    if (this.caseInsensitivePaths === undefined) {
+      this.caseInsensitivePaths = this.config?.caseInsensitivePaths ?? detectCaseInsensitivePaths(this.cwd);
+    }
+    const caseInsensitive = this.caseInsensitivePaths;
     const normalizeScopePath = (p: string): string => {
       const resolved = resolve(p);
       return caseInsensitive ? resolved.toLowerCase() : resolved;
@@ -283,6 +272,9 @@ export class FabricRuntime {
 
     try {
       const status = (await this.status()) as FabricStatus;
+      if (status.config?.caseInsensitivePaths !== undefined) {
+        this.caseInsensitivePaths = status.config.caseInsensitivePaths;
+      }
       const rootAgent = status.agents.find((a) => a.id === status.rootId);
       const rootBusy = !rootAgent || rootAgent.status === "starting" || rootAgent.status === "running";
 
@@ -872,6 +864,7 @@ export class ManagedChild {
             sessionId: this.session?.sessionId,
             workspace: this.workspace,
             token: this.token,
+            contextMode: this.contextMode,
           });
           this.record = registered.agent;
           this.taskId = registered.agent.taskId;
@@ -912,6 +905,10 @@ export class ManagedChild {
   private async degradeToNativeContext(): Promise<void> {
     if (this.contextMode === "native") return;
     this.contextMode = "native";
+    try {
+      this.embeddedManager?.dispose();
+    } catch {}
+    this.embeddedManager = undefined;
     try {
       await this.client.request("agent.update", { contextMode: "native" });
     } catch {}

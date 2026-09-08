@@ -102,10 +102,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     rootDeliveryTail = rootDeliveryTail.then(async () => {
       try {
         const content = `[${message.type} from ${message.from}]\n${message.body}`;
-        const hasPendingRootRequest = message.type === "resource_granted"
-          ? await runtime.hasPendingRootRequest(message)
-          : false;
-        const decision = classifyRootDelivery(message, { hasPendingRootRequest });
+        const decision = classifyRootDelivery(message);
         await api.sendMessage({ customType: "safe-agents.message", content, display: decision.display, details: message }, {
           triggerTurn: decision.triggerTurn,
           deliverAs: decision.deliverAs,

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import {
   registerInteropProvider,
   unregisterInteropProvider,
@@ -8,6 +9,8 @@ import {
   type EmbeddedContextManager,
   type EmbeddedToolResult,
 } from "../src/pi/interop.ts";
+import { ManagedChild } from "../src/pi/runtime.ts";
+
 
 test("embedded-context: provider absent degrades to undefined (native mode)", () => {
   unregisterInteropProvider("local-context-manager.embedded-context.v1");
@@ -312,48 +315,54 @@ test("embedded-context: session.compact is invoked with string | undefined, neve
   assert.equal(compactCalls[2], undefined);
 });
 
-test("embedded-context: degradation updates coordinator with contextMode native", async () => {
-  const updates: Array<{ operation: string; args: any }> = [];
-  const mockClient = {
-    async request<T>(operation: string, args: Record<string, unknown> = {}): Promise<T> {
-      updates.push({ operation, args });
-      return {} as T;
-    },
-  };
-
-  // Mock ManagedChild degradation flow
-  const childState = {
+test("embedded-context: ManagedChild degradation disposes embedded manager, clears it, and sets contextMode native", async () => {
+  const operations: Array<{ operation: string; args: any }> = [];
+  let disposed = false;
+  const child = new ManagedChild({ fabricId: "fabric-test" } as never, {
     agentId: "child-123",
-    contextMode: "lcm-embedded" as "native" | "lcm-embedded",
-    embeddedManager: {
-      disposed: false,
-      dispose() {
-        this.disposed = true;
-      },
-    },
-    async degradeToNativeContext() {
-      if (this.contextMode === "native") return;
-      this.contextMode = "native";
-      try {
-        this.embeddedManager?.dispose();
-      } catch {}
-      try {
-        await mockClient.request("agent.update", {
-          agentId: this.agentId,
-          contextMode: "native",
-        });
-      } catch {}
-    },
-  };
-
-  await childState.degradeToNativeContext();
-
-  assert.equal(childState.contextMode, "native");
-  assert.equal(childState.embeddedManager.disposed, true);
-  assert.equal(updates.length, 1);
-  assert.equal(updates[0].operation, "agent.update");
-  assert.deepEqual(updates[0].args, {
-    agentId: "child-123",
-    contextMode: "native",
+    token: "token-123",
+    parentId: "root",
+    role: "worker",
+    route: { provider: "anthropic", model: "claude-3-haiku", thinking: "low" },
+    cwd: resolve("."),
+    stateDirectory: resolve("."),
+    agentDir: resolve("."),
+    endpoint: "unused",
+    model: {} as never,
+    capabilities: { maySpawn: false, mayMessagePeers: false, mayEscalate: true, mayTransferOwnership: false, mayWriteRepo: false, mayUseShell: false, peerIds: [], resourceGrants: {} },
   });
+
+  (child as any).contextMode = "lcm-embedded";
+  (child as any).embeddedManager = {
+    dispose() {
+      disposed = true;
+    },
+  };
+  (child.client as any).request = async (operation: string, args: any) => {
+    operations.push({ operation, args });
+    if (operation === "message.inbox") return [];
+    return { agent: { id: "child-123" } };
+  };
+
+
+  await (child as any).degradeToNativeContext();
+
+  assert.equal((child as any).contextMode, "native");
+  assert.equal((child as any).embeddedManager, undefined);
+  assert.equal(disposed, true);
+  assert.equal(operations.length, 1);
+  assert.equal(operations[0].operation, "agent.update");
+  assert.deepEqual(operations[0].args, { contextMode: "native" });
+
+  // Verify reconnect preserves contextMode: "native"
+  (child as any).started = true;
+  (child as any).stopping = false;
+  (child.client as any).connect = async () => {};
+  operations.length = 0;
+  await (child as any).reconnect();
+
+  const registerOp = operations.find((o) => o.operation === "agent.register");
+  assert.ok(registerOp);
+  assert.equal(registerOp.args.contextMode, "native");
 });
+

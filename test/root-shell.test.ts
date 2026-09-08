@@ -135,3 +135,65 @@ test("root-shell: blocked with exact UX when child holds mutable resource", asyn
   assert.ok(relativeDotDot?.block);
   assert.ok(relativeDotDot?.reason?.includes("while child agent-4 holds mutable resource src/parser"));
 });
+
+test("root-shell: active write fences block colliding mutators even if mutable hold expired", async () => {
+  // Scenario: Child agent-4 had a mutable hold on src/parser, but the hold expired
+  // while an in-flight write fence remains active on that path.
+  const statusWithFence: FabricStatus = {
+    rootId: "root",
+    agents: [],
+    tasks: [],
+    resources: [],
+    pendingRequests: [],
+    recentMessages: [],
+    runningChildren: 1,
+    config: {} as any,
+    activeFences: 1,
+    fences: [
+      {
+        id: "fence-1",
+        resourceId: "res-parser",
+        path: "src/parser",
+        actorId: "agent-4",
+      },
+    ],
+  };
+
+  const client = makeMockClient(statusWithFence);
+  const options = { client, workspacePath: "/test/workspace" };
+
+  // 1. Read-only command is allowed
+  const readOnlyOutcome = await evaluateRootShellGuard(options, { command: "cargo test" });
+  assert.equal(readOnlyOutcome, undefined);
+
+  // 2. Broad mutator is blocked by active fence
+  const broadOutcome = await evaluateRootShellGuard(options, { command: "cargo fmt" });
+  assert.ok(broadOutcome?.block);
+  assert.ok(broadOutcome?.reason?.includes("active write fence"));
+
+  // 3. Path-scoped mutator colliding with fenced path is blocked
+  const collidingOutcome = await evaluateRootShellGuard(options, { command: "prettier --write src/parser/ast.ts" });
+  assert.ok(collidingOutcome?.block);
+  assert.ok(collidingOutcome?.reason?.includes("while child agent-4 has an active write fence on src/parser"));
+
+  // 4. Path-scoped mutator on unrelated path is allowed when fence path is known
+  const unrelatedOutcome = await evaluateRootShellGuard(options, { command: "prettier --write docs/readme.md" });
+  assert.equal(unrelatedOutcome, undefined);
+
+  // 5. When active fences exist but path details are omitted (fail closed for mutators)
+  const statusOmittedPaths: FabricStatus = {
+    ...statusWithFence,
+    fences: undefined,
+  };
+  const clientOmitted = makeMockClient(statusOmittedPaths);
+  const optionsOmitted = { client: clientOmitted, workspacePath: "/test/workspace" };
+
+  const blockedFailClosed = await evaluateRootShellGuard(optionsOmitted, { command: "prettier --write docs/readme.md" });
+  assert.ok(blockedFailClosed?.block);
+  assert.ok(blockedFailClosed?.reason?.includes("active write fence"));
+
+  // But read-only still succeeds
+  const readOnlyOmitted = await evaluateRootShellGuard(optionsOmitted, { command: "git diff" });
+  assert.equal(readOnlyOmitted, undefined);
+});
+

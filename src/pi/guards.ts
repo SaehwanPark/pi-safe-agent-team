@@ -392,21 +392,25 @@ export async function evaluateRootShellGuard(
     (r) => r.mutableHold && r.mutableHold.agentId !== status?.rootId,
   );
   const activeFences = status.activeFences ?? 0;
+  const childFences = (status.fences ?? []).filter(
+    (f) => f.actorId !== status?.rootId,
+  );
 
   if (childHolds.length === 0 && activeFences === 0) {
     return undefined;
   }
 
   if (risk.scope === "broad" || !risk.paths || risk.paths.length === 0) {
-    const holder = childHolds[0]?.mutableHold?.agentId ?? "a child agent";
-    const res = childHolds[0]?.path ?? childHolds[0]?.id ?? "workspace";
+    const holder = childHolds[0]?.mutableHold?.agentId ?? childFences[0]?.actorId ?? "a child agent";
+    const res = childHolds[0]?.path ?? childHolds[0]?.id ?? childFences[0]?.path ?? childFences[0]?.resourceId ?? "workspace";
+    const condition = childHolds.length > 0 ? `holds mutable resource ${res}` : `has an active write fence on ${res}`;
     return {
       block: true,
-      reason: `safe-agents blocked \`${command.trim()}\` while child ${holder} holds mutable resource ${res}. Wait for/release the hold, or explicitly perform the operation after coordinated child work completes.`,
+      reason: `safe-agents blocked \`${command.trim()}\` while child ${holder} ${condition}. Wait for/release the hold, or explicitly perform the operation after coordinated child work completes.`,
     };
   }
 
-  const caseInsensitive = detectCaseInsensitivePaths(options.workspacePath);
+  const caseInsensitive = status.config?.caseInsensitivePaths ?? detectCaseInsensitivePaths(options.workspacePath);
   const fold = (str: string) => (caseInsensitive ? str.toLowerCase() : str);
 
   for (const p of risk.paths) {
@@ -440,6 +444,34 @@ export async function evaluateRootShellGuard(
         reason: `safe-agents blocked \`${command.trim()}\` while child ${holder} holds mutable resource ${res}. Wait for/release the hold, or explicitly perform the operation after coordinated child work completes.`,
       };
     }
+
+    const matchedFence = childFences.find((f) => {
+      if (!f.path) return true;
+      const normalizedF = f.path.replace(/\\/g, "/").replace(/^\.\//, "");
+      const foldedF = fold(normalizedF);
+      return (
+        foldedP === foldedF ||
+        foldedP.startsWith(`${foldedF}/`) ||
+        foldedF.startsWith(`${foldedP}/`)
+      );
+    });
+    if (matchedFence) {
+      const holder = matchedFence.actorId ?? "a child agent";
+      const res = matchedFence.path ?? matchedFence.resourceId;
+      return {
+        block: true,
+        reason: `safe-agents blocked \`${command.trim()}\` while child ${holder} has an active write fence on ${res}. Wait for in-flight child writes to complete, or explicitly perform the operation after coordinated child work completes.`,
+      };
+    }
+  }
+
+  // If active write fences exist but no fence path identity was provided (e.g. status without detailed fence records),
+  // fail closed to prevent mutating paths that might be fenced
+  if (activeFences > 0 && childFences.length === 0) {
+    return {
+      block: true,
+      reason: `safe-agents blocked \`${command.trim()}\` while active write fences are in flight. Wait for in-flight child writes to complete, or explicitly perform the operation after coordinated child work completes.`,
+    };
   }
 
   return undefined;

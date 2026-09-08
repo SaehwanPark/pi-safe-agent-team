@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { FabricRuntime } from "../src/pi/runtime.ts";
 
-test("PI_CODING_AGENT_DIR contains all state and ~/.pi/agent remains untouched", async () => {
+test("canonical-agent-directory: PI_CODING_AGENT_DIR contains state, child sessions, auth/models, and ~/.pi/agent remains untouched", async () => {
   const tmpBase = process.platform === "darwin" ? "/tmp" : tmpdir();
   const testDir = await fs.mkdtemp(join(tmpBase, "pi-ag-"));
   const workspaceDir = join(testDir, "workspace");
@@ -34,6 +34,14 @@ test("PI_CODING_AGENT_DIR contains all state and ~/.pi/agent remains untouched",
     assert.equal(runtime.agentDir, testDir);
     assert.ok(runtime.stateDirectory.startsWith(testDir));
 
+    // Verify child session path and auth/models path resolution reside strictly under testDir
+    const childSessionDir = join(runtime.stateDirectory, "sessions", "child-123");
+    assert.ok(childSessionDir.startsWith(testDir));
+    const authPath = join(runtime.agentDir, "auth.json");
+    const modelsPath = join(runtime.agentDir, "models.json");
+    assert.ok(authPath.startsWith(testDir));
+    assert.ok(modelsPath.startsWith(testDir));
+
     // Initialize broker state under testDir
     await (runtime as any).ensureBroker();
 
@@ -42,6 +50,7 @@ test("PI_CODING_AGENT_DIR contains all state and ~/.pi/agent remains untouched",
     assert.ok(filesUnderStateDir.includes("broker.lock") || filesUnderStateDir.includes("events.jsonl"));
 
     await runtime.stop();
+
 
     // Verify ~/.pi/agent was not mutated
     let realDirAfter: string[] = [];

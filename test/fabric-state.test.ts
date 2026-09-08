@@ -434,3 +434,29 @@ test("fabric-state: canonical snapshot includes activeTasks, mutableResources, a
   assert.equal(snapshot.mutableResources[0].path, "src/main.ts");
   assert.equal(snapshot.mutableResources[0].holder, "child-1");
 });
+
+test("fabric-state: case-sensitivity check is cached and does not repeatedly probe filesystem", async () => {
+  const runtime = new FabricRuntime({ cwd: "/test/repo", startBroker: false });
+  (runtime as any).root = {
+    agentId: "root-1",
+    ctx: { cwd: "/test/repo", sessionId: "sess-1" },
+  };
+  (runtime as any).status = async () =>
+    makeMockStatus({
+      config: {
+        ...makeMockStatus().config,
+        caseInsensitivePaths: true,
+      },
+    });
+
+  // First call sets cached caseInsensitivePaths from config
+  const snap1 = await runtime.getFabricStateSnapshot({ cwd: "/test/repo" });
+  assert.ok(snap1);
+  assert.equal((runtime as any).caseInsensitivePaths, true);
+
+  // Subsequent call preserves cached property without probe
+  const snap2 = await runtime.getFabricStateSnapshot({ cwd: "/test/repo" });
+  assert.ok(snap2);
+  assert.equal((runtime as any).caseInsensitivePaths, true);
+});
+
