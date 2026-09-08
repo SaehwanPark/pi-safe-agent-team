@@ -33,26 +33,32 @@ run_scenario_1() {
   trap - EXIT
 }
 
+resolve_lcm_entrypoint() {
+  local lcm_dir="${LCM_DIR:-${REPO_DIR}/../local-context-manager}"
+  if [[ -f "${lcm_dir}/src/index.ts" ]]; then
+    printf '%s\n' "${lcm_dir}/src/index.ts"
+    return 0
+  fi
+  if [[ -f "${lcm_dir}/index.ts" ]]; then
+    printf '%s\n' "${lcm_dir}/index.ts"
+    return 0
+  fi
+  echo "Error: local-context-manager not found at '${lcm_dir}'." >&2
+  echo "Set LCM_DIR=<path-to-local-context-manager> or checkout sibling repository." >&2
+  return 1
+}
+
 run_scenario_lcm() {
   local test_dir
   test_dir="$(make_temp_agent_dir)"
   trap 'rm -rf "${test_dir}"' EXIT
 
-  local lcm_dir="${LCM_DIR:-${REPO_DIR}/../local-context-manager}"
-  local lcm_entry=""
-  if [[ -f "${lcm_dir}/src/index.ts" ]]; then
-    lcm_entry="${lcm_dir}/src/index.ts"
-  elif [[ -f "${lcm_dir}/index.ts" ]]; then
-    lcm_entry="${lcm_dir}/index.ts"
-  else
-    echo "Error: local-context-manager not found at '${lcm_dir}'." >&2
-    echo "Set LCM_DIR=<path-to-local-context-manager> or checkout sibling repository." >&2
-    exit 1
-  fi
+  local lcm_entry
+  lcm_entry="$(resolve_lcm_entrypoint)"
 
   echo "Scenario 2: safe-agent-team + local-context-manager load smoke"
   echo "  PI_CODING_AGENT_DIR=${test_dir}"
-  echo "  LCM_DIR=${lcm_dir}"
+  echo "  LCM_DIR=${LCM_DIR:-${REPO_DIR}/../local-context-manager}"
   PI_CODING_AGENT_DIR="${test_dir}" pi \
     --no-extensions \
     -e "${REPO_DIR}/index.ts" \
@@ -73,13 +79,58 @@ run_scenario_integration() {
   test_dir="$(make_temp_agent_dir)"
   trap 'rm -rf "${test_dir}"' EXIT
 
+  local lcm_entry
+  lcm_entry="$(resolve_lcm_entrypoint)"
+
+  # Pi's model registry and auth stores are deliberately copied into the
+  # disposable directory. The smoke must not read or mutate the normal agent
+  # directory while it creates a real managed child.
+  local source_agent_dir="${PI_SMOKE_SOURCE_AGENT_DIR:-${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}}"
+  local auth_file="${PI_SMOKE_AUTH_FILE:-${source_agent_dir}/auth.json}"
+  local models_file="${PI_SMOKE_MODELS_FILE:-${source_agent_dir}/models.json}"
+  if [[ ! -f "${auth_file}" || ! -f "${models_file}" ]]; then
+    echo "Model-backed integration smoke needs auth.json and models.json fixtures." >&2
+    echo "Set PI_SMOKE_SOURCE_AGENT_DIR, or PI_SMOKE_AUTH_FILE and PI_SMOKE_MODELS_FILE." >&2
+    exit 1
+  fi
+  cp "${auth_file}" "${test_dir}/auth.json"
+  cp "${models_file}" "${test_dir}/models.json"
+  chmod 600 "${test_dir}/auth.json" "${test_dir}/models.json"
+
   echo "Scenario 3: Model-backed integration smoke with model=${PI_SMOKE_MODEL}"
   echo "  PI_CODING_AGENT_DIR=${test_dir}"
-  PI_CODING_AGENT_DIR="${test_dir}" pi \
+  local output_file="${test_dir}/pi-output.txt"
+  local prompt="${PI_SMOKE_PROMPT:-Use agent_spawn exactly once with taskDescription 'Integration smoke worker: call agent_task with action=complete and result summary smoke-child-complete, then report completion to the parent.' Wait for that child task to reach a terminal completed state by using agent_status; do not do the worker task yourself. After the child is completed and no child work remains, report the exact marker SMOKE_ROOT_QUIESCENT.}"
+  if ! PI_CODING_AGENT_DIR="${test_dir}" pi \
     --no-extensions \
     -e "${REPO_DIR}/index.ts" \
+    -e "${lcm_entry}" \
     --model "${PI_SMOKE_MODEL}" \
-    -p "echo 'pi-safe-agent-team smoke test'" >/dev/null
+    -p "${prompt}" >"${output_file}" 2>&1; then
+    cat "${output_file}" >&2
+    exit 1
+  fi
+
+  if ! rg -q "SMOKE_ROOT_QUIESCENT" "${output_file}"; then
+    echo "Integration smoke did not report the quiescent completion marker." >&2
+    cat "${output_file}" >&2
+    exit 1
+  fi
+
+  local journal
+  journal="$(find "${test_dir}/safe-agents" -name events.jsonl -type f -print -quit 2>/dev/null || true)"
+  if [[ -z "${journal}" ]]; then
+    echo "Integration smoke did not leave a safe-agent journal under the disposable agent directory." >&2
+    exit 1
+  fi
+  if ! rg -q 'lcm-embedded' "${journal}"; then
+    echo "Integration smoke did not observe a managed child in lcm-embedded mode." >&2
+    exit 1
+  fi
+  if ! rg -q 'smoke-child-complete|"status":"completed"' "${journal}"; then
+    echo "Integration smoke did not observe a completed managed-child task." >&2
+    exit 1
+  fi
   rm -rf "${test_dir}"
   trap - EXIT
 }

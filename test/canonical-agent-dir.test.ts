@@ -93,3 +93,17 @@ test("precedence: options.agentDir > PI_CODING_AGENT_DIR (getAgentDir)", async (
     else delete process.env.PI_CODING_AGENT_DIR;
   }
 });
+
+test("default fabric identity is isolated by Pi session while reconnects reuse the same scope", () => {
+  const agentDir = "/tmp/pi-safe-agent-identity";
+  const first = new FabricRuntime({ cwd: "/workspace/repo", agentDir, sessionId: "session-a", startBroker: false });
+  const resumed = new FabricRuntime({ cwd: "/workspace/repo", agentDir, sessionId: "session-a", startBroker: false });
+  const concurrent = new FabricRuntime({ cwd: "/workspace/repo", agentDir, sessionId: "session-b", startBroker: false });
+
+  assert.equal(resumed.fabricId, first.fabricId);
+  assert.equal(resumed.stateDirectory, first.stateDirectory);
+  assert.equal(resumed.endpoint, first.endpoint);
+  assert.notEqual(concurrent.fabricId, first.fabricId);
+  assert.notEqual(concurrent.stateDirectory, first.stateDirectory);
+  assert.notEqual(concurrent.endpoint, first.endpoint);
+});

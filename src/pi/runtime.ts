@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -26,6 +27,8 @@ export interface RoleConfig {
 
 export interface FabricRuntimeOptions {
   cwd?: string;
+  /** Optional session identity for programmatic hosts and deterministic tests. */
+  sessionId?: string;
   fabricId?: string;
   stateDirectory?: string;
   agentDir?: string;
@@ -69,12 +72,47 @@ interface RootBinding {
   client: BrokerClient;
 }
 
+function normalizeSessionId(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function hashIdentity(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 24);
+}
+
+function canonicalWorkspacePath(value: string): string {
+  const resolved = resolve(value);
+  try {
+    return realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function resolvePiSessionId(ctx: ExtensionContext): string {
+  const sessionManager = ctx.sessionManager as unknown as {
+    getSessionId?: () => unknown;
+    sessionId?: unknown;
+  };
+  let value: unknown;
+  if (typeof sessionManager?.getSessionId === "function") {
+    value = sessionManager.getSessionId();
+  } else {
+    value = sessionManager?.sessionId;
+  }
+  const sessionId = normalizeSessionId(value);
+  if (!sessionId) {
+    throw new FabricError("INVALID_ARGUMENT", "Pi session identity is required before attaching a fabric root");
+  }
+  return sessionId;
+}
+
 export class FabricRuntime {
   readonly cwd: string;
-  readonly fabricId: string;
-  readonly stateDirectory: string;
+  private _fabricId: string;
+  private _stateDirectory: string;
   readonly agentDir: string;
-  readonly endpoint: string;
+  private _endpoint: string;
   readonly config?: Partial<FabricConfig>;
   readonly workspaceStrategy: WorkspaceStrategy;
 
@@ -93,22 +131,74 @@ export class FabricRuntime {
   private stopped = false;
   private rootDelivery?: (message: AgentMessage) => void;
   private caseInsensitivePaths?: boolean;
+  private sessionId?: string;
+
+  get fabricId(): string {
+    return this._fabricId;
+  }
+
+  get stateDirectory(): string {
+    return this._stateDirectory;
+  }
+
+  get endpoint(): string {
+    return this._endpoint;
+  }
 
   constructor(options: FabricRuntimeOptions = {}) {
     this.options = options;
-    this.cwd = options.cwd ?? process.cwd();
-    this.fabricId = options.fabricId ?? `fabric-${createHash("sha256").update(this.cwd).digest("hex").slice(0, 24)}`;
+    this.cwd = canonicalWorkspacePath(options.cwd ?? process.cwd());
     this.agentDir = options.agentDir ?? getAgentDir();
-    this.stateDirectory = options.stateDirectory ?? join(this.agentDir, "safe-agents", createHash("sha256").update(this.cwd).digest("hex").slice(0, 24));
-    this.endpoint = options.endpoint ?? defaultEndpoint(this.stateDirectory);
     this.config = options.config;
     this.caseInsensitivePaths = options.config?.caseInsensitivePaths;
     this.workspaceStrategy = options.workspaceStrategy ?? new GitWorkspaceStrategy();
     this.roles = options.roles ?? {};
+    this.sessionId = normalizeSessionId(options.sessionId);
+    const identityKey = this.identityKey(this.sessionId ?? "unattached");
+    this._fabricId = options.fabricId ?? `fabric-${hashIdentity(identityKey)}`;
+    this._stateDirectory = options.stateDirectory ?? join(this.agentDir, "safe-agents", hashIdentity(identityKey));
+    this._endpoint = options.endpoint ?? defaultEndpoint(this._stateDirectory);
+  }
+
+  private identityKey(sessionId: string): string {
+    return this.options.fabricId
+      ? `fabric\u0000${this.options.fabricId}`
+      : `${this.cwd}\u0000${sessionId}`;
+  }
+
+  private configureSessionIdentity(sessionId: string): void {
+    const normalized = normalizeSessionId(sessionId);
+    if (!normalized) {
+      throw new FabricError("INVALID_ARGUMENT", "Pi session identity is required before attaching a fabric root");
+    }
+    if (this.options.fabricId) {
+      this.sessionId = normalized;
+      return;
+    }
+    if (this.sessionId === normalized) {
+      return;
+    }
+    if (this.root || this.server) {
+      throw new FabricError("IDENTITY_CONFLICT", "Cannot change the default fabric identity while it is attached");
+    }
+
+    this.sessionId = normalized;
+    const identityKey = this.identityKey(normalized);
+    this._fabricId = `fabric-${hashIdentity(identityKey)}`;
+    if (!this.options.stateDirectory) {
+      this._stateDirectory = join(this.agentDir, "safe-agents", hashIdentity(identityKey));
+    }
+    if (!this.options.endpoint) {
+      this._endpoint = defaultEndpoint(this._stateDirectory);
+    }
+    // A root token belongs to the previous default fabric identity.
+    this.rootToken = undefined;
   }
 
 
   async attachRoot(api: ExtensionAPI, ctx: ExtensionContext, rootDelivery?: (message: AgentMessage) => void): Promise<RootBinding> {
+    const sessionId = resolvePiSessionId(ctx);
+    this.configureSessionIdentity(sessionId);
     // A Pi process may start another session after session_shutdown. The
     // durable root is reusable, so a fresh attachment re-enables reconnects.
     this.stopped = false;
@@ -123,7 +213,7 @@ export class FabricRuntime {
           role: "root",
           route: routeFromModel(ctx.model, ctx.thinkingLevel ?? "medium"),
           capabilities: { maySpawn: true, mayMessagePeers: true, mayEscalate: true, mayTransferOwnership: true, mayWriteRepo: true, mayUseShell: true },
-          sessionId: ctx.sessionManager.getSessionId(),
+          sessionId,
           token: this.rootToken,
           workspace: { mode: "shared", root: ctx.cwd, path: ctx.cwd },
         });
@@ -137,7 +227,6 @@ export class FabricRuntime {
     this.modelRegistry = ctx.modelRegistry;
     await this.ensureBroker();
     await this.loadRootToken();
-    const sessionId = ctx.sessionManager.getSessionId();
     const agentId = `root-${createHash("sha256").update(this.fabricId).digest("hex").slice(0, 24)}`;
     const client = new BrokerClient({ endpoint: this.endpoint, agentId, token: this.rootToken });
     await client.connect();
@@ -242,7 +331,7 @@ export class FabricRuntime {
     if (normalizeScopePath(request.cwd) !== normalizeScopePath(this.cwd)) {
       return null;
     }
-    const rootSessionId = (this.root?.ctx as any)?.sessionManager?.getSessionId?.() ?? (this.root?.ctx as any)?.sessionId;
+    const rootSessionId = this.sessionId ?? (this.root?.ctx as any)?.sessionManager?.getSessionId?.() ?? (this.root?.ctx as any)?.sessionId;
     if (request.sessionId && rootSessionId && request.sessionId !== rootSessionId) {
       return null;
     }
@@ -535,12 +624,13 @@ export class FabricRuntime {
           await this.root.client.connect();
           const ctx = this.root.ctx;
           if (!ctx.model) return;
+          const sessionId = resolvePiSessionId(ctx);
           const refreshed = await this.root.client.request<{ agent: AgentRecord; token: string }>("agent.register", {
             rootId: this.fabricId,
             role: "root",
             route: routeFromModel(ctx.model, ctx.thinkingLevel ?? "medium"),
             capabilities: { maySpawn: true, mayMessagePeers: true, mayEscalate: true, mayTransferOwnership: true, mayWriteRepo: true, mayUseShell: true },
-            sessionId: ctx.sessionManager.getSessionId(),
+            sessionId,
             workspace: { mode: "shared", root: ctx.cwd, path: ctx.cwd },
             token: this.rootToken,
           });
@@ -711,8 +801,10 @@ export class ManagedChild {
           throw new FabricError("CAPABILITY_DENIED", "Cannot compact child context while active operations are in flight");
         }
         if (this.session && typeof this.session.compact === "function") {
-          const instructions = request.customInstructions ?? request.reason;
-          await this.session.compact(instructions);
+          // `reason` is protocol metadata (for example, "threshold"), not
+          // necessarily prose intended for the model. Only an explicit
+          // customInstructions value should become Pi compaction guidance.
+          await this.session.compact(request.customInstructions);
         }
       },
       onStatus: (_snapshot) => {},
@@ -906,9 +998,11 @@ export class ManagedChild {
     if (this.contextMode === "native") return;
     this.contextMode = "native";
     try {
-      this.embeddedManager?.dispose();
+      // Keep any recovery files referenced by already-reduced tool results
+      // alive until the child really terminates. Native fallback only disables
+      // the active manager; stop() owns final cleanup.
+      this.embeddedManager?.deactivate?.();
     } catch {}
-    this.embeddedManager = undefined;
     try {
       await this.client.request("agent.update", { contextMode: "native" });
     } catch {}

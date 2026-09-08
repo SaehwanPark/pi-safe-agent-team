@@ -18,7 +18,7 @@ This ensures that disposable test directories configured via `PI_CODING_AGENT_DI
 By default:
 
 ```text
-<agentDir>/safe-agents/<sha256(cwd)[0:24]>/
+<agentDir>/safe-agents/<sha256(canonicalWorkspace + "\0" + rootPiSessionId)[0:24]>/
   events.jsonl       # broker transaction journal
   broker.lock        # local ownership lock
   broker.sock        # POSIX endpoint; named pipe on Windows
@@ -28,6 +28,13 @@ By default:
 ```
 
 `FabricRuntime` options can override `cwd`, `stateDirectory`, `endpoint`, `agentDir`, `fabricId`, and whether this process starts the broker or joins an existing endpoint.
+
+The default fabric identity is finalized when the root attaches, because Pi's session ID
+is not available while the extension is being constructed. Reconnecting the same Pi
+session reuses its fabric; two concurrent Pi sessions in the same workspace receive
+different state directories, broker endpoints, root identities, and child namespaces.
+Explicit `fabricId`, `stateDirectory`, or `endpoint` values are advanced overrides for
+intentional sharing or embedding and should be used together when sharing is desired.
 
 ## Limits
 
@@ -67,8 +74,26 @@ Use `shared` for read-only investigations or when all work is intentionally seri
 
 ## Broker startup
 
-Normally the first root extension instance starts the local broker; later instances join the locked fabric. The runtime uses a stable per-fabric root identity and stores its reconnect credential in `root.token` with mode `0600`. A broker restart permits one matching-token reattach for live actors; completed, failed, and cancelled semantic terminal actors remain terminal. A stale lock can be removed only when its recorded PID is no longer alive. The endpoint is local-user scoped. The broker is one writer for `events.jsonl`.
+Normally the first root extension instance starts the local broker; later instances join the locked fabric. The runtime uses a stable per-session root identity and stores its reconnect credential in `root.token` with mode `0600`. A broker restart permits one matching-token reattach for live actors; completed, failed, and cancelled semantic terminal actors remain terminal. A stale lock can be removed only when its recorded PID is no longer alive. The endpoint is local-user scoped. The broker is one writer for `events.jsonl`.
 
 ## Diagnostics
 
 Use `/agents`, `/agents tree`, `/agents tasks`, `/agents resources`, `/agents messages`, and `/agents inbox`. For tests and embedding, inspect structured `FabricError.code` values rather than matching human messages. Important categories include `CAPABILITY_DENIED`, `AGENT_LIMIT_REACHED`, `MAILBOX_FULL`, `RESOURCE_CONFLICT`, `MODEL_NOT_FOUND`, `WORKSPACE_FAILURE`, and `BROKER_UNAVAILABLE`.
+
+## Isolated smoke modes
+
+`npm run smoke:pi` runs the credential-free safe-agent load smoke. Use
+`npm run smoke:pi:with-lcm` for an explicit joint extension-load check; it fails if the
+companion checkout is missing. The opt-in model-backed managed-child check is:
+
+```text
+PI_SMOKE_MODEL=<provider/model> \
+PI_SMOKE_SOURCE_AGENT_DIR=<agent-fixture-dir> \
+npm run smoke:pi:integration
+```
+
+The integration mode copies only `auth.json` and `models.json` into a disposable
+`PI_CODING_AGENT_DIR`, loads both extensions, spawns one child, and verifies the child
+uses the embedded context provider and completes its task. `PI_SMOKE_AUTH_FILE` and
+`PI_SMOKE_MODELS_FILE` can point to explicit fixture files when the source directory
+layout differs.

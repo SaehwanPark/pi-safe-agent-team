@@ -76,6 +76,12 @@ Recovery replays only committed transactions and ignores an incomplete final tra
 - scoped coordination tools bound to the child identity;
 - guarded Pi built-in operations for resource-authorized file writes and conservative shell access.
 
+The default fabric scope is `hash(canonicalWorkspace + "\0" + rootPiSessionId)`. It is
+resolved lazily at root attachment so two concurrent Pi sessions in one repository
+cannot alias a broker, root actor, reconnect token, or child namespace. Reattaching the
+same Pi session retains the scope; explicit fabric/state/endpoint options remain the
+advanced opt-in for intentional sharing.
+
 A handle owns at most one active `session.prompt()` call. Incoming messages are queued in the broker and then delivered through Pi's `steer`, `followUp`, or a fresh prompt. Acknowledgement follows host queue acceptance, and an in-flight/accepted ID set makes notification plus inbox replay idempotent within the host process. A clarification request is not awaited by the caller's JavaScript stack: the ask tool records a request and returns `terminate: true`; the child becomes `waiting`; a reply later starts a new prompt. This is the deadlock-free pause/resume path.
 
 Managed children do not load the parent extension set a second time (`noExtensions: true`). They retain Pi's built-in tools, project context files, and skills, while the host supplies only the scoped coordination and guarded built-in operations.
@@ -92,7 +98,7 @@ Root capabilities such as web access, browser automation, MCP tools, and compute
 
 A process-local interop registry via `Symbol.for("pi.extension-interop.v1")` allows safe cooperation between extensions without hard dependencies:
 - **`safe-agent-team.fabric-state.v1`**: The fabric runtime exports a deterministic and conservative state snapshot (`quiescent: boolean`, `state: "known" | "uncertain"`, `sessionReplacementSafe: boolean`, active tasks, mutable holds, write fences, pending requests). Root session replacement (`session_shutdown`) cancels managed child agents; companion context managers (like `local-context-manager`) consume this to defer destructive compaction, semantic resets, or root session rewinds until `sessionReplacementSafe === true`.
-- **`local-context-manager.embedded-context.v1`**: When present, `ManagedChild` obtains an embedded context controller. It applies adaptive output reduction and turn compaction to child tool outputs while retaining `noExtensions: true`. Compaction instructions are delegated as `string | undefined` to upstream Pi's `AgentSession.compact(customInstructions?: string)`. Any provider failure degrades cleanly to `native` context management, synchronizing to the coordinator with `agent.update({ contextMode: "native" })`.
+- **`local-context-manager.embedded-context.v1`**: When present, `ManagedChild` obtains an embedded context controller. It applies adaptive output reduction and turn compaction to child tool outputs while retaining `noExtensions: true`. Compaction instructions are delegated as `string | undefined` to upstream Pi's `AgentSession.compact(customInstructions?: string)`. Any provider failure deactivates the controller while retaining its reference and manager-owned recovery files, synchronizes to the coordinator with `agent.update({ contextMode: "native" })`, and lets final child shutdown call `dispose()` for cleanup.
 
 ### Root message delivery policy
 

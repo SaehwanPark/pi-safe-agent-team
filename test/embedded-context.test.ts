@@ -296,8 +296,7 @@ test("embedded-context: session.compact is invoked with string | undefined, neve
 
   // Simulate ManagedChild compaction delegation
   const hostCompact = async (request: { customInstructions?: string; reason?: string }) => {
-    const instructions = request.customInstructions ?? request.reason;
-    await mockSession.compact(instructions);
+    await mockSession.compact(request.customInstructions);
   };
 
   await hostCompact({ customInstructions: "Prune old outputs", reason: "overflow" });
@@ -307,16 +306,16 @@ test("embedded-context: session.compact is invoked with string | undefined, neve
 
   await hostCompact({ reason: "threshold_exceeded" });
   assert.equal(compactCalls.length, 2);
-  assert.equal(typeof compactCalls[1], "string");
-  assert.equal(compactCalls[1], "threshold_exceeded");
+  assert.equal(compactCalls[1], undefined);
 
   await hostCompact({});
   assert.equal(compactCalls.length, 3);
   assert.equal(compactCalls[2], undefined);
 });
 
-test("embedded-context: ManagedChild degradation disposes embedded manager, clears it, and sets contextMode native", async () => {
+test("embedded-context: ManagedChild degradation deactivates embedded manager, retains it for final cleanup, and sets contextMode native", async () => {
   const operations: Array<{ operation: string; args: any }> = [];
+  let deactivated = false;
   let disposed = false;
   const child = new ManagedChild({ fabricId: "fabric-test" } as never, {
     agentId: "child-123",
@@ -334,6 +333,9 @@ test("embedded-context: ManagedChild degradation disposes embedded manager, clea
 
   (child as any).contextMode = "lcm-embedded";
   (child as any).embeddedManager = {
+    deactivate() {
+      deactivated = true;
+    },
     dispose() {
       disposed = true;
     },
@@ -348,8 +350,9 @@ test("embedded-context: ManagedChild degradation disposes embedded manager, clea
   await (child as any).degradeToNativeContext();
 
   assert.equal((child as any).contextMode, "native");
-  assert.equal((child as any).embeddedManager, undefined);
-  assert.equal(disposed, true);
+  assert.ok((child as any).embeddedManager);
+  assert.equal(deactivated, true);
+  assert.equal(disposed, false);
   assert.equal(operations.length, 1);
   assert.equal(operations[0].operation, "agent.update");
   assert.deepEqual(operations[0].args, { contextMode: "native" });
@@ -364,5 +367,7 @@ test("embedded-context: ManagedChild degradation disposes embedded manager, clea
   const registerOp = operations.find((o) => o.operation === "agent.register");
   assert.ok(registerOp);
   assert.equal(registerOp.args.contextMode, "native");
-});
 
+  await (child as any).stop();
+  assert.equal(disposed, true);
+});
