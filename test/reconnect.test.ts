@@ -50,7 +50,13 @@ test("Pi root reattaches with its persisted reconnect credential", async () => {
 test("default fabric identity is finalized from the root Pi session at attachment", async () => {
   const directory = await mkdtemp(join(tmpdir(), "safe-agents-session-scope-"));
   const endpoint = join("/tmp", `pi-safe-identity-${process.pid}-${Date.now()}.sock`);
-  const runtime = new FabricRuntime({ cwd: directory, agentDir: directory, endpoint });
+  const runtime = new FabricRuntime({
+    cwd: directory,
+    agentDir: directory,
+    // Keep the POSIX socket short on macOS; Windows uses its named-pipe
+    // endpoint and must not receive a POSIX path.
+    endpoint: process.platform === "win32" ? undefined : endpoint,
+  });
   const provisionalFabricId = runtime.fabricId;
   try {
     await runtime.ensureRoot({} as ExtensionAPI, runtimeContext(directory, "session-finalized"));
