@@ -478,6 +478,7 @@ export class Coordinator {
     const next = cloneAgent(target);
     if (args.sessionId !== undefined) next.sessionId = parseString(args.sessionId, "sessionId", 512);
     if (args.workspace !== undefined) next.workspace = parseWorkspace(args.workspace);
+    if (args.contextMode !== undefined) next.contextMode = parseOptionalString(args.contextMode, "contextMode", 128);
     next.lastActivity = this.clock();
     this.agents.set(target.id, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
@@ -498,6 +499,7 @@ export class Coordinator {
     assertCondition(args.taskId === undefined, "IDENTITY_CONFLICT", "Use task.claim or task.update to change task ownership");
     if (args.route !== undefined) next.route = this.validateRoute(args.route as ModelRoute);
     if (args.workspace !== undefined) next.workspace = parseWorkspace(args.workspace);
+    if (args.contextMode !== undefined) next.contextMode = parseOptionalString(args.contextMode, "contextMode", 128);
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });

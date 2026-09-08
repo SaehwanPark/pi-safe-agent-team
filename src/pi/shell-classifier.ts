@@ -51,9 +51,9 @@ function splitChainedCommands(command: string): string[] {
  * Check for mutating file redirection (> or >>) not directed to /dev/null or file descriptors.
  */
 function extractRedirectionPaths(segment: string): { hasRedirection: boolean; paths: string[] } {
-  // Regex to match redirection operators > or >>
-  // Exclude 2>&1, >&2, etc.
-  const redirRegex = /(?:^|\s)(?:[0-9]*>>?)\s*([^\s;&|]+)/g;
+  // Regex to match redirection operators > or >> (including no-space like echo x>a.ts)
+  // Excludes here-docs << and file descriptors &1, &2, and /dev/null
+  const redirRegex = /(?<!<)(?:[0-9]*>>?)\s*("[^"]*"|'[^']*'|[^\s;&|<>]+)/g;
   let match: RegExpExecArray | null;
   const paths: string[] = [];
   let hasRedirection = false;
@@ -122,9 +122,11 @@ function classifySingleCommand(tokens: string[]): RootShellRisk {
     if (args[0] === "fmt") {
       return { kind: "known-mutator", scope: "broad", reason: "cargo fmt formats files in place" };
     }
-    if (["test", "check", "clippy", "bench", "doc", "metadata", "read-manifest", "tree", "verify-project"].includes(args[0])) {
+    if (["read-manifest", "tree", "verify-project"].includes(args[0])) {
       return { kind: "read-only" };
     }
+    // cargo test/check/build/bench execute arbitrary project build scripts/hooks -> unknown
+    return { kind: "unknown" };
   }
 
   if (bin === "ruff") {
@@ -172,9 +174,11 @@ function classifySingleCommand(tokens: string[]): RootShellRisk {
     if (args[0] === "fmt") {
       return { kind: "known-mutator", scope: "broad", reason: "go fmt formats files in place" };
     }
-    if (["test", "vet", "version", "env", "list"].includes(args[0])) {
+    if (["version", "env", "list"].includes(args[0])) {
       return { kind: "read-only" };
     }
+    // go test/vet execute project code -> unknown
+    return { kind: "unknown" };
   }
 
   if (bin === "gofmt") {
@@ -188,18 +192,21 @@ function classifySingleCommand(tokens: string[]): RootShellRisk {
     if (args[0] === "format") {
       return { kind: "known-mutator", scope: "broad", reason: "dotnet format formats files in place" };
     }
-    if (["test", "build", "run"].includes(args[0])) {
+    if (["--version", "--info"].includes(args[0])) {
       return { kind: "read-only" };
     }
+    // dotnet test/build/run execute project code -> unknown
+    return { kind: "unknown" };
   }
 
   if (bin === "mix") {
     if (args[0] === "format") {
       return { kind: "known-mutator", scope: "broad", reason: "mix format formats files in place" };
     }
-    if (["test", "compile"].includes(args[0])) {
+    if (args.includes("--version")) {
       return { kind: "read-only" };
     }
+    return { kind: "unknown" };
   }
 
   if (bin === "git") {
@@ -226,6 +233,16 @@ function classifySingleCommand(tokens: string[]): RootShellRisk {
     }
   }
 
+  if (bin === "tee") {
+    const paths = args.filter((a) => !a.startsWith("-"));
+    return {
+      kind: "known-mutator",
+      scope: paths.length > 0 ? "path" : "broad",
+      paths: paths.length > 0 ? paths : undefined,
+      reason: "tee writes to files",
+    };
+  }
+
   if (["rm", "unlink", "mv", "cp", "mkdir", "rmdir", "touch", "chmod", "chown"].includes(bin)) {
     const paths = args.filter((a) => !a.startsWith("-"));
     return {
@@ -240,12 +257,11 @@ function classifySingleCommand(tokens: string[]): RootShellRisk {
     if (args.includes("format") || args.includes("lint:fix") || args.includes("format:fix")) {
       return { kind: "known-mutator", scope: "broad", reason: `${bin} format script mutates files` };
     }
-    if (args.includes("test") || args.includes("check") || args.includes("typecheck") || args.includes("run") && (args.includes("test") || args.includes("check") || args.includes("typecheck"))) {
-      return { kind: "read-only" };
-    }
+    // npm test/run/etc execute arbitrary scripts -> unknown
+    return { kind: "unknown" };
   }
 
-  // Pure read-only commands
+  // Intrinsically observational commands (no code execution)
   if ([
     "rg",
     "grep",
@@ -273,8 +289,6 @@ function classifySingleCommand(tokens: string[]): RootShellRisk {
     "true",
     "false",
     "test",
-    "node",
-    "pytest",
     "uname",
   ].includes(bin)) {
     return { kind: "read-only" };
@@ -312,7 +326,7 @@ export function classifyRootShellCommand(command: string): RootShellRisk {
     }
 
     // Strip redirection tokens from segment for command classification
-    const cleanedSegment = segment.replace(/(?:^|\s)(?:[0-9]*>>?)\s*[^\s;&|]+/g, " ").trim();
+    const cleanedSegment = segment.replace(/(?<!<)(?:[0-9]*>>?)\s*(?:"[^"]*"|'[^']*'|[^\s;&|<>]+)/g, " ").trim();
     if (!cleanedSegment) continue;
 
     const tokens = tokenize(cleanedSegment);
@@ -331,6 +345,13 @@ export function classifyRootShellCommand(command: string): RootShellRisk {
   }
 
   if (allMutators.length > 0) {
+    // If the chained command changes directories (e.g. cd or pushd), relative path targets cannot be reliably scoped
+    const changesDir = segments.some((s) => /\b(?:cd|pushd)\b/.test(s));
+    if (changesDir) {
+      for (const m of allMutators) {
+        m.scope = "broad";
+      }
+    }
     // If any mutator has broad scope, the whole command is broad
     const isBroad = allMutators.some((m) => m.scope === "broad");
     const allPaths = allMutators.flatMap((m) => m.paths ?? []);

@@ -110,4 +110,28 @@ test("root-shell: blocked with exact UX when child holds mutable resource", asyn
   // 5. Unknown command retains trusted-root semantics (allowed)
   const unknownOutcome = await evaluateRootShellGuard(options, { command: "custom-script --check" });
   assert.equal(unknownOutcome, undefined);
+
+  // 6. Output redirections targeting held path are blocked
+  const echoRedir = await evaluateRootShellGuard(options, { command: "echo x>src/parser/ast.ts" });
+  assert.ok(echoRedir?.block);
+  assert.ok(echoRedir?.reason?.includes("while child agent-4 holds mutable resource src/parser"));
+
+  const appendRedir = await evaluateRootShellGuard(options, { command: "printf 'more'>>src/parser/ast.ts" });
+  assert.ok(appendRedir?.block);
+  assert.ok(appendRedir?.reason?.includes("while child agent-4 holds mutable resource src/parser"));
+
+  // 7. tee pipeline targeting held path is blocked
+  const teeOutcome = await evaluateRootShellGuard(options, { command: "cat input.ts | tee src/parser/ast.ts" });
+  assert.ok(teeOutcome?.block);
+  assert.ok(teeOutcome?.reason?.includes("while child agent-4 holds mutable resource src/parser"));
+
+  // 8. Chained cd command turns mutator broad -> blocked
+  const cdOutcome = await evaluateRootShellGuard(options, { command: "cd src && prettier --write other.ts" });
+  assert.ok(cdOutcome?.block);
+  assert.ok(cdOutcome?.reason?.includes("while child agent-4 holds mutable resource src/parser"));
+
+  // 9. Path-scoped mutator with relative navigation (..) resolving into held path is blocked
+  const relativeDotDot = await evaluateRootShellGuard(options, { command: "prettier --write src/other/../parser/ast.ts" });
+  assert.ok(relativeDotDot?.block);
+  assert.ok(relativeDotDot?.reason?.includes("while child agent-4 holds mutable resource src/parser"));
 });

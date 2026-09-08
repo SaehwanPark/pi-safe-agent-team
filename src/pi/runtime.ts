@@ -10,12 +10,12 @@ import { FabricError, asFabricError } from "../core/errors.ts";
 import { Coordinator } from "../core/coordinator.ts";
 import type { AgentStatus, FabricConfig, AgentMessage, AgentRecord, FabricStatus, ModelRoute, TaskRecord } from "../core/types.ts";
 import { BrokerClient } from "../broker/client.ts";
-import { BrokerServer, defaultEndpoint } from "../broker/server.ts";
+import { BrokerServer, defaultEndpoint, detectCaseInsensitivePaths } from "../broker/server.ts";
 import { GitWorkspaceStrategy, type WorkspaceStrategy } from "../workspace.ts";
 import { resolveChildModel, routeFromModel } from "./model-routing.ts";
 import { createCoordinationTools, type SpawnToolInput } from "./tools.ts";
 import { createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootShellGuard, evaluateRootWriteGuard, releaseRootWriteFence, type RootWriteGuardOutcome } from "./guards.ts";
-import { createEmbeddedContextController, type EmbeddedContextHost, type EmbeddedContextManager, type FabricSnapshotRequest, type FabricStateSnapshotV1 } from "./interop.ts";
+import { createEmbeddedContextController, type EmbeddedCompactionRequest, type EmbeddedContextHost, type EmbeddedContextManager, type FabricSnapshotRequest, type FabricStateSnapshotV1 } from "./interop.ts";
 
 export interface RoleConfig {
   model?: string;
@@ -97,7 +97,7 @@ export class FabricRuntime {
     this.options = options;
     this.cwd = options.cwd ?? process.cwd();
     this.fabricId = options.fabricId ?? `fabric-${createHash("sha256").update(this.cwd).digest("hex").slice(0, 24)}`;
-    this.agentDir = options.agentDir ?? (process.env.PI_CODING_AGENT_DIR ? getAgentDir() : (process.env.PI_AGENT_DIR ?? getAgentDir()));
+    this.agentDir = options.agentDir ?? getAgentDir();
     this.stateDirectory = options.stateDirectory ?? join(this.agentDir, "safe-agents", createHash("sha256").update(this.cwd).digest("hex").slice(0, 24));
     this.endpoint = options.endpoint ?? defaultEndpoint(this.stateDirectory);
     this.config = options.config;
@@ -226,11 +226,31 @@ export class FabricRuntime {
     this.pendingRootFencesCount = count;
   }
 
+  async hasPendingRootRequest(message?: AgentMessage): Promise<boolean> {
+    if (!this.root) return false;
+    try {
+      const status = (await this.status()) as FabricStatus;
+      const rootId = status.rootId;
+      if (!rootId) return false;
+      const rootRequests = (status.pendingRequests ?? []).filter((r) => r.from === rootId && r.status === "pending");
+      if (!message) return rootRequests.length > 0;
+      if (message.replyTo || message.requestId) {
+        return rootRequests.some((r) => r.messageId === message.replyTo || r.id === message.requestId);
+      }
+      return rootRequests.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
   /** Provide a deterministic fabric state snapshot for context managers. */
   async getFabricStateSnapshot(request: FabricSnapshotRequest): Promise<FabricStateSnapshotV1 | null> {
-    const requestedCwd = resolve(request.cwd);
-    const runtimeCwd = resolve(this.cwd);
-    if (requestedCwd.toLowerCase() !== runtimeCwd.toLowerCase()) {
+    const caseInsensitive = detectCaseInsensitivePaths(this.cwd);
+    const normalizeScopePath = (p: string): string => {
+      const resolved = resolve(p);
+      return caseInsensitive ? resolved.toLowerCase() : resolved;
+    };
+    if (normalizeScopePath(request.cwd) !== normalizeScopePath(this.cwd)) {
       return null;
     }
     const rootSessionId = (this.root?.ctx as any)?.sessionManager?.getSessionId?.() ?? (this.root?.ctx as any)?.sessionId;
@@ -241,21 +261,31 @@ export class FabricRuntime {
     const now = Date.now();
     if (this.stopped || !this.root) {
       return {
+        version: 1,
         active: false,
         quiescent: false,
+        state: "known",
+        sessionReplacementSafe: false,
         capturedAt: now,
+        rootSessionId,
+        cwd: this.cwd,
         runningChildren: 0,
         unresolvedChildTasks: 0,
         mutableHolds: 0,
+        activeWriteFences: 0,
         pendingRootRequests: 0,
         pendingRootDeliveries: 0,
         activeTasks: [],
         mutableResources: [],
+        quiescenceReasons: ["fabric_runtime_unattached_or_stopped"],
       };
     }
 
     try {
       const status = (await this.status()) as FabricStatus;
+      const rootAgent = status.agents.find((a) => a.id === status.rootId);
+      const rootBusy = !rootAgent || rootAgent.status === "starting" || rootAgent.status === "running";
+
       const runningChildren = status.agents.filter(
         (a) => a.depth > 0 && (a.status === "starting" || a.status === "running"),
       ).length;
@@ -267,15 +297,19 @@ export class FabricRuntime {
         (r) => r.to === status.rootId && r.status === "pending",
       ).length;
       const pendingRootDeliveries = this.pendingRootDeliveriesCount;
-      const activeFences = (status.activeFences ?? 0) + this.pendingRootFencesCount;
+      const activeWriteFences = status.activeFences ?? 0;
 
-      const quiescent =
-        runningChildren === 0 &&
-        unresolvedChildTasks === 0 &&
-        mutableHolds === 0 &&
-        pendingRootRequests === 0 &&
-        pendingRootDeliveries === 0 &&
-        activeFences === 0;
+      const quiescenceReasons: string[] = [];
+      if (rootBusy) quiescenceReasons.push("root_agent_active_or_running");
+      if (runningChildren > 0) quiescenceReasons.push("running_children_active");
+      if (unresolvedChildTasks > 0) quiescenceReasons.push("unresolved_child_tasks");
+      if (mutableHolds > 0) quiescenceReasons.push("active_mutable_holds");
+      if (activeWriteFences > 0) quiescenceReasons.push("active_write_fences");
+      if (pendingRootRequests > 0) quiescenceReasons.push("pending_root_requests");
+      if (pendingRootDeliveries > 0) quiescenceReasons.push("pending_root_deliveries");
+
+      const quiescent = quiescenceReasons.length === 0;
+      const sessionReplacementSafe = quiescent;
 
       const activeTasks = status.tasks
         .filter((t) => ["pending", "ready", "active", "waiting", "blocked"].includes(t.status))
@@ -297,29 +331,43 @@ export class FabricRuntime {
         }));
 
       return {
+        version: 1,
         active: true,
         quiescent,
+        state: "known",
+        sessionReplacementSafe,
         capturedAt: now,
+        rootSessionId,
+        cwd: this.cwd,
         runningChildren,
         unresolvedChildTasks,
         mutableHolds,
+        activeWriteFences,
         pendingRootRequests,
         pendingRootDeliveries,
         activeTasks,
         mutableResources,
+        quiescenceReasons,
       };
     } catch {
       return {
-        active: false,
+        version: 1,
+        active: true,
         quiescent: false,
+        state: "uncertain",
+        sessionReplacementSafe: false,
         capturedAt: now,
+        rootSessionId,
+        cwd: this.cwd,
         runningChildren: 0,
         unresolvedChildTasks: 0,
         mutableHolds: 0,
+        activeWriteFences: 0,
         pendingRootRequests: 0,
-        pendingRootDeliveries: 0,
+        pendingRootDeliveries: this.pendingRootDeliveriesCount,
         activeTasks: [],
         mutableResources: [],
+        quiescenceReasons: ["broker_status_query_failed"],
       };
     }
   }
@@ -666,12 +714,13 @@ export class ManagedChild {
           return [];
         }
       },
-      compact: async (request) => {
+      compact: async (request: EmbeddedCompactionRequest) => {
         if (this.session?.isStreaming || this.hasInFlightWrite > 0 || this.resolvingToolCount > 0) {
           throw new FabricError("CAPABILITY_DENIED", "Cannot compact child context while active operations are in flight");
         }
-        if (typeof (this.session as any)?.compact === "function") {
-          await (this.session as any).compact(request);
+        if (this.session && typeof this.session.compact === "function") {
+          const instructions = request.customInstructions ?? request.reason;
+          await this.session.compact(instructions);
         }
       },
       onStatus: (_snapshot) => {},
@@ -719,7 +768,7 @@ export class ManagedChild {
                 details: transformed.details !== undefined ? transformed.details : result.details,
               };
             } catch {
-              this.contextMode = "native";
+              void this.degradeToNativeContext();
               return result;
             }
           }
@@ -860,6 +909,14 @@ export class ManagedChild {
     });
   }
 
+  private async degradeToNativeContext(): Promise<void> {
+    if (this.contextMode === "native") return;
+    this.contextMode = "native";
+    try {
+      await this.client.request("agent.update", { contextMode: "native" });
+    } catch {}
+  }
+
   private async executePrompt(prompt: string): Promise<void> {
     if (!this.session || this.stopping) return;
     let started = false;
@@ -873,7 +930,7 @@ export class ManagedChild {
       try {
         this.embeddedManager.observeTurnStart();
       } catch {
-        this.contextMode = "native";
+        await this.degradeToNativeContext();
       }
     }
     await this.session.prompt(prompt, { expandPromptTemplates: false });
@@ -882,7 +939,7 @@ export class ManagedChild {
         this.embeddedManager.observeTurnEnd();
         await this.embeddedManager.observeSettled();
       } catch {
-        this.contextMode = "native";
+        await this.degradeToNativeContext();
       }
     }
     const agent = await this.client.request<AgentRecord>("agent.status", {});

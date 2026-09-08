@@ -19,10 +19,24 @@ test("interop registry uses Symbol.for('pi.extension-interop.v1') and handles re
   const testProvider = { name: "test-provider", testFn: () => 42 };
   registerInteropProvider("test.provider.v1", testProvider);
 
+  // Idempotent re-registration of exact same instance succeeds
+  registerInteropProvider("test.provider.v1", testProvider);
+
+  // Conflicting registration throws
+  assert.throws(
+    () => registerInteropProvider("test.provider.v1", { name: "different" }),
+    /already registered with a different instance/
+  );
+
   const retrieved = getInteropProvider<typeof testProvider>("test.provider.v1");
   assert.equal(retrieved, testProvider);
   assert.equal(retrieved?.testFn(), 42);
 
-  unregisterInteropProvider("test.provider.v1");
+  // Unregister with non-matching instance does not remove it
+  unregisterInteropProvider("test.provider.v1", { name: "wrong-instance" });
+  assert.equal(getInteropProvider("test.provider.v1"), testProvider);
+
+  // Unregister with matching instance removes it
+  unregisterInteropProvider("test.provider.v1", testProvider);
   assert.equal(getInteropProvider("test.provider.v1"), undefined);
 });

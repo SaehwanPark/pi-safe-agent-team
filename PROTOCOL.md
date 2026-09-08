@@ -259,51 +259,80 @@ Cross-extension coordination uses a process-local symbol registry accessible via
 
 ### `safe-agent-team.fabric-state.v1`
 
-Exported by safe-agent-team to inform companion extensions of fabric quiescence:
+Exported by safe-agent-team to inform companion extensions (such as context managers) of deterministic fabric state and quiescence:
 
 ```ts
+interface FabricTaskSnapshot {
+  id: string;
+  status: string;
+  owner?: string;
+  description?: string;
+}
+
+interface FabricResourceSnapshot {
+  id: string;
+  path?: string;
+  holder?: string;
+}
+
 interface FabricStateSnapshotV1 {
   version: 1;
   active: boolean;
   quiescent: boolean;
-  rootSessionId: string;
-  cwd: string;
-  activeAgents: number;
-  runningAgents: number;
-  nonTerminalChildTasks: number;
-  activeMutableHolds: number;
+  state: "known" | "uncertain";
+  sessionReplacementSafe: boolean;
+  capturedAt: number;
+  rootSessionId?: string;
+  cwd?: string;
+
+  runningChildren: number;
+  unresolvedChildTasks: number;
+  mutableHolds: number;
   activeWriteFences: number;
-  pendingRequestsToRoot: number;
+  pendingRootRequests: number;
+  pendingRootDeliveries: number;
+
+  activeTasks: FabricTaskSnapshot[];
+  mutableResources: FabricResourceSnapshot[];
   quiescenceReasons: string[];
 }
 ```
 
-Quiescence rules are strictly conservative:
-- Root must be active and not currently executing a turn.
-- No child agent may be in `running` state.
-- All child tasks must have reached terminal state (`completed`, `failed`, `cancelled`).
-- Zero active mutable borrows or write fences across the entire fabric.
-- Zero unresolved requests directed to the root.
+Quiescence and session replacement rules are strictly conservative:
+- **Root agent turn**: Root must be attached and not currently executing a turn (`rootBusy = !rootAgent || rootAgent.status === "starting" || rootAgent.status === "running"`).
+- **Child agent states**: No child agent may be in `starting` or `running` state (`runningChildren === 0`).
+- **Child tasks**: All child tasks must have reached a terminal state (`completed`, `failed`, `cancelled`), ensuring `unresolvedChildTasks === 0`.
+- **Resource holds and write fences**: Zero active mutable borrows (`mutableHolds === 0`) and zero active write fences (`activeWriteFences === 0`) across the entire fabric.
+- **Pending root requests and deliveries**: Zero unresolved requests or unconsumed deliveries directed to the root (`pendingRootRequests === 0` and `pendingRootDeliveries === 0`).
+- **Failure state**: If the broker is unreachable or a status query fails while the root is attached, the snapshot fails closed with `active: true, quiescent: false, state: "uncertain", sessionReplacementSafe: false`, and `quiescenceReasons: ["broker_status_query_failed"]`.
+
+### Root Session Replacement and Descendant Cancellation
+
+Safe-agent-team binds managed child agents to the active root Pi session lifetime:
+- When a root session shuts down (e.g. during a session reset, `/checkpoint-reset`, or editor reload), Pi emits `session_shutdown`.
+- On `session_shutdown`, the runtime cancels all managed descendant agents and tasks and unregisters its interop provider.
+- Companion extensions (e.g. `local-context-manager`) that replace, reset, or rewind root sessions **must** query `safe-agent-team.fabric-state.v1` first and wait until `sessionReplacementSafe === true` (or prompt the user) before resetting the session, preventing unexpected mid-flight child cancellation.
 
 ### `local-context-manager.embedded-context.v1`
 
 When registered by a context manager, safe-agent-team's `ManagedChild` requests an embedded context manager:
 
 - Wraps tool outputs with adaptive compaction and token budgeting.
-- Observes turn boundaries (`onTurnStart`, `onTurnSettled`).
+- Observes turn boundaries (`observeTurnStart`, `observeTurnEnd`, `observeSettled`).
+- Context usage and compactions delegate to upstream Pi `AgentSession.compact(customInstructions?: string)`, passing `customInstructions` or `reason` strictly as `string | undefined` (never an object).
 - Runs strictly inside the managed child session without ambient extension loading (`noExtensions: true`).
-- Fails soft: any error or throwing provider drops back to `native` context management without crashing the child agent.
+- Fails soft: any error or throwing provider drops back to `native` context management, notifying the coordinator broker with `agent.update({ contextMode: "native" })` without crashing the child agent.
 
 ## Root Shell Mutator Preflight Guard
 
 The root `bash` tool call is preflighted in `index.ts` using `classifyRootShellCommand`:
 
 - **Classification**:
-  - `read-only`: Read-only queries (`git status`, `git diff`, `cargo test`, `rg`, `grep`, `cat`, etc.) — always allowed.
-  - `known-mutator` with `scope: "broad"`: Global mutators (`git checkout .`, `git restore .`, `rm -rf`, `prettier --write`, `sed -i`, `ruff format`, `black`, etc.) or pipe/redirection writes (`|`, `>`, `>>`).
-  - `known-mutator` with `scope: "path"`: Mutations targeting specific declared files (`prettier --write src/foo.ts`).
-  - `unknown`: Unrecognized tools.
+  - `read-only`: Purely observational commands without arbitrary code execution (`git status`, `git diff`, `git log`, `rg`, `grep`, `cat`, `head`, `ls`, etc.) — always allowed.
+  - `unknown`: Arbitrary code/test execution (`cargo test`, `cargo check`, `npm test`, `pytest`, `node`, `dotnet run`) and unrecognized tools. These serve as the trusted developer escape hatch and are permitted when unblocked, but are not falsely classified as read-only.
+  - `known-mutator` with `scope: "broad"`: Workspace-wide mutators (`git checkout .`, `git restore .`, `git reset --hard`, `git clean`, `cargo fmt`, `ruff format`, `black`, `dotnet format`, `mix format`, etc.) or chained commands that change directory (`cd`, `pushd`).
+  - `known-mutator` with `scope: "path"`: Targeted in-place mutators (`prettier --write src/foo.ts`, `sed -i`, `rm file`, `mv file`, `tee file`), output redirections (`> file`, `>> file`), and no-space redirections (`echo x>file.ts`).
 - **Evaluation**:
-  - If no child holds mutable resources or active write fences exist, execution proceeds unhindered.
-  - If an active child mutable hold or write fence exists, any broad mutator, pipe/redirection write, or write overlapping the held path is blocked with a structured, user-actionable message.
+  - If no child holds mutable resources and no active write fences exist, execution proceeds unhindered.
+  - If an active child mutable hold or write fence exists, any broad mutator, pipe/redirection write, or write overlapping the held path (compared using canonical path identities and filesystem case folding) is blocked with a structured, user-actionable message.
 - Root shell remains a trusted developer escape hatch and is not represented as an infallible security sandbox.

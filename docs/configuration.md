@@ -4,13 +4,12 @@ The extension is intentionally usable with no project configuration. Defaults ar
 
 ## Canonical agent directory resolution
 
-The runtime resolves the canonical Pi agent directory using `@earendil-works/pi-coding-agent`'s `getAgentDir()`.
+The runtime resolves the canonical Pi agent directory using `options.agentDir ?? getAgentDir()`.
 Resolution precedence is:
 
 1. `options.agentDir` (explicit programmatic/test override)
-2. `PI_CODING_AGENT_DIR` environment variable (canonical Pi convention)
-3. `PI_AGENT_DIR` environment variable (deprecated legacy fallback)
-4. Default Pi directory (`~/.pi/agent`)
+2. `PI_CODING_AGENT_DIR` environment variable (canonical Pi convention, read natively by `getAgentDir()`)
+3. Default Pi directory (`~/.pi/agent`, canonical fallback in `getAgentDir()`)
 
 This ensures that disposable test directories configured via `PI_CODING_AGENT_DIR` isolate both the root host and all managed child sessions consistently.
 

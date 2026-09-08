@@ -1,6 +1,6 @@
 import { constants as fsConstants } from "node:fs";
 import { access as fsAccess, lstat as fsLstat, mkdir as fsMkdir, open as fsOpen, readFile as fsReadFile, realpath as fsRealpath, readdir as fsReaddir, stat as fsStat } from "node:fs/promises";
-import { basename, delimiter, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
 import {
   createBashToolDefinition,
   createEditToolDefinition,
@@ -18,6 +18,7 @@ import {
 import { FabricError } from "../core/errors.ts";
 import type { FabricStatus } from "../core/types.ts";
 import { classifyRootShellCommand } from "./shell-classifier.ts";
+import { detectCaseInsensitivePaths } from "../broker/server.ts";
 
 export interface WriteAuthorizationClient {
   request<T = unknown>(operation: string, args?: Record<string, unknown>): Promise<T>;
@@ -405,15 +406,30 @@ export async function evaluateRootShellGuard(
     };
   }
 
+  const caseInsensitive = detectCaseInsensitivePaths(options.workspacePath);
+  const fold = (str: string) => (caseInsensitive ? str.toLowerCase() : str);
+
   for (const p of risk.paths) {
-    const normalizedP = p.replace(/\\/g, "/").replace(/^\.\//, "");
+    const rawTarget = isAbsolute(p) ? relative(options.workspacePath, p) : p;
+    let canonicalP = normalize(rawTarget).split(sep).join("/").replace(/^\.\//, "");
+    try {
+      const identity = await resolvePolicyPathIdentity(options.workspacePath, p);
+      if (identity.coordinated && identity.path) {
+        canonicalP = identity.path;
+      }
+    } catch {
+      // Keep normalized target path if unresolvable locally
+    }
+
+    const foldedP = fold(canonicalP);
     const matched = childHolds.find((h) => {
       if (!h.path) return true;
       const normalizedH = h.path.replace(/\\/g, "/").replace(/^\.\//, "");
+      const foldedH = fold(normalizedH);
       return (
-        normalizedP === normalizedH ||
-        normalizedP.startsWith(`${normalizedH}/`) ||
-        normalizedH.startsWith(`${normalizedP}/`)
+        foldedP === foldedH ||
+        foldedP.startsWith(`${foldedH}/`) ||
+        foldedH.startsWith(`${foldedP}/`)
       );
     });
     if (matched) {

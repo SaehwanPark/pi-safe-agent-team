@@ -315,6 +315,7 @@ test("fabric-state: shutdown or unattached root returns inactive", async () => {
   assert.ok(snapshot1);
   assert.equal(snapshot1.active, false);
   assert.equal(snapshot1.quiescent, false);
+  assert.equal(snapshot1.state, "known");
 
   // Stopped
   (runtime as any).root = { agentId: "root-1", ctx: { cwd: "/test/repo" } };
@@ -323,4 +324,113 @@ test("fabric-state: shutdown or unattached root returns inactive", async () => {
   assert.ok(snapshot2);
   assert.equal(snapshot2.active, false);
   assert.equal(snapshot2.quiescent, false);
+  assert.equal(snapshot2.state, "known");
+});
+
+test("fabric-state: attached root with status RPC failure -> active=true, quiescent=false, state='uncertain'", async () => {
+  const runtime = new FabricRuntime({ cwd: "/test/repo", startBroker: false });
+  (runtime as any).root = {
+    agentId: "root-1",
+    ctx: { cwd: "/test/repo", sessionId: "sess-1" },
+  };
+  (runtime as any).status = async () => {
+    throw new Error("Broker connection timeout");
+  };
+
+  const snapshot = await runtime.getFabricStateSnapshot({ cwd: "/test/repo", sessionId: "sess-1" });
+  assert.ok(snapshot);
+  assert.equal(snapshot.active, true);
+  assert.equal(snapshot.quiescent, false);
+  assert.equal(snapshot.state, "uncertain");
+  assert.equal(snapshot.sessionReplacementSafe, false);
+  assert.ok(snapshot.quiescenceReasons.includes("broker_status_query_failed"));
+});
+
+test("fabric-state: root agent busy (running or starting) -> quiescent=false with reason", async () => {
+  const runtime = new FabricRuntime({ cwd: "/test/repo", startBroker: false });
+  (runtime as any).root = {
+    agentId: "root-1",
+    ctx: { cwd: "/test/repo", sessionId: "sess-1" },
+  };
+  (runtime as any).status = async () =>
+    makeMockStatus({
+      agents: [
+        {
+          id: "root-1",
+          depth: 0,
+          role: "root",
+          route: { provider: "openai", model: "gpt-5.6-sol", thinking: "high" },
+          status: "running",
+          lastActivity: Date.now(),
+        },
+      ],
+    });
+
+  const snapshot = await runtime.getFabricStateSnapshot({ cwd: "/test/repo" });
+  assert.ok(snapshot);
+  assert.equal(snapshot.active, true);
+  assert.equal(snapshot.quiescent, false);
+  assert.equal(snapshot.sessionReplacementSafe, false);
+  assert.ok(snapshot.quiescenceReasons.includes("root_agent_active_or_running"));
+});
+
+test("fabric-state: canonical snapshot includes activeTasks, mutableResources, and activeWriteFences", async () => {
+  const runtime = new FabricRuntime({ cwd: "/test/repo", startBroker: false });
+  (runtime as any).root = {
+    agentId: "root-1",
+    ctx: { cwd: "/test/repo", sessionId: "sess-1" },
+  };
+  (runtime as any).status = async () =>
+    makeMockStatus({
+      tasks: [
+        {
+          id: "task-100",
+          creator: "root-1",
+          description: "Analyze code",
+          status: "active",
+          owner: "child-1",
+          dependencies: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      ],
+      resources: [
+        {
+          id: "res-100",
+          kind: "file",
+          path: "src/main.ts",
+          version: 1,
+          owner: "child-1",
+          grants: {},
+          sharedHolds: [],
+          mutableHold: {
+            leaseId: "lease-100",
+            agentId: "child-1",
+            mode: "mutable",
+            acquiredAt: Date.now(),
+            expiresAt: Date.now() + 30000,
+            lastHeartbeat: Date.now(),
+            leaseMs: 30000,
+          },
+          waiters: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      ],
+      activeFences: 2,
+    });
+
+  const snapshot = await runtime.getFabricStateSnapshot({ cwd: "/test/repo" });
+  assert.ok(snapshot);
+  assert.equal(snapshot.active, true);
+  assert.equal(snapshot.quiescent, false);
+  assert.equal(snapshot.state, "known");
+  assert.equal(snapshot.activeWriteFences, 2);
+  assert.equal(snapshot.activeTasks.length, 1);
+  assert.equal(snapshot.activeTasks[0].id, "task-100");
+  assert.equal(snapshot.activeTasks[0].owner, "child-1");
+  assert.equal(snapshot.mutableResources.length, 1);
+  assert.equal(snapshot.mutableResources[0].id, "res-100");
+  assert.equal(snapshot.mutableResources[0].path, "src/main.ts");
+  assert.equal(snapshot.mutableResources[0].holder, "child-1");
 });
