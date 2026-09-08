@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+- **Canonical Agent Directory Resolution**: Resolved agent directory via `@earendil-works/pi-coding-agent`'s `getAgentDir()` honoring `PI_CODING_AGENT_DIR` uniformly for root and all managed children, deprecating legacy `PI_AGENT_DIR`. Added full-isolation test verifying no state leaks into default `~/.pi/agent`.
+- **Extension Interop Registry & Fabric State Provider**: Registered `safe-agent-team.fabric-state.v1` in `Symbol.for("pi.extension-interop.v1")`, providing deterministic and conservative quiescence signals (`quiescent: boolean`) for companion extensions like `local-context-manager`.
+- **Embedded Context Integration**: Discovered and consumed `local-context-manager.embedded-context.v1` inside `ManagedChild` to apply adaptive output reduction and compaction to child tool outputs while strictly preserving `noExtensions: true`, with soft degradation to `native` context management on any provider failure.
+- **Centralized Root Message Delivery Policy**: Implemented table-driven delivery in `src/pi/delivery.ts` (`classifyRootDelivery`), preventing routine background `progress` and `inform` messages from waking the root model turn while guaranteeing immediate turn wakes for `clarification`, `escalation`, `blocked`, `agent_failed`, and `task_result`.
+- **Root Shell Mutator Preflight Guard**: Intercepted root `bash` execution before process spawn using `classifyRootShellCommand`, blocking broad mutators (`git checkout`, `git restore`, `rm -rf`, `prettier --write`, `sed -i`, `ruff format`, `black`, pipes/redirections) while active child mutable holds or write fences exist in the workspace.
+- **Root/Child Capability Asymmetry Guidance**: Added explicit guidance in `agent_spawn` tool descriptions, bootstrap instructions, and `before_agent_start` indicating that external web, browser, MCP, and computer-use tools are root capabilities not inherited by managed children, directing children to request external info via parent clarification.
+- **Enhanced `/agents` Diagnostics**: Surfaced child model route provenance, workspace mode, context mode (`native` vs `lcm-embedded`), and active write fences.
+
 ## 0.2.1
 
 - Fixed Pi root reattachment by forwarding the persisted reconnect credential during root registration, eliminating the recurring `requires its reconnect credential` startup error.

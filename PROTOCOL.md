@@ -115,6 +115,31 @@ Guarantees:
 
 Acknowledgement means the Pi host accepted the message into its session queue. It does not mean the model read or followed it. A model response is not a broker acknowledgement.
 
+### Root message delivery policy
+
+When messages are delivered to the root session, `classifyRootDelivery` routes them according to urgency and type to avoid unnecessary model turn churn:
+
+| Message Type | Delivery Mode | Triggers Root Turn | Description |
+| --- | --- | :---: | --- |
+| `progress` | `appendOnly` | No | Background status updates appended to conversation context |
+| `inform` | `appendOnly` | No | Informational notices appended to conversation context |
+| `clarification` | `steer` | **Yes** | Child asks a blocking question requiring parent answer |
+| `decision_request` | `steer` | **Yes** | Child requests an explicit decision |
+| `escalation` | `steer` | **Yes** | Child escalates an unresolvable obstacle |
+| `blocked` | `steer` | **Yes** | Child is blocked on an external factor |
+| `request` | `steer` | **Yes** | Correlated request |
+| `response` | `steer` | **Yes** | Correlated response |
+| `resource_request` | `steer` | **Yes** | Child requests resource access |
+| `resource_granted` | `appendOnly` / `steer` | Conditional | Triggers turn only if resolving a pending root request |
+| `result` | `steer` | **Yes** | Child emits a major result |
+| `task_result` | `steer` | **Yes** | Child completes an assigned task with structured output |
+| `handoff` | `steer` | **Yes** | Work handoff notification |
+| `agent_failed` | `steer` | **Yes** | Child failed or crashed |
+| `cancel` | `steer` | **Yes** | Child cancellation notice |
+| `steer` | `steer` | **Yes** | Explicit steering directive |
+
+Messages with priority `"urgent"` always bypass default mode and trigger an immediate root model turn (`steer`, `triggerTurn: true`). Non-triggering messages remain durable in the session context and are processed on the root's next natural turn.
+
 ## Clarification flow
 
 A child calls `message.send` with a request type and `expectsReply: true`:
@@ -227,3 +252,58 @@ CHILD_SESSION_FAILURE
 ```
 
 Error details are diagnostic metadata, not authority. Clients must not convert a failed operation into a guessed fallback operation.
+
+## Extension Interop Protocol
+
+Cross-extension coordination uses a process-local symbol registry accessible via `Symbol.for("pi.extension-interop.v1")`. Extensions do not directly import each other.
+
+### `safe-agent-team.fabric-state.v1`
+
+Exported by safe-agent-team to inform companion extensions of fabric quiescence:
+
+```ts
+interface FabricStateSnapshotV1 {
+  version: 1;
+  active: boolean;
+  quiescent: boolean;
+  rootSessionId: string;
+  cwd: string;
+  activeAgents: number;
+  runningAgents: number;
+  nonTerminalChildTasks: number;
+  activeMutableHolds: number;
+  activeWriteFences: number;
+  pendingRequestsToRoot: number;
+  quiescenceReasons: string[];
+}
+```
+
+Quiescence rules are strictly conservative:
+- Root must be active and not currently executing a turn.
+- No child agent may be in `running` state.
+- All child tasks must have reached terminal state (`completed`, `failed`, `cancelled`).
+- Zero active mutable borrows or write fences across the entire fabric.
+- Zero unresolved requests directed to the root.
+
+### `local-context-manager.embedded-context.v1`
+
+When registered by a context manager, safe-agent-team's `ManagedChild` requests an embedded context manager:
+
+- Wraps tool outputs with adaptive compaction and token budgeting.
+- Observes turn boundaries (`onTurnStart`, `onTurnSettled`).
+- Runs strictly inside the managed child session without ambient extension loading (`noExtensions: true`).
+- Fails soft: any error or throwing provider drops back to `native` context management without crashing the child agent.
+
+## Root Shell Mutator Preflight Guard
+
+The root `bash` tool call is preflighted in `index.ts` using `classifyRootShellCommand`:
+
+- **Classification**:
+  - `read-only`: Read-only queries (`git status`, `git diff`, `cargo test`, `rg`, `grep`, `cat`, etc.) — always allowed.
+  - `known-mutator` with `scope: "broad"`: Global mutators (`git checkout .`, `git restore .`, `rm -rf`, `prettier --write`, `sed -i`, `ruff format`, `black`, etc.) or pipe/redirection writes (`|`, `>`, `>>`).
+  - `known-mutator` with `scope: "path"`: Mutations targeting specific declared files (`prettier --write src/foo.ts`).
+  - `unknown`: Unrecognized tools.
+- **Evaluation**:
+  - If no child holds mutable resources or active write fences exist, execution proceeds unhindered.
+  - If an active child mutable hold or write fence exists, any broad mutator, pipe/redirection write, or write overlapping the held path is blocked with a structured, user-actionable message.
+- Root shell remains a trusted developer escape hatch and is not represented as an infallible security sandbox.

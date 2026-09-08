@@ -180,7 +180,13 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
     {
       name: "agent_spawn",
       label: "Agent spawn",
-      description: "Ask the coordinator to create a bounded child agent. The child starts independently; this call does not wait for its model turn.",
+      description: "Ask the coordinator to create a bounded child agent. Managed children run in a constrained tool environment and do not inherit arbitrary root extensions. Delegate repository analysis/coding/testing directly. For root-only web/browser/MCP/computer-use work, gather the external information at the root and send the findings to the child unless an explicit brokered capability is available.",
+      promptSnippet: "spawn bounded child agent",
+      promptGuidelines: [
+        "Managed children run in a constrained tool environment and do not inherit arbitrary root extensions. Delegate repository analysis/coding/testing directly.",
+        "For root-only web/browser/MCP/computer-use work, gather the external information at the root and send the findings to the child unless an explicit brokered capability is available.",
+        "Do not infer child capabilities from root tool availability.",
+      ],
       parameters: Type.Object({
         role: Type.Optional(Type.String()),
         provider: Type.Optional(Type.String()),

@@ -16,6 +16,8 @@ import {
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import { FabricError } from "../core/errors.ts";
+import type { FabricStatus } from "../core/types.ts";
+import { classifyRootShellCommand } from "./shell-classifier.ts";
 
 export interface WriteAuthorizationClient {
   request<T = unknown>(operation: string, args?: Record<string, unknown>): Promise<T>;
@@ -361,6 +363,70 @@ export async function evaluateRootWriteGuard(options: RootWriteGuardOptions, too
   }
   if (decision?.allowed === true) return decision.fenceId ? { fenceId: decision.fenceId } : undefined;
   return { block: true, reason: `safe-agents root write guard: ${decision?.reason ?? `a coordinated resource hold blocks writing ${path}`}` };
+}
+
+export async function evaluateRootShellGuard(
+  options: { client: WriteAuthorizationClient; workspacePath: string },
+  input: unknown,
+): Promise<RootWriteGuardOutcome | undefined> {
+  const command = (input as { command?: unknown } | undefined)?.command;
+  if (typeof command !== "string" || command.trim().length === 0) return undefined;
+
+  const risk = classifyRootShellCommand(command);
+  if (risk.kind === "read-only" || risk.kind === "unknown") {
+    return undefined;
+  }
+
+  let status: FabricStatus | undefined;
+  try {
+    status = await options.client.request<FabricStatus>("fabric.status", {});
+  } catch (error) {
+    return {
+      block: true,
+      reason: `safe-agents could not coordinate shell command \`${command.trim()}\`: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  const childHolds = status.resources.filter(
+    (r) => r.mutableHold && r.mutableHold.agentId !== status?.rootId,
+  );
+  const activeFences = status.activeFences ?? 0;
+
+  if (childHolds.length === 0 && activeFences === 0) {
+    return undefined;
+  }
+
+  if (risk.scope === "broad" || !risk.paths || risk.paths.length === 0) {
+    const holder = childHolds[0]?.mutableHold?.agentId ?? "a child agent";
+    const res = childHolds[0]?.path ?? childHolds[0]?.id ?? "workspace";
+    return {
+      block: true,
+      reason: `safe-agents blocked \`${command.trim()}\` while child ${holder} holds mutable resource ${res}. Wait for/release the hold, or explicitly perform the operation after coordinated child work completes.`,
+    };
+  }
+
+  for (const p of risk.paths) {
+    const normalizedP = p.replace(/\\/g, "/").replace(/^\.\//, "");
+    const matched = childHolds.find((h) => {
+      if (!h.path) return true;
+      const normalizedH = h.path.replace(/\\/g, "/").replace(/^\.\//, "");
+      return (
+        normalizedP === normalizedH ||
+        normalizedP.startsWith(`${normalizedH}/`) ||
+        normalizedH.startsWith(`${normalizedP}/`)
+      );
+    });
+    if (matched) {
+      const holder = matched.mutableHold?.agentId ?? "a child agent";
+      const res = matched.path ?? matched.id;
+      return {
+        block: true,
+        reason: `safe-agents blocked \`${command.trim()}\` while child ${holder} holds mutable resource ${res}. Wait for/release the hold, or explicitly perform the operation after coordinated child work completes.`,
+      };
+    }
+  }
+
+  return undefined;
 }
 
 export function workspaceRelativePath(workspacePath: string, targetPath: string): string {

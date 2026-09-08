@@ -99,6 +99,8 @@ export interface AgentRecord {
   authToken?: string;
   /** True only for a liveness recovery window after a broker restart. */
   reconnectable?: boolean;
+  /** Context management mode (e.g. lcm-embedded or native). */
+  contextMode?: string;
 }
 
 export interface TaskResult {
@@ -271,6 +273,8 @@ export interface AgentSummary {
   status: AgentStatus;
   workspace?: WorkspaceInfo;
   lastActivity: number;
+  contextMode?: string;
+  capabilities?: AgentCapabilities;
 }
 
 export interface FabricStatus {
@@ -282,6 +286,7 @@ export interface FabricStatus {
   recentMessages: AgentMessage[];
   runningChildren: number;
   config: FabricConfig;
+  activeFences?: number;
 }
 
 export type CoordinatorEvent =
@@ -336,7 +341,12 @@ export function cloneCapabilities(capabilities: AgentCapabilities): AgentCapabil
 }
 
 export function cloneAgent(agent: AgentRecord): AgentRecord {
-  return { ...agent, capabilities: cloneCapabilities(agent.capabilities), workspace: agent.workspace ? { ...agent.workspace } : undefined };
+  return {
+    ...agent,
+    capabilities: cloneCapabilities(agent.capabilities),
+    workspace: agent.workspace ? { ...agent.workspace } : undefined,
+    contextMode: agent.contextMode,
+  };
 }
 
 export function cloneTask(task: TaskRecord): TaskRecord {

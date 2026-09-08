@@ -2,12 +2,24 @@
 
 The extension is intentionally usable with no project configuration. Defaults are conservative and can be supplied to `FabricRuntime` or a future role/config loader.
 
+## Canonical agent directory resolution
+
+The runtime resolves the canonical Pi agent directory using `@earendil-works/pi-coding-agent`'s `getAgentDir()`.
+Resolution precedence is:
+
+1. `options.agentDir` (explicit programmatic/test override)
+2. `PI_CODING_AGENT_DIR` environment variable (canonical Pi convention)
+3. `PI_AGENT_DIR` environment variable (deprecated legacy fallback)
+4. Default Pi directory (`~/.pi/agent`)
+
+This ensures that disposable test directories configured via `PI_CODING_AGENT_DIR` isolate both the root host and all managed child sessions consistently.
+
 ## State layout
 
 By default:
 
 ```text
-PI_AGENT_DIR/safe-agents/<sha256(cwd)[0:24]>/
+<agentDir>/safe-agents/<sha256(cwd)[0:24]>/
   events.jsonl       # broker transaction journal
   broker.lock        # local ownership lock
   broker.sock        # POSIX endpoint; named pipe on Windows
@@ -16,7 +28,7 @@ PI_AGENT_DIR/safe-agents/<sha256(cwd)[0:24]>/
   worktrees/<id>/    # managed Git worktrees when selected
 ```
 
-`PI_AGENT_DIR` may point at the same Pi agent directory used by the host. `FabricRuntime` options can override `cwd`, `stateDirectory`, `endpoint`, `agentDir`, `fabricId`, and whether this process starts the broker or joins an existing endpoint.
+`FabricRuntime` options can override `cwd`, `stateDirectory`, `endpoint`, `agentDir`, `fabricId`, and whether this process starts the broker or joins an existing endpoint.
 
 ## Limits
 
