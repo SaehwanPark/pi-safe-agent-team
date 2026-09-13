@@ -10,7 +10,7 @@ import { FabricError, assertCondition } from "./errors.ts";
 import { cloneAgent, type AgentCapabilities, type AgentRecord, type AgentStatus, type DispatchResult, type FabricConfig, type MessageType, type ResourcePermission, type TaskRecord } from "./types.ts";
 
 export const TERMINAL_STATUSES = new Set<AgentStatus>(["completed", "failed", "cancelled"]);
-export const ACTIVE_STATUSES = new Set<AgentStatus>(["starting", "ready", "running", "waiting", "blocked"]);
+export const ACTIVE_STATUSES = new Set<AgentStatus>(["starting", "ready", "running", "waiting", "blocked", "draining"]);
 export const ALL_MESSAGE_TYPES = new Set<MessageType>([
   "inform",
   "clarification",

@@ -43,7 +43,8 @@ Current defaults:
 | Setting | Default |
 | --- | ---: |
 | `maxDepth` | 4 |
-| `maxChildrenPerAgent` | 8 |
+| `maxChildrenPerAgent` | 8 live direct children |
+| `maxChildrenCreatedPerAgent` | unset (no lifetime ceiling) |
 | `maxTotalAgents` | 32 active |
 | `maxConcurrentAgents` | 8 running turns |
 | `maxMailboxMessages` | 512 pending per recipient |
@@ -70,7 +71,7 @@ The authority fields are coordinator state. Role prompt text is guidance only.
 
 ## Workspace policy
 
-Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Cleanup is explicit; a dirty artifact requires user confirmation/force through a future cleanup command.
+Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Clean worktrees are reclaimed after a completed child shutdown; dirty or uncertain artifacts are retained for inspection and require user confirmation/force through a future cleanup command.
 
 ## Broker startup
 
@@ -78,7 +79,7 @@ Normally the first root extension instance starts the local broker; later instan
 
 ## Diagnostics
 
-Use `/agents`, `/agents tree`, `/agents tasks`, `/agents resources`, `/agents messages`, and `/agents inbox`. For tests and embedding, inspect structured `FabricError.code` values rather than matching human messages. Important categories include `CAPABILITY_DENIED`, `AGENT_LIMIT_REACHED`, `MAILBOX_FULL`, `RESOURCE_CONFLICT`, `MODEL_NOT_FOUND`, `WORKSPACE_FAILURE`, and `BROKER_UNAVAILABLE`.
+Use `/agents`, `/agents tree`, `/agents tasks`, `/agents resources`, `/agents messages`, and `/agents inbox`. `/agents stop` performs a bounded graceful descendant drain; `/agents stop --budget` captures model-free handoff state for quota emergencies; `/agents stop --now` uses the shortest best-effort deadline. For tests and embedding, inspect structured `FabricError.code` values rather than matching human messages. Important categories include `CAPABILITY_DENIED`, `AGENT_LIMIT_REACHED`, `MAILBOX_FULL`, `RESOURCE_CONFLICT`, `MODEL_NOT_FOUND`, `WORKSPACE_FAILURE`, and `BROKER_UNAVAILABLE`.
 
 ## Isolated smoke modes
 

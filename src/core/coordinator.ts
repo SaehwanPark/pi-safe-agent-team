@@ -162,6 +162,7 @@ export class Coordinator {
     this.caseFoldPaths = this.config.caseInsensitivePaths ?? process.platform === "win32";
     assertCondition(this.config.maxDepth >= 0, "INVALID_ARGUMENT", "maxDepth must be non-negative");
     assertCondition(this.config.maxChildrenPerAgent >= 0, "INVALID_ARGUMENT", "maxChildrenPerAgent must be non-negative");
+    assertCondition(this.config.maxChildrenCreatedPerAgent === undefined || this.config.maxChildrenCreatedPerAgent >= 0, "INVALID_ARGUMENT", "maxChildrenCreatedPerAgent must be non-negative");
     assertCondition(this.config.maxTotalAgents > 0, "INVALID_ARGUMENT", "maxTotalAgents must be positive");
     assertCondition(this.config.maxConcurrentAgents > 0, "INVALID_ARGUMENT", "maxConcurrentAgents must be positive");
     assertCondition(this.config.maxMailboxMessages > 0, "INVALID_ARGUMENT", "maxMailboxMessages must be positive");
@@ -199,6 +200,8 @@ export class Coordinator {
         return this.withEvents(events, this.configureChild(this.requireActor(actorId).id, args, events));
       case "agent.begin_turn":
         return this.withEvents(events, this.beginTurn(this.requireActor(actorId).id, events));
+      case "agent.drain":
+        return this.withEvents(events, this.drainAgent(this.requireActor(actorId).id, parseString(args.agentId ?? actorId, "agentId"), parseOptionalString(args.reason, "reason", 2048), events));
       case "agent.end_turn":
         return this.withEvents(events, this.endTurn(this.requireBoundAgent(actorId).id, args, events));
       case "agent.heartbeat":
@@ -387,7 +390,7 @@ export class Coordinator {
     assertCondition(this.reservedAgentCount() < this.config.maxTotalAgents, "AGENT_LIMIT_REACHED", "The fabric has reached maxTotalAgents (slots awaiting reconnecting agents stay reserved)");
     if (parent) {
       assertCondition(parent.rootId === this.rootId, "IDENTITY_CONFLICT", "Parent belongs to another fabric");
-      assertCondition(parent.childrenCreated < this.config.maxChildrenPerAgent, "AGENT_LIMIT_REACHED", `Agent ${parent.id} reached maxChildrenPerAgent`);
+      this.assertChildCapacity(parent);
       assertCondition(depth === parent.depth + 1, "IDENTITY_CONFLICT", "Child depth must be parent depth plus one");
     }
 
@@ -426,8 +429,9 @@ export class Coordinator {
     const parent = this.requireActor(actorId);
     assertCondition(parent.capabilities.maySpawn, "CAPABILITY_DENIED", `Agent ${actorId} cannot spawn children`);
     assertCondition(!isTerminal(parent.status), "LIFECYCLE_CONFLICT", `Agent ${actorId} is terminal`);
+    assertCondition(parent.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot spawn children`);
     assertCondition(parent.depth < this.config.maxDepth, "AGENT_LIMIT_REACHED", "Maximum recursion depth reached");
-    assertCondition(parent.childrenCreated < this.config.maxChildrenPerAgent, "AGENT_LIMIT_REACHED", "Maximum child count reached");
+    this.assertChildCapacity(parent);
     assertCondition(this.reservedAgentCount() < this.config.maxTotalAgents, "AGENT_LIMIT_REACHED", "The fabric has reached maxTotalAgents (slots awaiting reconnecting agents stay reserved)");
     const requestedCapabilities = input.capabilities ?? {};
     const childId = this.idFactory("agent");
@@ -473,6 +477,7 @@ export class Coordinator {
 
   private configureChild(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): AgentRecord {
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot configure children`);
     const target = this.requireAgent(parseString(args.agentId, "agentId"));
     assertCondition(actor.capabilities.maySpawn, "CAPABILITY_DENIED", `Agent ${actorId} cannot configure children`);
     assertCondition(this.canControl(actor, target) && target.parentId === actorId, "CAPABILITY_DENIED", `Agent ${actorId} cannot configure child ${target.id}`);
@@ -511,6 +516,7 @@ export class Coordinator {
     const agent = this.requireAgent(actorId);
     if (agent.status === "running") throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} is already running`);
     if (isTerminal(agent.status)) throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} is terminal`);
+    assertCondition(agent.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot start another turn`);
     if (this.runningAgentCount() >= this.config.maxConcurrentAgents) {
       return { started: false, reason: "maxConcurrentAgents reached" };
     }
@@ -533,6 +539,15 @@ export class Coordinator {
     // task, deterministic task state controls whether its lifecycle may become
     // terminal; an uncompleted task can only leave the worker ready.
     const effectiveStatus = this.statusAfterTask(agent, requested);
+    if (effectiveStatus === "completed") this.assertNoLiveDescendants(agent.id);
+
+    // Tear down a failed or cancelled subtree before the parent terminal
+    // update becomes observable. This preserves the no-orphan invariant for
+    // readers that process the emitted events in order.
+    if (effectiveStatus === "failed" || effectiveStatus === "cancelled") {
+      this.cancelDescendants(agent.id, effectiveStatus === "cancelled" ? "Parent was cancelled" : "Parent failed", events);
+    }
+
     const next = cloneAgent(agent);
     this.transitionStatus(next, effectiveStatus, parseOptionalString(args.statusReason, "statusReason", 2048));
     if (isTerminal(effectiveStatus)) next.reconnectable = false;
@@ -611,22 +626,57 @@ export class Coordinator {
     assertCondition(actor.id === target.id || actor.capabilities.maySpawn, "CAPABILITY_DENIED", `Agent ${actorId} cannot cancel descendants`);
     assertCondition(this.canControl(actor, target), "CAPABILITY_DENIED", `Agent ${actorId} cannot cancel ${targetId}`);
     const cancelled: AgentId[] = [];
+    this.cancelSubtree(target, `Cancelled by ${actorId}`, events, cancelled);
+    return { cancelled };
+  }
+
+  /** Enter a bounded, non-terminal shutdown phase for a subtree. */
+  private drainAgent(actorId: AgentId, targetId: AgentId, reason: string | undefined, events: CoordinatorEvent[]): { draining: AgentId[] } {
+    const actor = this.requireActor(actorId);
+    const target = this.requireAgent(targetId);
+    assertCondition(actor.id === target.id || actor.capabilities.maySpawn, "CAPABILITY_DENIED", `Agent ${actorId} cannot drain descendants`);
+    assertCondition(this.canControl(actor, target), "CAPABILITY_DENIED", `Agent ${actorId} cannot drain ${targetId}`);
+    const draining: AgentId[] = [];
     const visit = (agent: AgentRecord): void => {
       for (const child of this.agents.values()) if (child.parentId === agent.id) visit(child);
-      if (isTerminal(agent.status) && !agent.reconnectable) return;
+      if (isTerminal(agent.status) || agent.status === "draining") return;
       const next = cloneAgent(agent);
-      next.status = "cancelled";
-      next.reconnectable = false;
-      next.statusReason = `Cancelled by ${actorId}`;
+      this.transitionStatus(next, "draining", reason ?? `Draining by ${actorId}`);
       next.lastActivity = this.clock();
       this.agents.set(next.id, next);
       events.push({ type: "agent_updated", agent: cloneAgent(next) });
-      this.cancelRequestsFor(next.id, "cancelled", "Agent was cancelled", events);
-      this.releaseAgentRuntime(next.id, "cancelled", events);
-      cancelled.push(next.id);
+      draining.push(next.id);
     };
     visit(target);
-    return { cancelled };
+    return { draining };
+  }
+
+  private assertNoLiveDescendants(agentId: AgentId): void {
+    const live = [...this.agents.values()].filter((candidate) => !isTerminal(candidate.status) && this.isAncestorAgent(agentId, candidate.id));
+    assertCondition(live.length === 0, "LIFECYCLE_CONFLICT", `Agent ${agentId} cannot complete with ${live.length} live descendant${live.length === 1 ? "" : "s"}; drain or cancel them first`);
+  }
+
+  private cancelDescendants(parentId: AgentId, reason: string, events: CoordinatorEvent[]): AgentId[] {
+    const cancelled: AgentId[] = [];
+    for (const child of this.agents.values()) {
+      if (child.parentId === parentId) this.cancelSubtree(child, reason, events, cancelled);
+    }
+    return cancelled;
+  }
+
+  private cancelSubtree(agent: AgentRecord, reason: string, events: CoordinatorEvent[], cancelled: AgentId[]): void {
+    for (const child of this.agents.values()) if (child.parentId === agent.id) this.cancelSubtree(child, reason, events, cancelled);
+    if (isTerminal(agent.status) && !agent.reconnectable) return;
+    const next = cloneAgent(agent);
+    next.status = "cancelled";
+    next.reconnectable = false;
+    next.statusReason = reason;
+    next.lastActivity = this.clock();
+    this.agents.set(next.id, next);
+    events.push({ type: "agent_updated", agent: cloneAgent(next) });
+    this.cancelRequestsFor(next.id, "cancelled", "Agent was cancelled", events);
+    this.releaseAgentRuntime(next.id, "cancelled", events);
+    cancelled.push(next.id);
   }
 
   private getAgentStatus(actorId: AgentId, requestedId: string | undefined, scope: unknown): unknown {
@@ -735,6 +785,7 @@ export class Coordinator {
 
   private createTask(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): DispatchResult<TaskRecord> {
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot create tasks`);
     const description = parseString(args.description, "description", 16 * 1024);
     if (args.dependencies !== undefined) assertCondition(Array.isArray(args.dependencies), "INVALID_ARGUMENT", "dependencies must be an array");
     const dependencies = (args.dependencies as unknown[] | undefined)?.map((id) => parseString(id, "dependency")) ?? [];
@@ -777,6 +828,7 @@ export class Coordinator {
 
   private claimTask(actorId: AgentId, taskId: TaskId, events: CoordinatorEvent[]): TaskRecord {
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot claim tasks`);
     const task = this.requireTask(taskId);
     if (task.owner && isTerminal(this.requireAgent(task.owner).status)) {
       task.owner = undefined;
@@ -888,6 +940,7 @@ export class Coordinator {
 
   private defineResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot define resources`);
     assertCondition(actor.capabilities.mayWriteRepo || actor.capabilities.mayTransferOwnership, "CAPABILITY_DENIED", `Agent ${actorId} cannot define resources`);
     const id = parseString(args.resourceId, "resourceId", 1024);
     const kind = parseString(args.kind ?? "resource", "kind", 128);
@@ -942,6 +995,7 @@ export class Coordinator {
   private grantResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const resource = this.requireResource(parseString(args.resourceId, "resourceId"));
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot grant resources`);
     assertCondition(this.canManageResource(actor, resource), "CAPABILITY_DENIED", `Agent ${actorId} cannot grant ${resource.id}`);
     const targetId = parseString(args.agentId, "agentId");
     const target = this.requireAgent(targetId);
@@ -957,6 +1011,7 @@ export class Coordinator {
   private claimResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const resource = this.requireResource(parseString(args.resourceId, "resourceId"));
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot claim resources`);
     assertCondition(this.hasPermission(resource, actorId, "write") || actor.capabilities.mayTransferOwnership, "CAPABILITY_DENIED", `Agent ${actorId} cannot claim ${resource.id}`);
     if (resource.owner && resource.owner !== actorId) {
       const owner = this.requireAgent(resource.owner);
@@ -985,6 +1040,7 @@ export class Coordinator {
   private borrowResource(actorId: AgentId, input: ResourceBorrowArgs, events: CoordinatorEvent[]): { status: "granted" | "waiting"; leaseId?: string; requestId?: RequestId; resource: ResourceRecord } {
     const resource = this.requireResource(parseString(input.resourceId, "resourceId"));
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot borrow resources`);
     const mode = input.mode;
     assertCondition(mode === "shared" || mode === "mutable", "INVALID_ARGUMENT", "mode must be shared or mutable");
     assertCondition(this.hasPermission(resource, actorId, mode === "mutable" ? "write" : "read"), "CAPABILITY_DENIED", `Agent ${actorId} has no ${mode} permission for ${resource.id}`);
@@ -1017,6 +1073,7 @@ export class Coordinator {
   private transferResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const resource = this.requireResource(parseString(args.resourceId, "resourceId"));
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot transfer resources`);
     const targetId = parseString(args.agentId, "agentId");
     const target = this.requireAgent(targetId);
     assertCondition(!isTerminal(target.status), "AGENT_NOT_FOUND", `Agent ${targetId} is not active`);
@@ -1384,11 +1441,12 @@ export class Coordinator {
     }
     if (isTerminal(agent.status)) throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${agent.id} is already ${agent.status}`);
     const valid: Record<AgentStatus, AgentStatus[]> = {
-      starting: ["ready", "failed", "cancelled"],
-      ready: ["running", "waiting", "blocked", "completed", "failed", "cancelled"],
-      running: ["ready", "waiting", "blocked", "completed", "failed", "cancelled"],
-      waiting: ["ready", "running", "blocked", "completed", "failed", "cancelled"],
-      blocked: ["ready", "running", "waiting", "completed", "failed", "cancelled"],
+      starting: ["ready", "draining", "failed", "cancelled"],
+      ready: ["running", "waiting", "blocked", "draining", "completed", "failed", "cancelled"],
+      running: ["ready", "waiting", "blocked", "draining", "completed", "failed", "cancelled"],
+      waiting: ["ready", "running", "blocked", "draining", "completed", "failed", "cancelled"],
+      blocked: ["ready", "running", "waiting", "draining", "completed", "failed", "cancelled"],
+      draining: ["completed", "failed", "cancelled"],
       completed: [],
       failed: [],
       cancelled: [],
@@ -1869,6 +1927,17 @@ export class Coordinator {
    */
   private reservedAgentCount(): number {
     return [...this.agents.values()].filter((agent) => ACTIVE_STATUSES.has(agent.status) || agent.reconnectable === true).length;
+  }
+
+  private liveChildrenCount(parentId: AgentId): number {
+    return [...this.agents.values()].filter((agent) => agent.parentId === parentId && !isTerminal(agent.status)).length;
+  }
+
+  private assertChildCapacity(parent: AgentRecord): void {
+    assertCondition(this.liveChildrenCount(parent.id) < this.config.maxChildrenPerAgent, "AGENT_LIMIT_REACHED", `Agent ${parent.id} reached maxChildrenPerAgent live-child limit`);
+    if (this.config.maxChildrenCreatedPerAgent !== undefined) {
+      assertCondition(parent.childrenCreated < this.config.maxChildrenCreatedPerAgent, "AGENT_LIMIT_REACHED", `Agent ${parent.id} reached maxChildrenCreatedPerAgent`);
+    }
   }
 
   private runningAgentCount(): number {

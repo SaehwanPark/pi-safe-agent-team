@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Box, Text } from "@earendil-works/pi-tui";
 import { FabricError, asFabricError } from "./src/core/errors.ts";
 import type { AgentMessage, FabricStatus } from "./src/core/types.ts";
-import { FabricRuntime } from "./src/pi/runtime.ts";
+import { FabricRuntime, type DescendantShutdownMode } from "./src/pi/runtime.ts";
 import { LifecycleQueue } from "./src/pi/lifecycle.ts";
 import { createCoordinationTools } from "./src/pi/tools.ts";
 import { classifyRootDelivery } from "./src/pi/delivery.ts";
@@ -15,6 +15,7 @@ export { BrokerClient } from "./src/broker/client.ts";
 export { BrokerServer, startBroker } from "./src/broker/server.ts";
 export { Journal } from "./src/broker/journal.ts";
 export { FabricRuntime, ManagedChild, taskAwareTurnStatus } from "./src/pi/runtime.ts";
+export type { DescendantShutdownMode, HandoffSnapshot } from "./src/pi/runtime.ts";
 export { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootShellGuard, evaluateRootWriteGuard, workspaceRelativePath } from "./src/pi/guards.ts";
 export { classifyRootShellCommand, type RootShellRisk } from "./src/pi/shell-classifier.ts";
 export { classifyRootDelivery, type RootDeliveryDecision, type RootDeliveryContext } from "./src/pi/delivery.ts";
@@ -63,6 +64,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
 
   const rootDeliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
   let rootDeliveryTail: Promise<void> = Promise.resolve();
+  let rootDeliveryEpoch = 0;
   const lifecycleQueue = new LifecycleQueue();
 
   const enqueueLifecycle = (generation: number, operation: () => Promise<void>): Promise<void> =>
@@ -86,11 +88,13 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     ctx.ui.notify(`safe-agents: ${fabricError.message}`, severity);
   };
 
-  const rootDelivery = (api: ExtensionAPI) => (message: AgentMessage): void => {
+  const rootDelivery = (api: ExtensionAPI, deliveryEpoch = rootDeliveryEpoch) => (message: AgentMessage): void => {
+    const epoch = deliveryEpoch;
     const state = rootDeliveryStates.get(message.id);
     if (state === "acknowledged" || state === "delivering") return;
     if (state === "accepted") {
-      void runtime.request("message.ack", { messageId: message.id }).then(() => rememberRootMessage(message.id, "acknowledged")).catch(() => undefined);
+      if (epoch !== rootDeliveryEpoch) return;
+      void runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs).then(() => rememberRootMessage(message.id, "acknowledged")).catch(() => undefined);
       return;
     }
     rootDeliveryStates.set(message.id, "delivering");
@@ -101,18 +105,21 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     // root model in the reverse order.
     rootDeliveryTail = rootDeliveryTail.then(async () => {
       try {
+        if (epoch !== rootDeliveryEpoch) return;
         const content = `[${message.type} from ${message.from}]\n${message.body}`;
         const decision = classifyRootDelivery(message);
         await api.sendMessage({ customType: "safe-agents.message", content, display: decision.display, details: message }, {
           triggerTurn: decision.triggerTurn,
           deliverAs: decision.deliverAs,
         });
+        if (epoch !== rootDeliveryEpoch) return;
         rememberRootMessage(message.id, "accepted");
-        await runtime.request("message.ack", { messageId: message.id });
+        await runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs);
         rememberRootMessage(message.id, "acknowledged");
       } catch {
         rootDeliveryStates.delete(message.id);
       } finally {
+        if (epoch !== rootDeliveryEpoch) rootDeliveryStates.delete(message.id);
         updatePendingDeliveries();
       }
     }).catch(() => undefined);
@@ -155,7 +162,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     if (fenceId === undefined) return undefined;
     pendingRootFences.delete(event.toolCallId);
     runtime.setPendingRootFencesCount(pendingRootFences.size);
-    void runtime.releaseRootFence(fenceId);
+    void runtime.releaseRootFence(fenceId, FabricRuntime.shutdownRpcTimeoutMs);
     return undefined;
   });
 
@@ -172,6 +179,8 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    rootDeliveryEpoch += 1;
+    rootDeliveryTail = Promise.resolve();
     registerInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);
     const generation = lifecycleQueue.beginSession();
     try {
@@ -201,23 +210,44 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     const generation = lifecycleQueue.currentGeneration;
     void enqueueLifecycle(generation, async () => {
       if (!runtime.rootAgentId) return;
+      if (rootSessionEndedWithAbort(ctx)) {
+        await runtime.abortDescendants({ reason: "root-aborted", mode: "budget" });
+      }
       await runtime.request("agent.end_turn", { status: "ready" });
     }).catch((error) => notifyLifecycleFailure(ctx, error, "warning", generation));
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    rootDeliveryEpoch += 1;
+    rootDeliveryTail = Promise.resolve();
+    rootDeliveryStates.clear();
+    runtime.setPendingRootDeliveriesCount(0);
     unregisterInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);
     const pendingLifecycle = lifecycleQueue.shutdown();
     await pendingLifecycle.catch(() => undefined);
+    const pendingFences = [...pendingRootFences.values()];
+    pendingRootFences.clear();
+    runtime.setPendingRootFencesCount(0);
+    await Promise.allSettled(pendingFences.map((fenceId) => runtime.releaseRootFence(fenceId, FabricRuntime.shutdownRpcTimeoutMs)));
     await runtime.stop().catch((error) => notifyLifecycleFailure(ctx, error, "warning"));
   });
 
   pi.registerCommand("agents", {
-    description: "Inspect the safe-agents fabric (status, tree, tasks, resources, messages, inbox)",
+    description: "Inspect or stop the safe-agents fabric (status, tree, tasks, resources, messages, inbox, stop)",
     handler: async (args, ctx) => {
       try {
         await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
         const mode = args.trim() || "status";
+        if (mode === "stop" || mode.startsWith("stop ")) {
+          const requestedMode = mode.slice("stop".length).trim();
+          if (requestedMode !== "" && requestedMode !== "--now" && requestedMode !== "--budget") {
+            throw new FabricError("INVALID_ARGUMENT", "usage: /agents stop [--budget|--now]");
+          }
+          const shutdownMode: DescendantShutdownMode = requestedMode === "--now" ? "now" : requestedMode === "--budget" ? "budget" : "graceful";
+          const snapshots = await runtime.abortDescendants({ reason: `agents-stop:${shutdownMode}`, mode: shutdownMode });
+          ctx.ui.notify(`safe-agents: stopped ${snapshots.length} descendant${snapshots.length === 1 ? "" : "s"} (${shutdownMode}); deterministic handoff captured`, "info");
+          return;
+        }
         if (mode === "inbox") {
           const messages = await runtime.request<AgentMessage[]>("message.inbox", { limit: 50 });
           ctx.ui.notify(messages.length ? messages.map(formatMessage).join("\n\n") : "safe-agents inbox is empty", "info");
@@ -249,6 +279,22 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       }
     },
   });
+}
+
+function rootSessionEndedWithAbort(ctx: ExtensionContext): boolean {
+  const manager = (ctx as ExtensionContext & { sessionManager?: { getEntries?: () => unknown[] } }).sessionManager;
+  try {
+    const entries = manager?.getEntries?.() ?? [];
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index] as { type?: string; message?: { role?: string; stopReason?: string } };
+      if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
+      return entry.message.stopReason === "aborted";
+    }
+  } catch {
+    // A lightweight test/RPC context may not expose session entries. In that
+    // case ordinary settlement remains unchanged.
+  }
+  return false;
 }
 
 function formatMessage(message: AgentMessage): string {

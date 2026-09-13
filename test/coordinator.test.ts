@@ -58,6 +58,51 @@ test("recursive spawn is bounded and preserves parent identity", () => {
   expectCode(() => coordinator.dispatch(spawned.agent.id, "agent.spawn", { route }), "AGENT_LIMIT_REACHED");
 });
 
+test("maxChildrenPerAgent limits live children, not historical creations", () => {
+  const coordinator = makeCoordinator({ maxChildrenPerAgent: 1, maxTotalAgents: 8 });
+  registerRoot(coordinator);
+  const first = coordinator.dispatch("root", "agent.spawn", { route }).value.agent as AgentRecord;
+  expectCode(() => coordinator.dispatch("root", "agent.spawn", { route }), "AGENT_LIMIT_REACHED");
+  coordinator.dispatch("root", "agent.cancel", { agentId: first.id });
+  const replacement = coordinator.dispatch("root", "agent.spawn", { route }).value.agent as AgentRecord;
+  assert.notEqual(replacement.id, first.id);
+});
+
+test("failed parents cascade cancellation to every descendant", () => {
+  const coordinator = makeCoordinator({ maxChildrenPerAgent: 4, maxTotalAgents: 8 });
+  registerRoot(coordinator);
+  const child = coordinator.dispatch("root", "agent.spawn", { route, capabilities: { maySpawn: true } }).value.agent as AgentRecord;
+  const grandchild = coordinator.dispatch(child.id, "agent.spawn", { route }).value.agent as AgentRecord;
+  const failed = coordinator.dispatch(child.id, "agent.end_turn", { status: "failed", statusReason: "provider failed" });
+  assert.deepEqual(
+    failed.events.filter((event) => event.type === "agent_updated").map((event) => [event.agent.id, event.agent.status]),
+    [[grandchild.id, "cancelled"], [child.id, "failed"]],
+  );
+  assert.equal(coordinator.dispatch("root", "agent.status", { agentId: child.id }).value.status, "failed");
+  assert.equal(coordinator.dispatch("root", "agent.status", { agentId: grandchild.id }).value.status, "cancelled");
+});
+
+test("an agent cannot complete while it still has live descendants", () => {
+  const coordinator = makeCoordinator({ maxChildrenPerAgent: 4, maxTotalAgents: 8 });
+  registerRoot(coordinator);
+  const child = coordinator.dispatch("root", "agent.spawn", { route, capabilities: { maySpawn: true } }).value.agent as AgentRecord;
+  coordinator.dispatch(child.id, "agent.spawn", { route });
+  expectCode(() => coordinator.dispatch(child.id, "agent.end_turn", { status: "completed" }), "LIFECYCLE_CONFLICT");
+  assert.equal(coordinator.dispatch("root", "agent.status", { agentId: child.id }).value.status, "starting");
+});
+
+test("draining freezes new work until the subtree is cancelled", () => {
+  const coordinator = makeCoordinator({ maxChildrenPerAgent: 4, maxTotalAgents: 8 });
+  registerRoot(coordinator);
+  const child = coordinator.dispatch("root", "agent.spawn", { route, capabilities: { maySpawn: true } }).value.agent as AgentRecord;
+  coordinator.dispatch("root", "agent.drain", { agentId: child.id, reason: "quota emergency" });
+  assert.equal(coordinator.dispatch("root", "agent.status", { agentId: child.id }).value.status, "draining");
+  expectCode(() => coordinator.dispatch(child.id, "agent.begin_turn", {}), "LIFECYCLE_CONFLICT");
+  expectCode(() => coordinator.dispatch(child.id, "agent.spawn", { route }), "LIFECYCLE_CONFLICT");
+  coordinator.dispatch("root", "agent.cancel", { agentId: child.id });
+  assert.equal(coordinator.dispatch("root", "agent.status", { agentId: child.id }).value.status, "cancelled");
+});
+
 test("one of 100 concurrently scheduled task claimers wins atomically", async () => {
   const coordinator = makeCoordinator({ maxTotalAgents: 128, maxChildrenPerAgent: 128 });
   registerRoot(coordinator);

@@ -14,6 +14,8 @@ export type AgentStatus =
   | "running"
   | "waiting"
   | "blocked"
+  /** Cooperative shutdown phase; no new work may be admitted. */
+  | "draining"
   | "completed"
   | "failed"
   | "cancelled";
@@ -222,7 +224,10 @@ export interface FabricConfig {
    */
   caseInsensitivePaths?: boolean;
   maxDepth: number;
+  /** Maximum number of non-terminal direct children at once. */
   maxChildrenPerAgent: number;
+  /** Optional cumulative creation ceiling; omitted means no lifetime ceiling. */
+  maxChildrenCreatedPerAgent?: number;
   maxTotalAgents: number;
   maxConcurrentAgents: number;
   maxMailboxMessages: number;

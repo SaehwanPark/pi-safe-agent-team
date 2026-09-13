@@ -135,7 +135,7 @@ Guarded Pi writes participate in borrowing and fencing. Root shell remains a tru
 
 ### Workspaces
 
-`src/workspace.ts` is a small pluggable strategy boundary. `shared` uses the caller's cwd. Explicit `worktree` mode requires a clean Git checkout and creates a detached managed worktree from a safe base ref. Worktree paths and branches are recorded in agent metadata. v1 does not auto-delete dirty worktrees: terminal artifacts remain inspectable, and cleanup is intentionally explicit.
+`src/workspace.ts` is a small pluggable strategy boundary. `shared` uses the caller's cwd. Explicit `worktree` mode requires a clean Git checkout and creates a detached managed worktree from a safe base ref. Worktree paths and branches are recorded in agent metadata. Child shutdown reclaims a worktree only when it is clean and the session abort completes; dirty or uncertain artifacts remain inspectable and require explicit cleanup.
 
 ## State and data flow
 
@@ -153,7 +153,7 @@ Guarded Pi writes participate in borrowing and fencing. Root shell remains a tru
 - malformed journal tail: committed transactions before the tail remain usable; the tail is ignored and surfaced in diagnostics;
 - child crash: host marks it failed, releases task/resource runtime state, and sends a compact `agent_failed` notice to its parent;
 - parent shutdown: the managed subtree is cancelled, leases are released, and the broker retains bounded audit metadata;
-- cancellation: idempotently aborts the Pi session and releases task/resource/mailbox waits;
+- cancellation: idempotently drains and aborts the Pi session, releases task/resource/mailbox waits, and cascades across the descendant tree;
 - limits: spawn returns a structured limit error; it never recursively retries or silently creates an unbounded worker.
 
 ## Pi-native integration decisions
