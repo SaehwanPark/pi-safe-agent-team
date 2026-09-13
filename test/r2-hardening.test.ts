@@ -223,3 +223,20 @@ test("R2 child capacity failure retries once before a successful turn", async ()
   assert.equal(calls.some((call) => call.operation === "agent.end_turn" && call.args.status === "ready"), true);
   assert.equal(calls.some((call) => call.operation === "task.update"), false);
 });
+
+test("R2 embedded compaction diagnostics block instead of laundering the turn to ready", async () => {
+  const calls: Array<{ operation: string; args: any }> = [];
+  let child!: ManagedChild;
+  child = makePromptChild(async () => {
+    (child as any).observeSessionEvent({
+      type: "agent_end",
+      willRetry: false,
+      messages: [{ role: "assistant", provider: "omlx", model: "qwen3", stopReason: "stop", usage: { input: 12_000, cacheRead: 0, output: 32 } }],
+    });
+    (child as any).compactionFailure = classifyCompactionFailure("Embedded compaction failed: summary backend unavailable");
+  }, calls);
+
+  await (child as any).executePrompt("compaction-failed");
+  assert.equal(calls.some((call) => call.operation === "agent.end_turn" && call.args.status === "blocked"), true);
+  assert.equal(calls.some((call) => call.operation === "agent.end_turn" && call.args.status === "ready"), false);
+});

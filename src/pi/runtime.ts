@@ -1195,6 +1195,17 @@ export class ManagedChild {
       onDiagnostic: (diagnostic) => {
         const message = typeof diagnostic?.message === "string" ? diagnostic.message : String(diagnostic);
         this.lastDiagnostic = message.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 1800);
+        // The companion LCM intentionally catches host.compact() failures so
+        // it can keep its own gate consistent. Promote only its explicit
+        // compaction-failure diagnostic to a lifecycle outcome; storage and
+        // output-reduction warnings remain non-blocking.
+        if (/\b(?:embedded\s+)?compaction failed\b/i.test(message)) {
+          this.compactionFailure = classifyCompactionFailure(
+            this.lastDiagnostic,
+            false,
+            typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined,
+          );
+        }
         void this.client.request("agent.update", { contextDiagnostic: this.lastDiagnostic }).catch(() => undefined);
       },
     };
