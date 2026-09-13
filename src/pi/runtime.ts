@@ -1128,6 +1128,8 @@ export class ManagedChild {
   private readonly childAckInFlight = new Map<string, Promise<void>>();
   /** Set only after a prompt/settlement boundary has completed for this ID. */
   private readonly persistedChildMessageIds = new Set<string>();
+  /** Steered messages use the surrounding agent_settled event as their boundary. */
+  private readonly steeredChildMessageIds = new Set<string>();
   private eventUnsubscribe?: () => void;
   private sessionEventUnsubscribe?: () => void;
   private closeUnsubscribe?: () => void;
@@ -1621,6 +1623,20 @@ export class ManagedChild {
 
   private observeSessionEvent(event: any): void {
     if (!event || typeof event.type !== "string") return;
+    if (event.type === "message_end" && event.message?.role === "user") {
+      const content = event.message.content;
+      const messageText = typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n")
+          : "";
+      if (typeof messageText === "string") {
+        for (const message of this.pendingChildAcks.values()) {
+          if (messageText.includes(message.id)) this.persistedChildMessageIds.add(message.id);
+        }
+      }
+      return;
+    }
     if (event.type === "agent_end") {
       const assistant = findFinalAssistantMessage(event.messages ?? []);
       if (assistant !== undefined) {
@@ -1874,6 +1890,7 @@ export class ManagedChild {
       }
       if (this.session.isStreaming) {
         await this.session.steer(text);
+        this.steeredChildMessageIds.add(message.id);
       } else {
         const promptCompletion = this.enqueuePrompt(text);
         accepted = true;
@@ -1882,7 +1899,11 @@ export class ManagedChild {
         this.pendingChildAcks.set(message.id, message);
         void promptCompletion.then((completed) => {
           if (!completed) return;
-          this.persistedChildMessageIds.add(message.id);
+          const manager = (this.session as any)?.sessionManager as { getEntries?: () => readonly any[] } | undefined;
+          if (!this.persistedChildMessageIds.has(message.id)) {
+            if (typeof manager?.getEntries === "function" && !this.hasPersistedChildMessage(message.id)) return;
+            this.persistedChildMessageIds.add(message.id);
+          }
           return this.acknowledgePersistedChildMessage(message, true);
         });
         return;
@@ -1903,6 +1924,7 @@ export class ManagedChild {
   private markMessageAcknowledged(messageId: string): void {
     this.pendingChildAcks.delete(messageId);
     this.persistedChildMessageIds.delete(messageId);
+    this.steeredChildMessageIds.delete(messageId);
     this.deliveryStates.set(messageId, "acknowledged");
     while (this.deliveryStates.size > 2048) {
       const removable = [...this.deliveryStates.entries()].find(([, current]) => current === "acknowledged")?.[0];
@@ -1942,11 +1964,16 @@ export class ManagedChild {
     // entry, so do not require a second transcript scan before ACKing.
     const inFlight = this.childAckInFlight.get(message.id);
     if (inFlight) return inFlight;
-    if (!boundary && !this.persistedChildMessageIds.has(message.id)) return Promise.resolve();
     const manager = (this.session as any)?.sessionManager as { getEntries?: () => readonly any[] } | undefined;
-    if (!boundary && typeof manager?.getEntries === "function") {
-      if (!this.hasPersistedChildMessage(message.id)) return Promise.resolve();
+    let durableBoundary = boundary || this.persistedChildMessageIds.has(message.id);
+    if (!durableBoundary && typeof manager?.getEntries === "function" && this.hasPersistedChildMessage(message.id)) {
+      this.persistedChildMessageIds.add(message.id);
+      durableBoundary = true;
     }
+    if (!durableBoundary) return Promise.resolve();
+    // Once a prior completion/settlement boundary recorded the ID, a later
+    // compaction may legitimately remove that transcript entry. Do not make a
+    // broker ACK retry depend on the entry still being present.
     const operation = this.client.request("message.ack", { messageId: message.id })
       .then(() => this.markMessageAcknowledged(message.id))
       .catch(() => {
@@ -1962,6 +1989,9 @@ export class ManagedChild {
 
   private async acknowledgePersistedChildMessages(): Promise<void> {
     for (const message of [...this.pendingChildAcks.values()]) {
+      if (!this.steeredChildMessageIds.has(message.id)) continue;
+      const manager = (this.session as any)?.sessionManager as { getEntries?: () => readonly any[] } | undefined;
+      if (!this.persistedChildMessageIds.has(message.id) && typeof manager?.getEntries === "function" && !this.hasPersistedChildMessage(message.id)) continue;
       this.persistedChildMessageIds.add(message.id);
       await this.acknowledgePersistedChildMessage(message, true);
     }
