@@ -1046,6 +1046,8 @@ export class ManagedChild {
   private promptTail: Promise<void> = Promise.resolve();
   private deliveryTail: Promise<void> = Promise.resolve();
   private readonly pendingReplyIds = new Set<string>();
+  /** Cancels a route-capacity wait as soon as local child shutdown begins. */
+  private readonly stopController = new AbortController();
   private embeddedManager?: EmbeddedContextManager;
   private resolvingToolCount = 0;
   private hasInFlightWrite = 0;
@@ -1305,6 +1307,7 @@ export class ManagedChild {
   async stop(options: { abortTimeoutMs?: number } = {}): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.stopController.abort();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.eventUnsubscribe?.();
     this.sessionEventUnsubscribe?.();
@@ -1330,6 +1333,7 @@ export class ManagedChild {
   /** Escalate an in-progress cooperative stop without waiting for its promise. */
   abortImmediately(): void {
     if (this.stopping) {
+      this.stopController.abort();
       try {
         void this.session?.abort();
       } catch {}
@@ -1337,6 +1341,7 @@ export class ManagedChild {
       return;
     }
     this.stopping = true;
+    this.stopController.abort();
     try {
       void this.session?.abort();
     } catch {}
@@ -1346,6 +1351,7 @@ export class ManagedChild {
   /** Synchronous best-effort disposal used after an emergency deadline. */
   disposeNow(): void {
     this.stopping = true;
+    this.stopController.abort();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.eventUnsubscribe?.();
     this.sessionEventUnsubscribe?.();
@@ -1514,7 +1520,7 @@ export class ManagedChild {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       promptThrownOutcome = undefined;
       try {
-        if (typeof (this.runtime as any).withModelRouteCapacity === "function") await this.runtime.withModelRouteCapacity(this.route, runPrompt);
+        if (typeof (this.runtime as any).withModelRouteCapacity === "function") await this.runtime.withModelRouteCapacity(this.route, runPrompt, this.stopController.signal);
         else await runPrompt();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
