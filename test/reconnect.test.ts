@@ -174,5 +174,8 @@ test("child reconnect rebuilds the blocked gate from durable task state", async 
   taskStatus = "active";
   (child as any).handleEvent({ event: "task_changed", data: { task: { id: "task-blocked", owner: "child-blocked", status: "active" } } });
   assert.equal((child as any).blockedByOutcome, undefined);
+
+  (child as any).handleEvent({ event: "task_changed", data: { task: { id: "task-blocked", owner: "child-blocked", status: "blocked", blockedReason: "manual recovery required" } } });
+  assert.equal((child as any).blockedByOutcome?.lifecycle, "blocked");
   await child.stop();
 });

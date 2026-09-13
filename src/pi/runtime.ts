@@ -254,6 +254,7 @@ export class FabricRuntime {
       if (this.root) {
         try {
           while (true) {
+            if (this.stopped) throw new FabricError("LIFECYCLE_CONFLICT", "Root compaction admission stopped with the fabric");
             if (signal?.aborted) throw new FabricError("BROKER_UNAVAILABLE", "Root compaction admission was aborted");
             const result = await this.root.client.request<{ started?: boolean }>("agent.begin_turn", {}, FabricRuntime.shutdownRpcTimeoutMs, signal);
             if (result?.started === true) {
@@ -301,8 +302,13 @@ export class FabricRuntime {
   resetRootCompactionState(): void {
     this.rootCompactionEpoch += 1;
     this.rootCompactionInFlight = 0;
-    this.rootCompactionBrokerReservations = [];
+    const reservations = this.rootCompactionBrokerReservations.splice(0);
     for (const release of this.rootCompactionReleases.splice(0)) release?.();
+    if (this.root) {
+      for (const reserved of reservations) {
+        if (reserved) void this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+      }
+    }
   }
 
   markRootContextDegraded(outcome: ModelTurnOutcome): void {
@@ -1701,6 +1707,9 @@ export class ManagedChild {
       const agent = (event.data as { agent?: AgentRecord }).agent;
       if (agent?.id === this.agentId) {
         this.record = agent;
+        if (agent.status === "blocked") {
+          this.blockedByOutcome ??= classifyCompactionFailure(agent.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery");
+        }
         if (agent.status === "ready" && this.blockedByOutcome) {
           // A ready agent event alone does not prove that its assigned task
           // was reopened. Reconcile the task before releasing the local gate;
@@ -1716,6 +1725,10 @@ export class ManagedChild {
     }
     if (event.event === "task_changed") {
       const task = (event.data as { task?: TaskRecord }).task;
+      if (task?.owner === this.agentId && task.status === "blocked") {
+        this.blockedByOutcome = classifyCompactionFailure(task.blockedReason ?? "Assigned task remains blocked pending explicit recovery");
+        return;
+      }
       if (task?.owner === this.agentId && task.status !== "blocked" && !["completed", "failed", "cancelled"].includes(task.status) && this.blockedByOutcome) {
         this.blockedByOutcome = undefined;
         this.drainPendingMessages();
