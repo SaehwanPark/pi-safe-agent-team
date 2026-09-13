@@ -8,6 +8,7 @@ An agent is an actor record plus an optional long-lived Pi `AgentSession`. Its b
 starting -> ready -> running -> ready
                     |         -> waiting -> ready
                     |         -> blocked -> ready
+                    +-> draining -> completed | failed | cancelled
                     +-> completed | failed | cancelled
 ```
 
@@ -18,7 +19,7 @@ Terminal states are idempotent and permanent. A broker restart creates one expli
 A child may call `agent_spawn` only when `maySpawn` is granted. The broker enforces:
 
 - maximum depth;
-- maximum child creations per parent;
+- maximum live direct children per parent (with an optional cumulative creation ceiling);
 - maximum active agents per fabric;
 - maximum concurrent model turns;
 - capability ceilings inherited from the parent.

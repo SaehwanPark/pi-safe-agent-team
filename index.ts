@@ -233,7 +233,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("agents", {
-    description: "Inspect the safe-agents fabric (status, tree, tasks, resources, messages, inbox)",
+    description: "Inspect or stop the safe-agents fabric (status, tree, tasks, resources, messages, inbox, stop)",
     handler: async (args, ctx) => {
       try {
         await runtime.ensureRoot(pi, ctx, rootDelivery(pi));

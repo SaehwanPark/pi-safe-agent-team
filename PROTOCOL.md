@@ -205,6 +205,7 @@ Agent state transitions are explicit:
 starting -> ready -> running -> ready
                     |         -> waiting -> ready
                     |         -> blocked -> ready
+                    +-> draining -> completed | failed | cancelled
                     +-> completed | failed | cancelled
 ```
 
