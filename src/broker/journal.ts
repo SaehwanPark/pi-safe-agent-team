@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
+import { platform } from "node:os";
 import { dirname, join } from "node:path";
 import type { Coordinator } from "../core/coordinator.ts";
 import type { CoordinatorEvent, IdempotencyRecord, PersistedCoordinatorState } from "../core/types.ts";
@@ -65,9 +66,29 @@ export class Journal {
         await handle.close();
       }
       await fs.rename(temporary, this.filePath);
+      // The replacement is durable only after the containing directory entry
+      // is flushed as well. POSIX filesystems support opening a directory for
+      // this purpose; Windows does not, so the atomic rename remains the
+      // platform boundary there.
+      if (platform() !== "win32") {
+        const directory = await fs.open(dirname(this.filePath), "r");
+        try {
+          await directory.sync();
+        } finally {
+          await directory.close();
+        }
+      }
     });
     this.tail = operation.catch(() => undefined);
     await operation;
+  }
+
+  async size(): Promise<number> {
+    try {
+      return (await fs.stat(this.filePath)).size;
+    } catch {
+      return 0;
+    }
   }
 
   async replay(coordinator: Coordinator): Promise<{ committedTransactions: number; ignoredTail: boolean; checkpoints: number }> {

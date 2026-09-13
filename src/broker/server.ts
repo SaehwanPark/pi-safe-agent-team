@@ -20,6 +20,10 @@ export interface BrokerServerOptions {
   coordinator?: Coordinator;
   journal?: Journal;
   maintenanceMs?: number;
+  /** Checkpoint after this many committed transactions (default 4096). */
+  checkpointTransactions?: number;
+  /** Checkpoint when the journal reaches this many bytes (default 16 MiB). */
+  checkpointBytes?: number;
 }
 
 export interface HelloFrame {
@@ -187,6 +191,9 @@ export class BrokerServer {
   private stopping = false;
   private readonly rawConfig?: Partial<FabricConfig>;
   private readonly autoCoordinator: boolean;
+  private readonly checkpointTransactions: number;
+  private readonly checkpointBytes: number;
+  private transactionsSinceCheckpoint = 0;
 
   constructor(options: BrokerServerOptions) {
     this.directory = options.directory;
@@ -197,6 +204,8 @@ export class BrokerServer {
     this.coordinator = options.coordinator ?? new Coordinator({ rootId: options.rootId, rootAgentId: options.rootAgentId, config: resolveBrokerConfig(options) });
     this.journal = options.journal ?? new Journal({ directory: options.directory });
     this.maintenanceMs = Math.max(1000, options.maintenanceMs ?? this.coordinator.config.heartbeatMs);
+    this.checkpointTransactions = Math.max(1, Math.floor(options.checkpointTransactions ?? 4_096));
+    this.checkpointBytes = Math.max(1, Math.floor(options.checkpointBytes ?? 16 * 1024 * 1024));
   }
 
   async start(): Promise<void> {
@@ -210,8 +219,12 @@ export class BrokerServer {
     }
     try {
       await this.journal.replay(this.coordinator);
+      this.transactionsSinceCheckpoint = 0;
       const recovery = this.coordinator.recover();
-      if (recovery.events.length > 0) await this.journal.append(recovery.events);
+      if (recovery.events.length > 0) {
+        await this.journal.append(recovery.events);
+        this.transactionsSinceCheckpoint += 1;
+      }
       if (platform() !== "win32") {
         try {
           await fs.unlink(this.endpoint);
@@ -254,6 +267,10 @@ export class BrokerServer {
     this.started = false;
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
     await this.operationTail.catch(() => undefined);
+    // Compact the journal before closing connections so all state transitions
+    // accepted by this broker are represented by one durable snapshot.
+    await this.journal.checkpoint(this.coordinator.exportState()).catch(() => undefined);
+    this.transactionsSinceCheckpoint = 0;
     for (const connection of this.connections) connection.close();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
     if (platform() !== "win32") {
@@ -343,6 +360,8 @@ export class BrokerServer {
       const result = this.coordinator.dispatch(actorId, request.op, request.args ?? {});
       if (result.events.length > 0 || result.idempotency !== undefined) {
         await this.journal.append(result.events, result.idempotency);
+        this.transactionsSinceCheckpoint += 1;
+        await this.maybeCheckpoint();
       }
       response = { id: request.id, version: PROTOCOL_VERSION, ok: true, result: result.value };
       this.broadcast(result.events);
@@ -365,10 +384,24 @@ export class BrokerServer {
       const result = this.coordinator.maintenance();
       if (result.events.length > 0) {
         await this.journal.append(result.events);
+        this.transactionsSinceCheckpoint += 1;
+        await this.maybeCheckpoint();
         this.broadcast(result.events);
       }
     } catch {
       this.coordinator.restoreState(before);
+    }
+  }
+
+  private async maybeCheckpoint(): Promise<void> {
+    if (this.transactionsSinceCheckpoint < this.checkpointTransactions && await this.journal.size() < this.checkpointBytes) return;
+    try {
+      await this.journal.checkpoint(this.coordinator.exportState());
+      this.transactionsSinceCheckpoint = 0;
+    } catch {
+      // A failed compaction must not turn a committed coordinator mutation
+      // into a client error; the append-only journal remains authoritative and
+      // the next transaction/shutdown retries the checkpoint.
     }
   }
 

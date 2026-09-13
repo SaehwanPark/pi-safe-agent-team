@@ -26,6 +26,15 @@ export interface WriteAuthorizationClient {
 
 export type ChildShellMode = "read-only" | "workspace";
 
+const DETACHED_SHELL_COMMAND = /(^|[;&|]\s*)(?:nohup|setsid|disown|daemon(?:ize)?|start-stop-daemon|systemctl)\b/i;
+
+/** Reject common daemon/background forms in disposable managed worktrees. */
+export function assertNoDetachedShellCommand(command: string): void {
+  if (DETACHED_SHELL_COMMAND.test(command) || command.replaceAll("&&", "").includes("&")) {
+    throw new FabricError("CAPABILITY_DENIED", "Detached/background shell commands are disabled in managed worktrees so agent stop can reclaim every process");
+  }
+}
+
 export interface GuardedChildToolOptions {
   client: WriteAuthorizationClient;
   workspacePath: string;
@@ -103,8 +112,16 @@ export function createGuardedReadOnlyTools(workspacePath: string): AnyToolDefini
 export function createGuardedChildTools(options: GuardedChildToolOptions): AnyToolDefinition[] {
   const tools: AnyToolDefinition[] = [];
   if (options.mayUseShell === true) {
-    const shellOperations = options.shellMode === "workspace"
-      ? createLocalBashOperations()
+    const shellOperations: BashOperations = options.shellMode === "workspace"
+      ? (() => {
+          const local = createLocalBashOperations();
+          return {
+            exec: async (command, cwd, executionOptions) => {
+              assertNoDetachedShellCommand(command);
+              return local.exec(command, cwd, executionOptions);
+            },
+          };
+        })()
       : createReadOnlyShellOperations(options.workspacePath);
     tools.push(createBashToolDefinition(options.workspacePath, { operations: shellOperations }));
   }

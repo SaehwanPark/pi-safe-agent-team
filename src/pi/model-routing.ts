@@ -2,7 +2,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { FabricError } from "../core/errors.ts";
-import { resolveRoute, type RouteResolutionInput } from "../core/routing.ts";
+import { resolveRoute, type RouteResolutionInput, type RouteSource } from "../core/routing.ts";
 import type { ModelRoute } from "../core/types.ts";
 
 export interface ResolvedModelRoute {
@@ -36,14 +36,23 @@ export function resolveModelRoute(input: RouteResolutionInput & { registry: Mode
   if (resolved.thinking !== "off" && model.thinkingLevelMap?.[resolved.thinking] === null) {
     throw new FabricError("MODEL_ROUTE_INVALID", `Model ${provider}/${resolved.model} does not support thinking level ${resolved.thinking}`);
   }
-  return { route: { provider, model: resolved.model, thinking: resolved.thinking }, model, source: resolved.source };
+  return {
+    route: {
+      provider,
+      model: resolved.model,
+      thinking: resolved.thinking,
+      ...(resolved.capacityGroup ? { capacityGroup: resolved.capacityGroup } : {}),
+    },
+    model,
+    source: resolved.source,
+  };
 }
 
 export function resolveChildModel(
   registry: ModelRegistry,
-  explicit: { provider?: string; model?: string; thinking?: ThinkingLevel } | undefined,
-  role: { provider?: string; model?: string; thinking?: ThinkingLevel } | undefined,
-  defaults: { provider?: string; model?: string; thinking?: ThinkingLevel } | undefined,
+  explicit: RouteSource | undefined,
+  role: RouteSource | undefined,
+  defaults: RouteSource | undefined,
   parentModel: Model<any> | undefined,
   parentThinking: ThinkingLevel,
 ): ResolvedModelRoute {

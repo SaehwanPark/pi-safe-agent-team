@@ -56,6 +56,8 @@ export interface ModelRoute {
   provider: string;
   model: string;
   thinking: ThinkingLevel;
+  /** Optional physical backend identity shared by semantic route aliases. */
+  capacityGroup?: string;
 }
 
 /** Optional policy for a concrete provider/model runtime. */
@@ -64,6 +66,8 @@ export interface ModelRoutePolicy {
   maxConcurrent?: number;
   /** Conservative operational prefill budget, in tokens. */
   effectivePrefillBudget?: number;
+  /** Explicit physical backend identity for aliases sharing one runtime. */
+  capacityGroup?: string;
 }
 
 export interface AgentCapabilities {

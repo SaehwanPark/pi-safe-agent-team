@@ -22,7 +22,11 @@ The file may contain the fields directly or under a `safeAgents`, `piSafeAgents`
 }
 ```
 
-Malformed or missing files are ignored and the broker validates any loaded values before startup.
+Configuration errors are fail-closed: an explicitly requested path that is
+missing, or any discovered file that is malformed JSON, prevents the runtime
+from starting. This avoids silently relaxing safety and memory policies. The
+loader returns the source and diagnostic errors for embedding hosts that want
+to surface them directly.
 
 ## Canonical agent directory resolution
 
@@ -82,7 +86,8 @@ Model-runtime coordination is configured independently from the global agent cou
 
 ```ts
 modelRoutePolicies: {
-  "omlx/qwen3": { maxConcurrent: 1, effectivePrefillBudget: 48_000 },
+  "omlx/qwen3": { maxConcurrent: 1, effectivePrefillBudget: 48_000, capacityGroup: "local-gpu-0" },
+  "my-local-alias/qwen3": { maxConcurrent: 1, capacityGroup: "local-gpu-0" },
   "openai/gpt-5.6-sol": { maxConcurrent: 4 },
 }
 ```
@@ -95,7 +100,19 @@ specified. `effectivePrefillBudget` is optional and is clamped to the model's
 logical context window; it is the budget passed to embedded context management,
 not a claim that the provider's advertised window changed.
 
+`capacityGroup` is the physical backend identity, independent of the semantic
+provider/model name. Routes that point at the same local GPU or inference
+server should use one group so broker admission and the process-local arbiter
+share one limit. When omitted, the route's provider/model key remains the
+fallback identity and local-provider name heuristics still provide the
+conservative one-turn default.
+
 Limits fail closed. There is no automatic unbounded retry or fallback provider.
+
+The broker periodically checkpoints `events.jsonl` (by transaction count or
+file size) and checkpoints again during clean shutdown. Heartbeats without
+leases update liveness in memory without creating a synchronous journal write;
+lease renewals remain durable.
 
 ## Roles and capabilities
 

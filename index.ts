@@ -12,18 +12,18 @@ import { classifyAssistantMessage, classifyCompactionFailure, findFinalAssistant
 export { Coordinator } from "./src/core/coordinator.ts";
 export { FabricError } from "./src/core/errors.ts";
 export { resolveRoute, routeId } from "./src/core/routing.ts";
-export { effectivePrefillBudget, modelRouteCapacity, modelRouteKey, modelRoutePolicy } from "./src/core/coordinator-wire.ts";
+export { effectivePrefillBudget, modelRouteCapacity, modelRouteCapacityKey, modelRouteKey, modelRoutePolicy } from "./src/core/coordinator-wire.ts";
 export { BrokerClient } from "./src/broker/client.ts";
 export { BrokerServer, startBroker } from "./src/broker/server.ts";
 export { Journal } from "./src/broker/journal.ts";
 export { FabricRuntime, ManagedChild, taskAwareTurnStatus } from "./src/pi/runtime.ts";
 export type { DescendantShutdownMode, HandoffSnapshot } from "./src/pi/runtime.ts";
-export { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootShellGuard, evaluateRootWriteGuard, workspaceRelativePath } from "./src/pi/guards.ts";
+export { assertNoDetachedShellCommand, assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootShellGuard, evaluateRootWriteGuard, workspaceRelativePath } from "./src/pi/guards.ts";
 export { classifyRootShellCommand, type RootShellRisk } from "./src/pi/shell-classifier.ts";
 export { classifyRootDelivery, type RootDeliveryDecision, type RootDeliveryContext } from "./src/pi/delivery.ts";
 export { ModelRouteCapacityArbiter } from "./src/pi/model-capacity.ts";
 export { loadFabricConfig, type FabricConfigLoadOptions, type FabricConfigLoadResult } from "./src/pi/config.ts";
-export { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isBlockingOutcome, type ModelTurnOutcome, type ModelTurnOutcomeKind } from "./src/pi/turn-outcome.ts";
+export { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isAbortLikeMessage, isBlockingOutcome, type ModelTurnOutcome, type ModelTurnOutcomeKind } from "./src/pi/turn-outcome.ts";
 export { getInteropRegistry, getInteropProvider, registerInteropProvider, unregisterInteropProvider, PI_EXTENSION_INTEROP } from "./src/pi/interop.ts";
 export type { FabricSnapshotRequest, FabricStateSnapshotV1, FabricStateProviderV1, EmbeddedContextHost, EmbeddedContextManager, EmbeddedToolResult } from "./src/pi/interop.ts";
 export { GitWorkspaceStrategy, SharedWorkspaceStrategy } from "./src/workspace.ts";
@@ -83,7 +83,9 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     lifecycleQueue.enqueue(generation, operation);
 
   const updatePendingDeliveries = (): void => {
-    const count = [...rootDeliveryStates.values()].filter((s) => s === "delivering").length;
+    // Accepted/deferred messages remain broker-unacknowledged until Pi has
+    // crossed the session boundary, so they must keep root quiescence closed.
+    const count = [...rootDeliveryStates.values()].filter((s) => s !== "acknowledged").length;
     runtime.setPendingRootDeliveriesCount(count);
   };
 
@@ -325,6 +327,9 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
           if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
         }
         if (started) {
+          // Keep the broker admission and process-local capacity permit in the
+          // same order used by managed children and root compaction.
+          await runtime.beginRootModelTurnCapacity();
           // The nextTurn queue is now part of this Pi prompt's immutable input;
           // ACK only after a later agent_end confirms its message_end entries.
           for (const messageId of deferredRootMessages.keys()) deferredRootRunMessages.add(messageId);
@@ -332,6 +337,8 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       });
     } catch (error) {
       rootLogicalRunActive = false;
+      await runtime.endRootModelTurnCapacity().catch(() => undefined);
+      await runtime.request("agent.end_turn", { status: "ready" }).catch(() => undefined);
       notifyLifecycleFailure(ctx, error, "warning", generation);
       throw error;
     }
@@ -384,6 +391,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       try {
         await runtime.request("agent.end_turn", { status: "ready" });
       } finally {
+        await runtime.endRootModelTurnCapacity();
         await acknowledgePersistedDeferredRootMessages();
         rootLogicalRunActive = false;
         lastFinalRootOutcome = undefined;

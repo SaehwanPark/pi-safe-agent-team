@@ -9,7 +9,7 @@ import { Coordinator } from "../src/core/coordinator.ts";
 import { FabricError } from "../src/core/errors.ts";
 import { BrokerClient } from "../src/broker/client.ts";
 import { BrokerServer } from "../src/broker/server.ts";
-import { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootWriteGuard, workspaceRelativePath } from "../src/pi/guards.ts";
+import { assertNoDetachedShellCommand, assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootWriteGuard, workspaceRelativePath } from "../src/pi/guards.ts";
 import { ManagedChild, taskAwareTurnStatus } from "../src/pi/runtime.ts";
 import type { AgentRecord, AgentMessage, ModelRoute, ResourceRecord } from "../src/core/types.ts";
 
@@ -86,6 +86,14 @@ test("shared shell rejects mutation syntax and dangerous read-command options", 
   expectCode(() => assertReadOnlyShellCommand("du --files0-from=names.bin"), "CAPABILITY_DENIED");
   expectCode(() => assertReadOnlyShellCommand("sort --files0-from=names.bin"), "CAPABILITY_DENIED");
   expectCode(() => assertReadOnlyShellCommand("find . -files0-from names.bin"), "CAPABILITY_DENIED");
+});
+
+test("managed worktree shells reject detached/background processes", () => {
+  assertNoDetachedShellCommand("npm test");
+  assertNoDetachedShellCommand("npm test && npm run lint");
+  expectCode(() => assertNoDetachedShellCommand("npm run dev &"), "CAPABILITY_DENIED");
+  expectCode(() => assertNoDetachedShellCommand("nohup npm run dev >/tmp/dev.log 2>&1 &"), "CAPABILITY_DENIED");
+  expectCode(() => assertNoDetachedShellCommand("systemctl start worker"), "CAPABILITY_DENIED");
 });
 
 test("shared git inspection cannot execute a repository alias", async () => {
@@ -635,10 +643,58 @@ test("duplicate unacknowledged notifications are queued and executed once", asyn
   const first = (child as any).deliverMessage(message) as Promise<void>;
   const second = (child as any).deliverMessage(message) as Promise<void>;
   await Promise.all([first, second]);
-  assert.equal(ackCalls, 1);
+  assert.equal(ackCalls, 0, "ACK waits for the queued prompt to settle");
   releasePrompt?.();
-  await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  for (let attempt = 0; attempt < 20 && ackCalls === 0; attempt += 1) await new Promise<void>((resolveWait) => setImmediate(resolveWait));
+  assert.equal(ackCalls, 1);
   assert.equal(promptCalls, 1);
+});
+
+test("managed child retains a broker message until its session user entry is durable", async () => {
+  let ackCalls = 0;
+  let allowPersistence!: () => void;
+  const entries: any[] = [];
+  const child = new ManagedChild({ fabricId: "fabric" } as never, {
+    agentId: "child-durable",
+    token: "token",
+    parentId: "root",
+    role: "worker",
+    route,
+    workspace: { mode: "shared", root: resolve("."), path: resolve(".") },
+    cwd: resolve("."),
+    stateDirectory: resolve("."),
+    agentDir: resolve("."),
+    endpoint: "unused",
+    model: {} as never,
+    capabilities: { maySpawn: false, mayMessagePeers: false, mayEscalate: true, mayTransferOwnership: false, mayWriteRepo: false, mayUseShell: false, peerIds: [], resourceGrants: {} },
+  });
+  (child.client as any).request = async (operation: string) => {
+    if (operation === "message.ack") {
+      ackCalls += 1;
+      return {};
+    }
+    if (operation === "agent.begin_turn") return { started: true };
+    if (operation === "agent.status") return { id: "child-durable", taskId: undefined };
+    if (operation === "agent.end_turn") return { agent: { id: "child-durable", status: "ready" } };
+    return {};
+  };
+  (child as any).session = {
+    isStreaming: false,
+    sessionManager: { getEntries: () => entries },
+    async prompt() {
+      await new Promise<void>((resolve) => { allowPersistence = resolve; });
+      entries.push({ type: "message", message: { role: "user", content: [{ type: "text", text: "[Fabric message message-durable]" }] } });
+    },
+  };
+  const message: AgentMessage = { id: "message-durable", from: "root", to: "child-durable", type: "inform", body: "persist me", senderSequence: 1, brokerSequence: 1, priority: "normal", createdAt: 1 };
+  await (child as any).deliverMessage(message);
+  // Queue admission alone is not enough when a SessionManager is present.
+  assert.equal(ackCalls, 0);
+  for (let attempt = 0; attempt < 20 && !allowPersistence; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(allowPersistence);
+  allowPersistence();
+  for (let attempt = 0; attempt < 20 && ackCalls === 0; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(ackCalls, 1);
 });
 
 async function registerBrokerAgent(client: BrokerClient, parentId?: string, token?: string): Promise<{ token: string; agent?: AgentRecord }> {

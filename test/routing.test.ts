@@ -21,8 +21,9 @@ test("model route precedence is explicit, role, defaults, parent, global", () =>
 
 test("Pi adapter resolves an exact registry object and rejects missing models", () => {
   const registry = { find: (provider: string, id: string) => provider === "local" && id === "small" ? model : undefined } as any;
-  const resolved = resolveModelRoute({ registry, explicit: { model: "local/small", thinking: "medium" } });
+  const resolved = resolveModelRoute({ registry, explicit: { model: "local/small", thinking: "medium", capacityGroup: "gpu-0" } });
   assert.equal(resolved.model, model);
   assert.equal(resolved.route.provider, "local");
+  assert.equal(resolved.route.capacityGroup, "gpu-0");
   assert.throws(() => resolveModelRoute({ registry, explicit: { model: "other/missing" } }), /not available/);
 });

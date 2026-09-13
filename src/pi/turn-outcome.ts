@@ -32,6 +32,24 @@ interface AssistantLike {
   diagnostics?: ReadonlyArray<{ error?: { message?: unknown; code?: unknown }; details?: Record<string, unknown> }>;
 }
 
+const ABORT_STOP_REASONS = new Set(["abort", "aborted", "cancelled", "canceled"]);
+const ABORT_ERROR_PATTERNS = [
+  /\bAbortError\b/i,
+  /\bABORT_ERR\b/i,
+  /\b(?:this|the) operation was aborted\b/i,
+  /\brequest was aborted\b/i,
+  /\baborted by (?:the )?(?:user|caller|signal)\b/i,
+  /\bsignal (?:is|was|has been) aborted\b/i,
+];
+
+/** Narrow classifier for user/signal aborts that providers sometimes report as errors. */
+export function isAbortLikeMessage(stopReason?: unknown, errorMessage?: unknown): boolean {
+  const reason = text(stopReason)?.toLowerCase();
+  if (reason && ABORT_STOP_REASONS.has(reason)) return true;
+  const message = text(errorMessage);
+  return Boolean(message && ABORT_ERROR_PATTERNS.some((pattern) => pattern.test(message)));
+}
+
 const CAPACITY_PATTERNS = [
   /prefill[_ -]?memory[_ -]?exceeded/i,
   /prefill.{0,80}(?:memory|kv|cache).{0,80}(?:exceed|insufficient|full|allocat|capacity)/i,
@@ -123,7 +141,7 @@ export function classifyAssistantMessage(message: unknown, contextWindow?: numbe
   const candidate = (message && typeof message === "object" ? message : {}) as AssistantLike;
   const stopReason = text(candidate.stopReason);
   const errorMessage = diagnosticText(candidate);
-  if (stopReason === "aborted") return outcome("aborted", candidate, contextWindow, errorMessage);
+  if (isAbortLikeMessage(stopReason, errorMessage)) return outcome("aborted", candidate, contextWindow, errorMessage);
   if (stopReason === "error") {
     let kind = failureKind(errorMessage);
     // Pi's provider-aware detector remains authoritative for genuine logical

@@ -56,6 +56,7 @@ import {
   mergeCapabilities,
   modelRouteCapacity,
   modelRouteKey,
+  modelRouteCapacityKey,
   normalizeClone,
   normalizeResourcePath,
   parseAgentId,
@@ -198,6 +199,7 @@ export class Coordinator {
         assertCondition(Boolean(policy) && typeof policy === "object" && !Array.isArray(policy), "INVALID_ARGUMENT", `model route policy for ${key} must be an object`);
         if (policy.maxConcurrent !== undefined) assertCondition(typeof policy.maxConcurrent === "number" && Number.isInteger(policy.maxConcurrent) && policy.maxConcurrent > 0, "INVALID_ARGUMENT", `model route maxConcurrent for ${key} must be a positive integer`);
         if (policy.effectivePrefillBudget !== undefined) assertCondition(typeof policy.effectivePrefillBudget === "number" && Number.isFinite(policy.effectivePrefillBudget) && policy.effectivePrefillBudget > 0, "INVALID_ARGUMENT", `effective prefill budget for ${key} must be a positive finite number`);
+        if (policy.capacityGroup !== undefined) assertCondition(typeof policy.capacityGroup === "string" && policy.capacityGroup.length > 0 && policy.capacityGroup.length <= 256, "INVALID_ARGUMENT", `capacityGroup for ${key} must be a bounded non-empty string`);
       }
     }
   }
@@ -250,7 +252,7 @@ export class Coordinator {
       case "message.ack":
         return this.withEvents(events, this.ackMessage(this.requireActor(actorId).id, parseString(args.messageId, "messageId"), events));
       case "message.inbox":
-        return this.withEvents(events, this.inbox(this.requireActor(actorId).id, args.limit), events);
+        return this.withEvents(events, this.inbox(this.requireActor(actorId).id, args.limit, args.afterBrokerSequence), events);
       case "message.list":
         return this.withEvents(events, this.listMessages(this.requireActor(actorId).id, args), events);
       case "task.create":
@@ -547,6 +549,7 @@ export class Coordinator {
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
+    if (requestedStatus === "blocked") this.releaseAgentResourceClaims(actorId, events);
     return publicAgent(next);
   }
 
@@ -558,7 +561,7 @@ export class Coordinator {
     if (this.runningAgentCount() >= this.config.maxConcurrentAgents) {
       return { started: false, reason: "maxConcurrentAgents reached" };
     }
-    const routeLimit = modelRouteCapacity(this.config, agent.route);
+    const routeLimit = this.routeCapacityLimit(agent.route);
     if (routeLimit !== undefined && this.runningRouteCount(agent.route, agent.id) >= routeLimit) {
       return { started: false, reason: `model route capacity reached for ${modelRouteKey(agent.route)}` };
     }
@@ -596,6 +599,11 @@ export class Coordinator {
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
+
+    // A blocked context/provider turn is deliberately recoverable, but it is
+    // not making progress. Release mutable claims immediately so another actor
+    // can proceed while the task remains assigned for explicit recovery.
+    if (effectiveStatus === "blocked") this.releaseAgentResourceClaims(actorId, events);
 
     let task = agent.taskId ? cloneTask(this.requireTask(agent.taskId)) : undefined;
     if (isTerminal(effectiveStatus)) {
@@ -676,7 +684,6 @@ export class Coordinator {
     const next = cloneAgent(agent);
     next.lastActivity = now;
     this.agents.set(actorId, next);
-    events.push({ type: "agent_updated", agent: cloneAgent(next) });
     let leases = 0;
     for (const resource of this.resources.values()) {
       let changed = false;
@@ -699,6 +706,10 @@ export class Coordinator {
         events.push({ type: "resource_changed", resource: cloneResource(resource) });
       }
     }
+    // Heartbeats without leases still refresh the in-memory liveness marker,
+    // but do not force a synchronous journal transaction every minute. Lease
+    // holders retain the durable agent update alongside their lease renewals.
+    if (leases > 0) events.push({ type: "agent_updated", agent: cloneAgent(next) });
     return { agent: publicAgent(next), leases };
   }
 
@@ -844,10 +855,19 @@ export class Coordinator {
     return cloneMessage(message);
   }
 
-  private inbox(actorId: AgentId, limit: unknown): AgentMessage[] {
+  private inbox(actorId: AgentId, limit: unknown, afterBrokerSequence?: unknown): AgentMessage[] {
     const max = Math.max(1, Math.min(100, Math.floor(parseNumber(limit, "limit", 50))));
-    return [...this.messages.values()]
+    const after = afterBrokerSequence === undefined ? undefined : parseNumber(afterBrokerSequence, "afterBrokerSequence", 0);
+    const pending = [...this.messages.values()]
       .filter((message) => message.to === actorId && message.acknowledgedAt === undefined)
+      .filter((message) => after === undefined || (message.brokerSequence ?? 0) > after);
+    if (after !== undefined) {
+      return pending
+        .sort((left, right) => (left.brokerSequence ?? 0) - (right.brokerSequence ?? 0) || left.id.localeCompare(right.id))
+        .slice(0, max)
+        .map(cloneMessage);
+    }
+    return pending
       .sort((left, right) => left.senderSequence - right.senderSequence || (left.brokerSequence ?? 0) - (right.brokerSequence ?? 0) || left.id.localeCompare(right.id))
       .slice(0, max)
       .map(cloneMessage);
@@ -944,6 +964,7 @@ export class Coordinator {
         task.blockedReason = parseString(args.reason, "reason", 4096);
         task.updatedAt = this.clock();
         events.push({ type: "task_changed", task: cloneTask(task) });
+        if (task.owner) this.releaseAgentResourceClaims(task.owner, events);
         return cloneTask(task);
       case "ready":
       case "reopen":
@@ -1516,7 +1537,8 @@ export class Coordinator {
     const model = parseString(route.model, "route.model", 512);
     const thinking = parseString(route.thinking, "route.thinking", 32) as ModelRoute["thinking"];
     assertCondition(ALL_THINKING_LEVELS.has(thinking), "MODEL_ROUTE_INVALID", `Unknown thinking level ${thinking}`);
-    return { provider, model, thinking };
+    const capacityGroup = route.capacityGroup === undefined ? undefined : parseString(route.capacityGroup, "route.capacityGroup", 256);
+    return { provider, model, thinking, ...(capacityGroup ? { capacityGroup } : {}) };
   }
 
   private transitionStatus(agent: AgentRecord, next: AgentStatus, reason?: string): void {
@@ -1561,14 +1583,21 @@ export class Coordinator {
       const existingId = this.dedupe.get(dedupeKey);
       if (existingId) {
         const existing = this.messages.get(existingId);
-        if (existing) return { message: cloneMessage(existing), request: existing.requestId ? this.requests.get(existing.requestId) && cloneRequest(this.requests.get(existing.requestId) as RequestRecord) : undefined };
+        if (existing && existing.acknowledgedAt === undefined) {
+          return { message: cloneMessage(existing), request: existing.requestId ? this.requests.get(existing.requestId) && cloneRequest(this.requests.get(existing.requestId) as RequestRecord) : undefined };
+        }
+        this.dedupe.delete(dedupeKey);
       }
     }
-    const pendingCount = [...this.messages.values()].filter((message) => message.to === recipient.id && message.acknowledgedAt === undefined).length;
-    assertCondition(pendingCount < this.config.maxMailboxMessages, "MAILBOX_FULL", `Mailbox for ${recipient.id} is full`, { recipient: recipient.id });
     const now = this.clock();
     const priority = options.priority ?? "normal";
     assertCondition(priority === "normal" || priority === "urgent", "INVALID_ARGUMENT", "priority must be normal or urgent");
+    const pending = [...this.messages.values()].filter((message) => message.to === recipient.id && message.acknowledgedAt === undefined);
+    const controlReserve = Math.min(32, Math.max(1, Math.floor(this.config.maxMailboxMessages / 8)));
+    const normalLimit = Math.max(1, this.config.maxMailboxMessages - controlReserve);
+    const pendingNormal = pending.filter((message) => message.priority === "normal").length;
+    const limit = priority === "urgent" ? this.config.maxMailboxMessages + controlReserve : Math.min(this.config.maxMailboxMessages, normalLimit);
+    assertCondition(priority === "urgent" ? pending.length < limit : pendingNormal < limit && pending.length < this.config.maxMailboxMessages, "MAILBOX_FULL", `Mailbox for ${recipient.id} is full`, { recipient: recipient.id, priority });
     assertCondition(options.expectsReply === undefined || typeof options.expectsReply === "boolean", "INVALID_ARGUMENT", "expectsReply must be boolean");
     const sequence = (this.nextMessageSequence.get(sender.id) ?? 0) + 1;
     this.nextMessageSequence.set(sender.id, sequence);
@@ -1630,7 +1659,15 @@ export class Coordinator {
     if (isTerminal(to.status)) return;
     const from = fromId === "broker" ? this.brokerActor() : this.requireAgent(fromId);
     try {
-      this.recordMessage(from, to, type, body.slice(0, this.config.maxMessageBody), { priority: "urgent", metadata }, events);
+      const entity = metadata.taskId ?? metadata.failedAgentId ?? metadata.resourceId ?? metadata.requestId ?? stableStringify(metadata);
+      this.recordMessage(from, to, type, body.slice(0, this.config.maxMessageBody), {
+        priority: "urgent",
+        metadata,
+        // Coalesce repeated control-plane notices for the same entity while a
+        // recipient is offline. Durable task/resource state remains the source
+        // of truth, so retaining one latest wake is sufficient and bounded.
+        clientDedupeKey: `control:${type}:${String(entity)}`,
+      }, events);
     } catch (error) {
       events.push({ type: "diagnostic", code: "MAILBOX_FULL", message: error instanceof Error ? error.message : String(error), details: { to: toId, type } });
     }
@@ -1669,7 +1706,8 @@ export class Coordinator {
     }
   }
 
-  private releaseAgentRuntime(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
+  /** Release leases, waiters, and in-flight write fences without changing task ownership. */
+  private releaseAgentResourceClaims(agentId: AgentId, events: CoordinatorEvent[]): void {
     for (const resource of this.resources.values()) {
       let changed = false;
       const beforeShared = resource.sharedHolds.length;
@@ -1691,6 +1729,11 @@ export class Coordinator {
         events.push({ type: "resource_changed", resource: cloneResource(resource) });
       }
     }
+    this.drainWaiters(events);
+  }
+
+  private releaseAgentRuntime(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
+    this.releaseAgentResourceClaims(agentId, events);
     let ownerTaskCleared = false;
     const owner = this.agents.get(agentId);
     for (const task of this.tasks.values()) {
@@ -1709,7 +1752,6 @@ export class Coordinator {
       events.push({ type: "task_changed", task: cloneTask(task) });
     }
     if (ownerTaskCleared && owner) events.push({ type: "agent_updated", agent: cloneAgent(owner) });
-    this.drainWaiters(events);
   }
 
   private drainWaiters(events: CoordinatorEvent[]): void {
@@ -2030,11 +2072,29 @@ export class Coordinator {
   }
 
   private runningRouteCount(route: ModelRoute, excludeAgentId?: string): number {
-    return [...this.agents.values()].filter((agent) => agent.status === "running" && agent.id !== excludeAgentId && agent.route.provider === route.provider && agent.route.model === route.model).length;
+    const capacityKey = modelRouteCapacityKey(this.config, route);
+    return [...this.agents.values()].filter((agent) => agent.status === "running" && agent.id !== excludeAgentId && modelRouteCapacityKey(this.config, agent.route) === capacityKey).length;
+  }
+
+  private routeCapacityLimit(route: ModelRoute): number | undefined {
+    const capacityKey = modelRouteCapacityKey(this.config, route);
+    const limits: number[] = [];
+    const requested = modelRouteCapacity(this.config, route);
+    if (requested !== undefined) limits.push(requested);
+    for (const agent of this.agents.values()) {
+      if (modelRouteCapacityKey(this.config, agent.route) !== capacityKey) continue;
+      const limit = modelRouteCapacity(this.config, agent.route);
+      if (limit !== undefined) limits.push(limit);
+    }
+    for (const policy of Object.values(this.config.modelRoutePolicies ?? {})) {
+      if (policy.capacityGroup !== capacityKey || policy.maxConcurrent === undefined) continue;
+      limits.push(policy.maxConcurrent);
+    }
+    return limits.length > 0 ? Math.min(...limits) : undefined;
   }
 
   private assertRouteCapacity(route: ModelRoute, excludeAgentId?: string): void {
-    const limit = modelRouteCapacity(this.config, route);
+    const limit = this.routeCapacityLimit(route);
     if (limit !== undefined) {
       assertCondition(this.runningRouteCount(route, excludeAgentId) < limit, "AGENT_LIMIT_REACHED", `model route capacity reached for ${modelRouteKey(route)}`);
     }

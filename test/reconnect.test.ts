@@ -179,3 +179,40 @@ test("child reconnect rebuilds the blocked gate from durable task state", async 
   assert.equal((child as any).blockedByOutcome?.lifecycle, "blocked");
   await child.stop();
 });
+
+test("reopening a blocked task schedules one deterministic recovery turn", async () => {
+  const child = new ManagedChild({ fabricId: "fabric" } as FabricRuntime, {
+    agentId: "child-reopen",
+    token: "token-child-reopen",
+    parentId: "root",
+    role: "worker",
+    route,
+    taskId: "task-reopen",
+    cwd: process.cwd(),
+    stateDirectory: process.cwd(),
+    agentDir: process.cwd(),
+    endpoint: "unused",
+    model: {} as never,
+    capabilities: { maySpawn: false, mayMessagePeers: true, mayEscalate: false, mayTransferOwnership: false, mayWriteRepo: false, mayUseShell: false, peerIds: [], resourceGrants: {} },
+  });
+  let prompts = 0;
+  (child as any).session = {
+    isStreaming: false,
+    async prompt() { prompts += 1; },
+    sessionManager: { getEntries: () => [] },
+  };
+  (child as any).blockedByOutcome = { lifecycle: "blocked" };
+  (child.client as any).request = async (operation: string) => {
+    if (operation === "agent.begin_turn") return { started: true };
+    if (operation === "agent.status") return { id: "child-reopen", taskId: "task-reopen" };
+    if (operation === "task.show") return { id: "task-reopen", owner: "child-reopen", status: "active" };
+    if (operation === "agent.end_turn") return { agent: { id: "child-reopen", status: "ready", taskId: "task-reopen" } };
+    return {};
+  };
+
+  (child as any).handleEvent({ event: "task_changed", data: { task: { id: "task-reopen", owner: "child-reopen", status: "active" } } });
+  (child as any).handleEvent({ event: "task_changed", data: { task: { id: "task-reopen", owner: "child-reopen", status: "active" } } });
+  for (let attempt = 0; attempt < 20 && prompts === 0; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(prompts, 1);
+  await child.stop();
+});
