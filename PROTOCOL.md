@@ -70,7 +70,7 @@ A reconnecting actor may re-register only with the matching token/session identi
 
 The public tool/command layer maps to these operation families:
 
-- `agent.register`, `agent.update`, `agent.configure_child`, `agent.begin_turn`, `agent.drain`, `agent.end_turn`, `agent.heartbeat`, `agent.cancel`, `agent.status`;
+- `agent.register`, `agent.update`, `agent.configure_child`, `agent.begin_turn`, `agent.end_turn`, `agent.finish_turn`, `agent.drain`, `agent.heartbeat`, `agent.cancel`, `agent.status`;
 - `agent.spawn`;
 - `message.send`, `message.reply`, `message.ack`, `message.inbox`, `message.list`;
 - `discover.agents`;
@@ -225,6 +225,13 @@ Terminal states are idempotent and permanently terminal. Only the explicit broke
 Only the broker writes `events.jsonl`. Mutations are transaction-framed. Recovery applies committed transactions and ignores a partial trailing transaction. Broker restart marks previously live sessions as liveness-unknown/reconnectable, releases their active leases and requeues their non-terminal task claims, and permits matching session identities to re-register once. It does not fail pending clarification records. No model transcript is replicated in the broker journal.
 
 A reconnectable actor keeps its `maxTotalAgents` slot reserved while its reconnect window is open: new registrations and spawns are refused rather than allowed to evict an expected reconnection, and the reservation is released when the actor reconnects, resolves its turn, or is cancelled. `maxConcurrentAgents` bounds concurrently running turns and is deliberately not reserved; a turn start that finds the fabric full is retryable and reports a structured limit error.
+
+`agent.finish_turn` is the atomic recovery transition used by managed hosts for a
+provider/compaction outcome. It may update the assigned task (`taskAction: "block"`
+or `"fail"`), transition the agent, and emit one parent notification in the same
+broker transaction. Reconnecting hosts query both the durable agent and assigned
+task before resuming, so a blocked recovery gate cannot be lost when one update
+event was missed.
 
 ## Error codes
 
