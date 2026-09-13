@@ -277,9 +277,15 @@ export class FabricRuntime {
         }
       }
 
-      const release = await this.modelCapacity.acquire(route, signal);
+      // Automatic compaction can run inside an already-admitted root model
+      // turn. The root permit is intentionally re-entrant for that nested
+      // lifecycle path; acquiring a second permit on a single-capacity local
+      // backend would make the root wait on itself until compaction aborts.
+      const release = this.rootModelCapacityRelease
+        ? undefined
+        : await this.modelCapacity.acquire(route, signal);
       if (epoch !== this.rootCompactionEpoch || this.stopped) {
-        release();
+        release?.();
         if (brokerReservation && this.root) await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
         return;
       }
