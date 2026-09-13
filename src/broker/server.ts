@@ -420,6 +420,8 @@ export class BrokerServer {
     switch (event.type) {
       case "message_sent":
         return event.message.to === actorId || event.message.from === actorId || observer.depth === 0;
+      case "message_updated":
+        return event.message.to === actorId || event.message.from === actorId || observer.depth === 0;
       case "message_acknowledged":
         return event.message.to === actorId || event.message.from === actorId || observer.depth === 0;
       case "messages_pruned":

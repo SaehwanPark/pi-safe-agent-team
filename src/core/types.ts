@@ -249,6 +249,10 @@ export interface FabricConfig {
   maxTaskOutput: number;
   leaseMs: number;
   heartbeatMs: number;
+  /** Mark an actor stale when no heartbeat is observed for this interval. */
+  agentHeartbeatTimeoutMs?: number;
+  /** Retain a stale reconnectable actor's slot for this long before retiring it. */
+  reconnectGraceMs?: number;
   messageRetention: number;
   /** Exact provider/model route capacities, keyed as `provider/model`. */
   modelRouteCapacity?: Record<string, number>;
@@ -270,6 +274,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   maxTaskOutput: 32 * 1024,
   leaseMs: 30 * 60 * 1000,
   heartbeatMs: 60 * 1000,
+  agentHeartbeatTimeoutMs: 3 * 60 * 1000,
+  reconnectGraceMs: 10 * 60 * 1000,
   messageRetention: 2048,
 };
 
@@ -332,6 +338,7 @@ export type CoordinatorEvent =
   | { type: "task_changed"; task: TaskRecord }
   | { type: "resource_changed"; resource: ResourceRecord }
   | { type: "message_sent"; message: AgentMessage; request?: RequestRecord }
+  | { type: "message_updated"; message: AgentMessage }
   | { type: "message_acknowledged"; message: AgentMessage }
   | { type: "messages_pruned"; ids: MessageId[] }
   | { type: "request_changed"; request: RequestRecord }
@@ -346,7 +353,7 @@ export interface DispatchResult<T = unknown> {
 }
 
 /**
- * Durable deduplication record for an idempotent write (agent.spawn, task.create).
+ * Durable deduplication record for an idempotent write.
  * A replay of the same actor + operationId + arguments returns the original
  * response instead of creating a second child or task.
  */

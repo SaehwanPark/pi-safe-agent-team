@@ -91,6 +91,53 @@ test("an agent cannot complete while it still has live descendants", () => {
   assert.equal(coordinator.dispatch("root", "agent.status", { agentId: child.id }).value.status, "starting");
 });
 
+test("task completion rejects an owner with live descendants before publishing a result", () => {
+  const coordinator = makeCoordinator({ maxChildrenPerAgent: 4, maxTotalAgents: 8 });
+  registerRoot(coordinator);
+  const parent = coordinator.dispatch("root", "agent.spawn", {
+    route,
+    capabilities: { maySpawn: true },
+    taskDescription: "parent task",
+  }).value as { agent: AgentRecord; taskId: string };
+  const descendant = coordinator.dispatch(parent.agent.id, "agent.spawn", { route }).value.agent as AgentRecord;
+  expectCode(() => coordinator.dispatch(parent.agent.id, "task.update", {
+    taskId: parent.taskId,
+    action: "complete",
+    result: { summary: "premature" },
+  }), "LIFECYCLE_CONFLICT");
+  assert.equal(coordinator.dispatch("root", "task.show", { taskId: parent.taskId }).value.status, "active");
+  assert.equal(coordinator.dispatch("root", "message.list", {}).value.some((message: AgentMessage) => message.type === "task_result"), false);
+  coordinator.dispatch("root", "agent.cancel", { agentId: descendant.id });
+  assert.equal(coordinator.dispatch(parent.agent.id, "task.update", {
+    taskId: parent.taskId,
+    action: "complete",
+    result: { summary: "done" },
+  }).value.status, "completed");
+});
+
+test("maintenance stales actors, releases claims, and expires reconnect reservations", () => {
+  const now = { value: 1_000 };
+  const coordinator = makeCoordinator({ maxTotalAgents: 3, agentHeartbeatTimeoutMs: 100, reconnectGraceMs: 200 }, now);
+  registerRoot(coordinator);
+  const spawned = coordinator.dispatch("root", "agent.spawn", { route, taskDescription: "recover me" }).value as { agent: AgentRecord; taskId: string };
+  now.value = 1_101;
+  coordinator.maintenance();
+  const stale = coordinator.dispatch("root", "agent.status", { agentId: spawned.agent.id }).value as AgentRecord;
+  assert.equal(stale.status, "failed");
+  assert.equal(stale.reconnectable, true);
+  assert.equal(stale.taskId, spawned.taskId);
+  assert.equal(coordinator.dispatch("root", "task.show", { taskId: spawned.taskId }).value.owner, undefined);
+  now.value = 1_302;
+  coordinator.maintenance();
+  const retired = coordinator.dispatch("root", "agent.status", { agentId: spawned.agent.id }).value as AgentRecord;
+  assert.equal(retired.status, "cancelled");
+  assert.equal(retired.reconnectable, false);
+  const task = coordinator.dispatch("root", "task.show", { taskId: spawned.taskId }).value;
+  assert.equal(task.status, "ready");
+  const replacement = coordinator.dispatch("root", "agent.spawn", { route }).value.agent as AgentRecord;
+  assert.ok(replacement.id);
+});
+
 test("draining freezes new work until the subtree is cancelled", () => {
   const coordinator = makeCoordinator({ maxChildrenPerAgent: 4, maxTotalAgents: 8 });
   registerRoot(coordinator);
@@ -269,6 +316,43 @@ test("message dedupe returns the original message", () => {
   const second = coordinator.dispatch("root", "message.send", { to: "child", type: "inform", body: "different", clientDedupeKey: "k" }).value.message;
   assert.equal(second.id, first.id);
   assert.equal(coordinator.dispatch("child", "message.inbox", {}).value.length, 1);
+});
+
+test("control notices coalesce to the newest durable state", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  registerChild(coordinator, "child");
+  const first = coordinator.dispatch("root", "message.send", {
+    to: "child",
+    type: "inform",
+    body: "lease-1",
+    clientDedupeKey: "control:resource_granted:file",
+    metadata: { requestId: "request-1", leaseId: "lease-1" },
+  }).value.message as AgentMessage;
+  const second = coordinator.dispatch("root", "message.send", {
+    to: "child",
+    type: "inform",
+    body: "lease-2",
+    clientDedupeKey: "control:resource_granted:file",
+    metadata: { requestId: "request-2", leaseId: "lease-2" },
+  });
+  assert.equal(second.value.message.id, first.id);
+  assert.equal(second.value.message.body, "lease-2");
+  assert.deepEqual(second.value.message.metadata, { requestId: "request-2", leaseId: "lease-2" });
+  assert.equal((coordinator.dispatch("child", "message.inbox", {}).value as AgentMessage[])[0]?.body, "lease-2");
+  assert.ok(second.events.some((event) => event.type === "message_updated"));
+});
+
+test("reopening a completed prerequisite is rejected while dependents remain live", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  const prerequisite = coordinator.dispatch("root", "task.create", { description: "prerequisite" }).value;
+  const dependent = coordinator.dispatch("root", "task.create", { description: "dependent", dependencies: [prerequisite.id] }).value;
+  coordinator.dispatch("root", "task.update", { taskId: prerequisite.id, action: "complete", result: { summary: "done" } });
+  assert.equal(coordinator.dispatch("root", "task.show", { taskId: dependent.id }).value.status, "ready");
+  expectCode(() => coordinator.dispatch("root", "task.update", { taskId: prerequisite.id, action: "reopen" }), "LIFECYCLE_CONFLICT");
+  coordinator.dispatch("root", "task.update", { taskId: dependent.id, action: "cancel" });
+  assert.equal(coordinator.dispatch("root", "task.update", { taskId: prerequisite.id, action: "reopen" }).value.status, "ready");
 });
 
 test("same-owner claim is idempotent and release requires exactly one selector", () => {

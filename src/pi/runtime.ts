@@ -103,6 +103,38 @@ function hashIdentity(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 24);
 }
 
+/**
+ * A durable child-message receipt is a dedicated, machine-readable line. It
+ * intentionally does not use substring matching: quoted IDs in ordinary
+ * model text cannot satisfy this exact receipt grammar.
+ */
+function childMessageReceipt(messageId: string): string {
+  return `<safe-agents-message id="${messageId}"/>`;
+}
+
+function childMessagePrompt(message: AgentMessage): string {
+  return `${childMessageReceipt(message.id)}\n[Fabric message from ${message.from} | ${message.type} | ${message.id}]\n${message.body}`;
+}
+
+function extractChildMessageReceipt(content: unknown): string | undefined {
+  const text = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n")
+      : "";
+  if (typeof text !== "string") return undefined;
+  const firstLine = text.split(/\r?\n/, 1)[0]?.trim();
+  const structured = /^<safe-agents-message id="([^"]+)"\/>$/.exec(firstLine ?? "");
+  if (structured) return structured[1];
+  // Read transcripts created before the structured receipt was introduced,
+  // but still require the complete canonical header rather than includes().
+  const legacy = /^\[Fabric message from [^|\]]+ \| [^|\]]+ \| ([^\]]+)\]$/.exec(firstLine ?? "");
+  if (legacy) return legacy[1];
+  // Very early test/host adapters only retained the compact receipt line.
+  const compact = /^\[Fabric message ([^\]]+)\]$/.exec(firstLine ?? "");
+  return compact?.[1];
+}
+
 function canonicalWorkspacePath(value: string): string {
   const resolved = resolve(value);
   try {
@@ -1170,6 +1202,8 @@ export class ManagedChild {
   /** Guards the one-shot wake scheduled for an explicit blocked-task reopen. */
   private recoveryWakePending = false;
   private recoveryWakeEpoch = 0;
+  /** Monotonic logical-turn counter used to derive stable lifecycle operation IDs. */
+  private turnSequence = 0;
 
   constructor(runtime: FabricRuntime, options: {
     agentId: string;
@@ -1602,15 +1636,24 @@ export class ManagedChild {
     });
   }
 
+  private requestLifecycle<T = unknown>(operation: string, args: Record<string, unknown>, operationId: string): Promise<T> {
+    const retry = (this.client as unknown as { requestIdempotent?: (...input: any[]) => Promise<unknown> }).requestIdempotent;
+    if (typeof retry === "function") return retry.call(this.client, operation, args, operationId) as Promise<T>;
+    // Lightweight lifecycle fakes used by hosts/tests may expose only request;
+    // retain compatibility while production BrokerClient gets durable replay.
+    return this.client.request<T>(operation, args);
+  }
+
   private enqueuePrompt(prompt: string): Promise<boolean> {
     // The returned promise resolves only after Pi has finished the queued
     // prompt. Message callers additionally verify that the corresponding user
     // entry is present in the durable SessionManager transcript before ACKing.
     const operation = this.promptTail.then(() => this.executePrompt(prompt)).catch(async (error) => {
-      const terminalized = await this.client.request("agent.end_turn", {
+      const ended = await this.requestLifecycle<{ agent?: AgentRecord }>("agent.end_turn", {
         status: "failed",
         statusReason: error instanceof Error ? error.message : String(error),
-      }).then(() => true).catch(() => false);
+      }, `recovery-${this.turnSequence++}-end`).catch(() => undefined);
+      const terminalized = Boolean(ended?.agent && ["completed", "failed", "cancelled"].includes(ended.agent.status));
       // Once the coordinator has committed failure, no later queued message
       // may be delivered into a terminal session. If transport is unavailable,
       // leave the live runtime reconnectable instead of manufacturing failure.
@@ -1646,7 +1689,7 @@ export class ManagedChild {
           : "";
       if (typeof messageText === "string") {
         for (const message of this.pendingChildAcks.values()) {
-          if (messageText.includes(message.id)) this.persistedChildMessageIds.add(message.id);
+          if (extractChildMessageReceipt(messageText) === message.id) this.persistedChildMessageIds.add(message.id);
         }
       }
       return;
@@ -1669,7 +1712,7 @@ export class ManagedChild {
     }
   }
 
-  private async finishTurnWithOutcome(outcomeValue: ModelTurnOutcome, taskId: string | undefined): Promise<void> {
+  private async finishTurnWithOutcome(outcomeValue: ModelTurnOutcome, taskId: string | undefined, turnId: string): Promise<void> {
     const reason = describeTurnOutcome(outcomeValue);
     const task = taskId
       ? await this.client.request<TaskRecord>("task.show", { taskId }).catch(() => undefined)
@@ -1695,7 +1738,7 @@ export class ManagedChild {
     };
     let ended: { agent: AgentRecord; task?: TaskRecord };
     try {
-      ended = await this.client.request<{ agent: AgentRecord; task?: TaskRecord }>("agent.finish_turn", finishArgs);
+      ended = await this.requestLifecycle<{ agent: AgentRecord; task?: TaskRecord }>("agent.finish_turn", finishArgs, `${turnId}:finish`);
       if (!ended?.agent) throw new FabricError("INVALID_ARGUMENT", "broker returned no finished agent");
     } catch (error) {
       // A broker process from an older safe-agent build may not know the
@@ -1729,12 +1772,13 @@ export class ManagedChild {
 
   private async executePrompt(prompt: string): Promise<boolean> {
     if (!this.session || this.stopping || this.blockedByOutcome) return false;
+    const turnId = `turn-${++this.turnSequence}`;
     this.turnOutcome = undefined;
     this.lastObservedOutcome = undefined;
     this.compactionFailure = undefined;
     let started = false;
     while (!started && !this.stopping) {
-      const result = await this.client.request<{ started: boolean }>("agent.begin_turn", {});
+      const result = await this.requestLifecycle<{ started: boolean }>("agent.begin_turn", {}, `${turnId}:begin`);
       started = result.started;
       if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
     }
@@ -1778,7 +1822,7 @@ export class ManagedChild {
     }
     if (promptThrownOutcome) {
       const agent = await this.client.request<AgentRecord>("agent.status", {});
-      await this.finishTurnWithOutcome(promptThrownOutcome, agent.taskId ?? this.taskId);
+      await this.finishTurnWithOutcome(promptThrownOutcome, agent.taskId ?? this.taskId, turnId);
       return true;
     }
     if (this.embeddedManager && this.contextMode === "lcm-embedded") {
@@ -1794,14 +1838,14 @@ export class ManagedChild {
     const assignedTaskId = agent.taskId ?? this.taskId;
     const outcomeValue = this.compactionFailure ?? this.turnOutcome ?? this.lastObservedOutcome;
     if (outcomeValue && isBlockingOutcome(outcomeValue)) {
-      await this.finishTurnWithOutcome(outcomeValue, assignedTaskId);
+      await this.finishTurnWithOutcome(outcomeValue, assignedTaskId, turnId);
       return true;
     }
     const task = assignedTaskId
       ? await this.client.request<TaskRecord>("task.show", { taskId: assignedTaskId })
       : undefined;
     const status = taskAwareTurnStatus(task, this.pendingReplyIds.size > 0);
-    const ended = await this.client.request<{ agent: AgentRecord }>("agent.end_turn", { status });
+    const ended = await this.requestLifecycle<{ agent: AgentRecord }>("agent.end_turn", { status }, `${turnId}:end`);
     this.record = ended.agent;
     this.taskId = ended.agent.taskId;
     if (["completed", "failed", "cancelled"].includes(ended.agent.status)) await this.stop();
@@ -1887,7 +1931,7 @@ export class ManagedChild {
       }
       return;
     }
-    const text = `[Fabric message from ${message.from} | ${message.type} | ${message.id}]\n${message.body}`;
+    const text = childMessagePrompt(message);
     let accepted = false;
     try {
       if (!this.session || this.stopping) throw new FabricError("CHILD_SESSION_FAILURE", "Child session is not ready to accept messages");
@@ -1964,7 +2008,7 @@ export class ManagedChild {
           : Array.isArray(content)
             ? content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n")
             : "";
-        return typeof text === "string" && text.includes(messageId);
+        return extractChildMessageReceipt(text) === messageId;
       });
     } catch {
       return false;
