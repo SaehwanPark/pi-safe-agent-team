@@ -70,6 +70,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   let rootDeliveryTail: Promise<void> = Promise.resolve();
   let rootDeliveryEpoch = 0;
   const deferredRootMessages = new Map<string, AgentMessage>();
+  let deferredRootWakePending = false;
   const lifecycleQueue = new LifecycleQueue();
   let rootLogicalRunActive = false;
   let lastFinalRootOutcome: ModelTurnOutcome | undefined;
@@ -149,13 +150,28 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   function wakeDeferredRoot(api: ExtensionAPI): void {
     if (deferredRootMessages.size === 0 || runtime.isRootCompactionInFlight || runtime.rootHealth === "degraded") return;
     // A retry/continuation is already running in Pi. The messages were
-    // delivered as next-turn context, so do not enqueue a second synthetic
-    // wake against the same logical run.
+    // delivered as next-turn context, so wait until that logical run settles
+    // before enqueueing a synthetic wake. `nextTurn` messages are injected by
+    // Pi only when a real prompt starts, so a custom-message wake would leave
+    // them stranded in the pending-next-turn queue.
     if (rootLogicalRunActive) {
-      deferredRootMessages.clear();
+      deferredRootWakePending = true;
       return;
     }
     deferredRootMessages.clear();
+    deferredRootWakePending = false;
+    const sendUserMessage = (api as ExtensionAPI & { sendUserMessage?: (content: string, options?: { expandPromptTemplates?: boolean }) => void }).sendUserMessage;
+    if (typeof sendUserMessage === "function") {
+      // This starts a normal prompt, which flushes Pi's pending `nextTurn`
+      // messages into the model context before generation begins.
+      sendUserMessage("Review the deferred safe-agents messages that were waiting for root context recovery.", {
+        expandPromptTemplates: false,
+      });
+      return;
+    }
+    // Lightweight hosts predating sendUserMessage still get a visible wake;
+    // their custom-message implementation may not expose Pi's pending-next-turn
+    // queue, so retain the compatibility fallback.
     void api.sendMessage({
       customType: "safe-agents.status",
       content: "Deferred fabric messages are available in the session context; review them before continuing.",
@@ -211,6 +227,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     rootDeliveryEpoch += 1;
     rootDeliveryTail = Promise.resolve();
     deferredRootMessages.clear();
+    deferredRootWakePending = false;
     rootLogicalRunActive = false;
     lastFinalRootOutcome = undefined;
     runtime.resetRootCompactionState();
@@ -237,6 +254,10 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       rootLogicalRunActive = true;
       lastFinalRootOutcome = undefined;
       runtime.resetRootContextHealth();
+      // A user-led run consumes any messages queued as `nextTurn`. Automatic
+      // compaction/retry continuations set deferredRootWakePending instead and
+      // must keep the queue until the logical run finally settles.
+      if (!deferredRootWakePending) deferredRootMessages.clear();
       let started = false;
       while (!started && generation === lifecycleQueue.currentGeneration) {
         const result = await runtime.request<{ started?: boolean }>("agent.begin_turn", {});
@@ -298,6 +319,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
         rootLogicalRunActive = false;
         lastFinalRootOutcome = undefined;
       }
+      if (deferredRootWakePending || deferredRootMessages.size > 0) wakeDeferredRoot(pi);
     }).catch((error) => notifyLifecycleFailure(ctx, error, "warning", generation));
   });
 
@@ -305,6 +327,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     rootDeliveryEpoch += 1;
     rootDeliveryTail = Promise.resolve();
     deferredRootMessages.clear();
+    deferredRootWakePending = false;
     rootLogicalRunActive = false;
     lastFinalRootOutcome = undefined;
     runtime.resetRootCompactionState();
