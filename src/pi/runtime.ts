@@ -49,6 +49,24 @@ export interface SpawnedAgentSummary {
   summaryText?: string;
 }
 
+export type DescendantShutdownMode = "graceful" | "budget" | "now";
+
+/** Deterministic, model-free recovery state captured before descendant abort. */
+export interface HandoffSnapshot {
+  agentId: string;
+  parentId?: string;
+  role: string;
+  status: AgentStatus;
+  task?: Pick<TaskRecord, "id" | "description" | "status" | "owner" | "result">;
+  workspace?: AgentRecord["workspace"];
+  route: ModelRoute;
+  lastActivity: number;
+  pendingRequests: string[];
+  mutableResources: string[];
+  activeWriteFences: string[];
+  reason: string;
+}
+
 /** Derive a host lifecycle result from durable task facts, never model text. */
 export function taskAwareTurnStatus(task: Pick<TaskRecord, "status"> | undefined, hasPendingReply: boolean): AgentStatus {
   switch (task?.status) {
@@ -132,6 +150,12 @@ export class FabricRuntime {
   private rootDelivery?: (message: AgentMessage) => void;
   private caseInsensitivePaths?: boolean;
   private sessionId?: string;
+  private draining = false;
+  private lastHandoffSnapshots: HandoffSnapshot[] = [];
+
+  static readonly shutdownRpcTimeoutMs = 1_500;
+  static readonly shutdownAbortTimeoutMs = 1_500;
+  static readonly shutdownDeadlineMs = 3_000;
 
   get fabricId(): string {
     return this._fabricId;
@@ -143,6 +167,22 @@ export class FabricRuntime {
 
   get endpoint(): string {
     return this._endpoint;
+  }
+
+  get isDraining(): boolean {
+    return this.draining;
+  }
+
+  get handoffSnapshots(): readonly HandoffSnapshot[] {
+    return this.lastHandoffSnapshots.map((snapshot) => ({
+      ...snapshot,
+      task: snapshot.task ? { ...snapshot.task, result: snapshot.task.result ? { ...snapshot.task.result } : undefined } : undefined,
+      workspace: snapshot.workspace ? { ...snapshot.workspace } : undefined,
+      route: { ...snapshot.route },
+      pendingRequests: [...snapshot.pendingRequests],
+      mutableResources: [...snapshot.mutableResources],
+      activeWriteFences: [...snapshot.activeWriteFences],
+    }));
   }
 
   constructor(options: FabricRuntimeOptions = {}) {
@@ -373,7 +413,7 @@ export class FabricRuntime {
       const rootBusy = !rootAgent || rootAgent.status === "starting" || rootAgent.status === "running";
 
       const runningChildren = status.agents.filter(
-        (a) => a.depth > 0 && (a.status === "starting" || a.status === "running"),
+        (a) => a.depth > 0 && (a.status === "starting" || a.status === "running" || a.status === "draining"),
       ).length;
       const unresolvedChildTasks = status.tasks.filter(
         (t) => t.owner && t.owner !== status.rootId && ["pending", "ready", "active", "waiting", "blocked"].includes(t.status),
@@ -476,16 +516,107 @@ export class FabricRuntime {
 
   async spawnFromRoot(input: SpawnToolInput, parentModel?: Model<any>, parentThinking?: string): Promise<SpawnedAgentSummary> {
     if (!this.root || !this.modelRegistry) throw new FabricError("BROKER_UNAVAILABLE", "Fabric root is not attached");
+    if (this.draining) throw new FabricError("LIFECYCLE_CONFLICT", "The fabric is draining; new children are not admitted");
     return this.spawnChild(this.root.agentId, this.root.client, input, parentModel ?? this.root.ctx.model, parentThinking ?? this.root.ctx.thinkingLevel ?? "medium", this.root.ctx.cwd);
   }
 
   async spawnChildFrom(parent: ManagedChild, input: SpawnToolInput): Promise<SpawnedAgentSummary> {
+    if (this.draining) throw new FabricError("LIFECYCLE_CONFLICT", "The fabric is draining; new children are not admitted");
     return this.spawnChild(parent.agentId, parent.client, input, parent.session?.model, parent.session?.thinkingLevel ?? "medium", parent.workspacePath);
+  }
+
+  /**
+   * Capture deterministic recovery metadata and stop every managed descendant.
+   * This is deliberately separate from stop(): the root remains attached and
+   * usable after an aborted run, while a session shutdown tears down the host.
+   */
+  async abortDescendants(options: { reason?: string; mode?: DescendantShutdownMode } = {}): Promise<readonly HandoffSnapshot[]> {
+    const reason = options.reason ?? "descendants-aborted";
+    const mode = options.mode ?? "graceful";
+    if (this.draining) return this.handoffSnapshots;
+    this.draining = true;
+    const root = this.root;
+    const children = [...this.children.values()];
+    try {
+      this.lastHandoffSnapshots = await this.captureHandoffSnapshots(reason).catch(() => this.captureLocalHandoffSnapshots(reason));
+      const topLevel = root
+        ? children.filter((child) => child.parentId === root.agentId)
+        : children.filter((child) => !children.some((candidate) => candidate.parentId === child.agentId));
+      const targets = topLevel.length > 0 ? topLevel : children;
+
+      // Freeze the coordinator first. This prevents a queued child turn or
+      // spawn from racing the emergency stop while local sessions are aborted.
+      if (root) {
+        await Promise.allSettled(targets.map((child) => root.client.request("agent.drain", { agentId: child.agentId, reason }, FabricRuntime.shutdownRpcTimeoutMs)));
+      }
+
+      const aborts = children.map((child) => child.stop({ abortTimeoutMs: FabricRuntime.shutdownAbortTimeoutMs }));
+      const cancellations = root
+        ? targets.map((child) => root.client.request("agent.cancel", { agentId: child.agentId }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined))
+        : [];
+      const all = Promise.allSettled([...aborts, ...cancellations]);
+      const graceMs = mode === "now" ? 0 : mode === "budget" ? 750 : 2_000;
+      await Promise.race([all, new Promise<void>((resolve) => setTimeout(resolve, graceMs))]);
+      // A child abort is cooperative. Ensure disposal still happens if a
+      // provider ignored the abort promise or the grace deadline elapsed.
+      for (const child of children) child.disposeNow();
+      void all;
+      return this.handoffSnapshots;
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  private async captureHandoffSnapshots(reason: string): Promise<HandoffSnapshot[]> {
+    const status = (await this.status()) as FabricStatus;
+    const tasksById = new Map(status.tasks.map((task) => [task.id, task]));
+    const requestsByAgent = new Map<string, string[]>();
+    for (const request of status.pendingRequests) {
+      for (const agentId of [request.from, request.to]) {
+        const current = requestsByAgent.get(agentId) ?? [];
+        current.push(request.id);
+        requestsByAgent.set(agentId, current);
+      }
+    }
+    return status.agents
+      .filter((agent) => agent.depth > 0 && !["completed", "failed", "cancelled"].includes(agent.status))
+      .map((agent) => ({
+        agentId: agent.id,
+        parentId: agent.parentId,
+        role: agent.role,
+        status: agent.status,
+        task: agent.taskId ? tasksById.get(agent.taskId) : undefined,
+        workspace: agent.workspace ? { ...agent.workspace } : undefined,
+        route: { ...agent.route },
+        lastActivity: agent.lastActivity,
+        pendingRequests: [...new Set(requestsByAgent.get(agent.id) ?? [])],
+        mutableResources: status.resources.filter((resource) => resource.mutableHold?.agentId === agent.id).map((resource) => resource.id),
+        activeWriteFences: (status.fences ?? []).filter((fence) => fence.actorId === agent.id).map((fence) => fence.id),
+        reason,
+      }));
+  }
+
+  private captureLocalHandoffSnapshots(reason: string): HandoffSnapshot[] {
+    return [...this.children.values()].filter((child) => !["completed", "failed", "cancelled"].includes(child.record.status)).map((child) => ({
+      agentId: child.agentId,
+      parentId: child.parentId,
+      role: child.role,
+      status: child.record.status,
+      task: undefined,
+      workspace: child.workspace ? { ...child.workspace } : undefined,
+      route: { ...child.route },
+      lastActivity: child.record.lastActivity,
+      pendingRequests: [],
+      mutableResources: [],
+      activeWriteFences: [],
+      reason,
+    }));
   }
 
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    this.draining = true;
     if (this.rootHeartbeatTimer) clearInterval(this.rootHeartbeatTimer);
     this.rootEventUnsubscribe?.();
     this.rootCloseUnsubscribe?.();
@@ -493,20 +624,32 @@ export class FabricRuntime {
     // Cancel managed descendants explicitly, then leave the reusable root in
     // the durable ready state so a later Pi session can reconnect. Explicit
     // terminal transitions still remain irreversible.
-    if (this.root) {
-      await this.root.client.request("agent.end_turn", { status: "ready" }).catch(() => undefined);
-      for (const child of this.children.values()) {
-        await this.root.client.request("agent.cancel", { agentId: child.agentId }).catch(() => undefined);
-        await child.stop();
-      }
-    } else {
-      for (const child of this.children.values()) await child.stop();
-    }
+    const root = this.root;
+    const children = [...this.children.values()];
+    this.lastHandoffSnapshots = await this.captureHandoffSnapshots("session-shutdown").catch(() => this.captureLocalHandoffSnapshots("session-shutdown"));
+    const topLevel = root
+      ? children.filter((child) => child.parentId === root.agentId)
+      : children.filter((child) => !children.some((candidate) => candidate.parentId === child.agentId));
+    const targets = topLevel.length > 0 ? topLevel : children;
+    const rootOperations = root
+      ? [
+          root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined),
+          ...targets.map((child) => root.client.request("agent.drain", { agentId: child.agentId, reason: "session-shutdown" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined)),
+          ...targets.map((child) => root.client.request("agent.cancel", { agentId: child.agentId }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined)),
+        ]
+      : [];
+    const childStops = children.map((child) => child.stop({ abortTimeoutMs: FabricRuntime.shutdownAbortTimeoutMs }));
+    await Promise.race([
+      Promise.allSettled([...rootOperations, ...childStops]),
+      new Promise<void>((resolve) => setTimeout(resolve, FabricRuntime.shutdownDeadlineMs)),
+    ]);
+    for (const child of children) child.disposeNow();
     this.children.clear();
     this.root?.client.close();
-    if (this.server) await this.server.stop();
+    if (this.server) await Promise.race([this.server.stop(), new Promise<void>((resolve) => setTimeout(resolve, FabricRuntime.shutdownDeadlineMs))]).catch(() => undefined);
     this.server = undefined;
     this.root = undefined;
+    this.draining = false;
   }
 
   private async loadRootToken(): Promise<void> {
@@ -761,6 +904,7 @@ export class ManagedChild {
 
   async start(): Promise<void> {
     if (this.started) return;
+    if (this.runtime.isDraining) throw new FabricError("LIFECYCLE_CONFLICT", "The fabric is draining; child startup was cancelled");
     await this.client.connect();
     this.eventUnsubscribe = this.client.onEvent((event) => this.handleEvent(event));
     const settingsManager = SettingsManager.create(this.workspacePath, this.agentDir);
@@ -926,23 +1070,46 @@ export class ManagedChild {
     this.enqueuePrompt(this.bootstrapPrompt());
   }
 
-  async stop(): Promise<void> {
+  async stop(options: { abortTimeoutMs?: number } = {}): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.eventUnsubscribe?.();
     this.closeUnsubscribe?.();
     try {
-      await this.session?.abort();
+      const abort = this.session?.abort();
+      if (abort) {
+        const timeoutMs = Math.max(0, options.abortTimeoutMs ?? FabricRuntime.shutdownAbortTimeoutMs);
+        await Promise.race([abort, new Promise<void>((resolve) => setTimeout(resolve, timeoutMs))]);
+      }
     } catch {
       // Cancellation is best effort; the coordinator still releases on the explicit request.
     }
-    this.session?.dispose();
+    this.disposeNow();
+    await this.cleanupWorkspace();
+  }
+
+  /** Synchronous best-effort disposal used after an emergency deadline. */
+  disposeNow(): void {
+    this.stopping = true;
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.eventUnsubscribe?.();
+    this.closeUnsubscribe?.();
+    try {
+      this.session?.dispose();
+    } catch {}
     try {
       this.embeddedManager?.dispose();
     } catch {}
     this.embeddedManager = undefined;
     this.client.close();
+  }
+
+  private async cleanupWorkspace(): Promise<void> {
+    if (!this.workspace || this.workspace.mode !== "worktree") return;
+    // Clean worktrees are disposable. A dirty worktree is a recovery artifact
+    // and is intentionally retained for the user to inspect or merge later.
+    await this.runtime.workspaceStrategy.cleanup(this.workspace).catch(() => undefined);
   }
 
   private async reconnect(): Promise<void> {

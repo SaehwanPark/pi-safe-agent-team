@@ -374,9 +374,7 @@ export async function evaluateRootShellGuard(
   if (typeof command !== "string" || command.trim().length === 0) return undefined;
 
   const risk = classifyRootShellCommand(command);
-  if (risk.kind === "read-only" || risk.kind === "unknown") {
-    return undefined;
-  }
+  if (risk.kind === "read-only") return undefined;
 
   let status: FabricStatus | undefined;
   try {
@@ -396,7 +394,22 @@ export async function evaluateRootShellGuard(
     (f) => f.actorId !== status?.rootId,
   );
 
-  if (childHolds.length === 0 && activeFences === 0) {
+  // Unknown commands are a deliberate trusted-root escape hatch while the
+  // fabric is idle. Once a child has a mutable hold or active fence, allowing
+  // an unclassified executable would bypass coordination entirely, so fail
+  // closed until the coordinated work is released.
+  if (risk.kind === "unknown") {
+    if (childHolds.length === 0 && childFences.length === 0) return undefined;
+    const holder = childHolds[0]?.mutableHold?.agentId ?? childFences[0]?.actorId ?? "a child agent";
+    const res = childHolds[0]?.path ?? childHolds[0]?.id ?? childFences[0]?.path ?? childFences[0]?.resourceId ?? "workspace";
+    const condition = childHolds.length > 0 ? `holds mutable resource ${res}` : `has an active write fence on ${res}`;
+    return {
+      block: true,
+      reason: `safe-agents blocked unknown shell command \`${command.trim()}\` while child ${holder} ${condition}. Wait for/release the hold, or explicitly perform the operation after coordinated child work completes.`,
+    };
+  }
+
+  if (childHolds.length === 0 && childFences.length === 0 && activeFences === 0) {
     return undefined;
   }
 

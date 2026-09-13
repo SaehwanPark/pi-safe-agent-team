@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Box, Text } from "@earendil-works/pi-tui";
 import { FabricError, asFabricError } from "./src/core/errors.ts";
 import type { AgentMessage, FabricStatus } from "./src/core/types.ts";
-import { FabricRuntime } from "./src/pi/runtime.ts";
+import { FabricRuntime, type DescendantShutdownMode } from "./src/pi/runtime.ts";
 import { LifecycleQueue } from "./src/pi/lifecycle.ts";
 import { createCoordinationTools } from "./src/pi/tools.ts";
 import { classifyRootDelivery } from "./src/pi/delivery.ts";
@@ -15,6 +15,7 @@ export { BrokerClient } from "./src/broker/client.ts";
 export { BrokerServer, startBroker } from "./src/broker/server.ts";
 export { Journal } from "./src/broker/journal.ts";
 export { FabricRuntime, ManagedChild, taskAwareTurnStatus } from "./src/pi/runtime.ts";
+export type { DescendantShutdownMode, HandoffSnapshot } from "./src/pi/runtime.ts";
 export { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootShellGuard, evaluateRootWriteGuard, workspaceRelativePath } from "./src/pi/guards.ts";
 export { classifyRootShellCommand, type RootShellRisk } from "./src/pi/shell-classifier.ts";
 export { classifyRootDelivery, type RootDeliveryDecision, type RootDeliveryContext } from "./src/pi/delivery.ts";
@@ -201,6 +202,9 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     const generation = lifecycleQueue.currentGeneration;
     void enqueueLifecycle(generation, async () => {
       if (!runtime.rootAgentId) return;
+      if (rootSessionEndedWithAbort(ctx)) {
+        await runtime.abortDescendants({ reason: "root-aborted", mode: "budget" });
+      }
       await runtime.request("agent.end_turn", { status: "ready" });
     }).catch((error) => notifyLifecycleFailure(ctx, error, "warning", generation));
   });
@@ -218,6 +222,13 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       try {
         await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
         const mode = args.trim() || "status";
+        if (mode === "stop" || mode.startsWith("stop ")) {
+          const requestedMode = mode.slice("stop".length).trim();
+          const shutdownMode: DescendantShutdownMode = requestedMode === "--now" ? "now" : requestedMode === "--budget" ? "budget" : "graceful";
+          const snapshots = await runtime.abortDescendants({ reason: `agents-stop:${shutdownMode}`, mode: shutdownMode });
+          ctx.ui.notify(`safe-agents: stopped ${snapshots.length} descendant${snapshots.length === 1 ? "" : "s"} (${shutdownMode}); deterministic handoff captured`, "info");
+          return;
+        }
         if (mode === "inbox") {
           const messages = await runtime.request<AgentMessage[]>("message.inbox", { limit: 50 });
           ctx.ui.notify(messages.length ? messages.map(formatMessage).join("\n\n") : "safe-agents inbox is empty", "info");
@@ -249,6 +260,22 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       }
     },
   });
+}
+
+function rootSessionEndedWithAbort(ctx: ExtensionContext): boolean {
+  const manager = (ctx as ExtensionContext & { sessionManager?: { getEntries?: () => unknown[] } }).sessionManager;
+  try {
+    const entries = manager?.getEntries?.() ?? [];
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index] as { type?: string; message?: { role?: string; stopReason?: string } };
+      if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
+      return entry.message.stopReason === "aborted";
+    }
+  } catch {
+    // A lightweight test/RPC context may not expose session entries. In that
+    // case ordinary settlement remains unchanged.
+  }
+  return false;
 }
 
 function formatMessage(message: AgentMessage): string {

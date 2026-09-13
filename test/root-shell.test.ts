@@ -79,9 +79,10 @@ test("root-shell: blocked with exact UX when child holds mutable resource", asyn
   const client = makeMockClient(status);
   const options = { client, workspacePath: "/test/workspace" };
 
-  // 1. Read-only command is allowed
+  // 1. Arbitrary executable workloads fail closed while a child hold exists.
   const readOnlyOutcome = await evaluateRootShellGuard(options, { command: "cargo test" });
-  assert.equal(readOnlyOutcome, undefined);
+  assert.ok(readOnlyOutcome?.block);
+  assert.ok(readOnlyOutcome?.reason?.includes("unknown shell command"));
 
   const gitDiffOutcome = await evaluateRootShellGuard(options, { command: "git diff" });
   assert.equal(gitDiffOutcome, undefined);
@@ -107,9 +108,10 @@ test("root-shell: blocked with exact UX when child holds mutable resource", asyn
   assert.ok(collidingOutcome?.block);
   assert.ok(collidingOutcome?.reason?.includes("while child agent-4 holds mutable resource src/parser"));
 
-  // 5. Unknown command retains trusted-root semantics (allowed)
+  // 5. Unknown commands cannot bypass an active child hold.
   const unknownOutcome = await evaluateRootShellGuard(options, { command: "custom-script --check" });
-  assert.equal(unknownOutcome, undefined);
+  assert.ok(unknownOutcome?.block);
+  assert.ok(unknownOutcome?.reason?.includes("unknown shell command"));
 
   // 6. Output redirections targeting held path are blocked
   const echoRedir = await evaluateRootShellGuard(options, { command: "echo x>src/parser/ast.ts" });
@@ -162,9 +164,10 @@ test("root-shell: active write fences block colliding mutators even if mutable h
   const client = makeMockClient(statusWithFence);
   const options = { client, workspacePath: "/test/workspace" };
 
-  // 1. Read-only command is allowed
+  // 1. Arbitrary executable workloads fail closed while a child fence exists.
   const readOnlyOutcome = await evaluateRootShellGuard(options, { command: "cargo test" });
-  assert.equal(readOnlyOutcome, undefined);
+  assert.ok(readOnlyOutcome?.block);
+  assert.ok(readOnlyOutcome?.reason?.includes("unknown shell command"));
 
   // 2. Broad mutator is blocked by active fence
   const broadOutcome = await evaluateRootShellGuard(options, { command: "cargo fmt" });
@@ -196,4 +199,3 @@ test("root-shell: active write fences block colliding mutators even if mutable h
   const readOnlyOmitted = await evaluateRootShellGuard(optionsOmitted, { command: "git diff" });
   assert.equal(readOnlyOmitted, undefined);
 });
-
