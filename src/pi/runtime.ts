@@ -195,6 +195,8 @@ export class FabricRuntime {
   private rootCompactionInFlight = 0;
   private rootCompactionReleases: Array<(() => void) | undefined> = [];
   private rootCompactionBrokerReservations: boolean[] = [];
+  private rootCompactionOperationIds: Array<string | undefined> = [];
+  private rootCompactionSequence = 0;
   private rootCompactionEpoch = 0;
   private rootModelCapacityRelease?: () => void;
   private rootModelCapacityController?: AbortController;
@@ -275,12 +277,15 @@ export class FabricRuntime {
     const reservationIndex = this.rootCompactionBrokerReservations.length;
     this.rootCompactionInFlight += 1;
     this.rootCompactionBrokerReservations.push(false);
+    const operationBase = `root-compaction-${++this.rootCompactionSequence}`;
+    this.rootCompactionOperationIds.push(undefined);
     const releaseIndex = this.rootCompactionReleases.length;
     this.rootCompactionReleases.push(undefined);
     const route = this.root?.ctx.model ? routeFromModel(this.root.ctx.model, this.root.ctx.thinkingLevel ?? "medium") : undefined;
     if (!route) {
       this.rootCompactionReleases.pop();
       this.rootCompactionBrokerReservations.pop();
+      this.rootCompactionOperationIds.pop();
       this.rootCompactionInFlight = Math.max(0, this.rootCompactionInFlight - 1);
       return;
     }
@@ -294,7 +299,7 @@ export class FabricRuntime {
           while (true) {
             if (this.stopped) throw new FabricError("LIFECYCLE_CONFLICT", "Root compaction admission stopped with the fabric");
             if (signal?.aborted) throw new FabricError("BROKER_UNAVAILABLE", "Root compaction admission was aborted");
-            const result = await this.root.client.request<{ started?: boolean }>("agent.begin_turn", {}, FabricRuntime.shutdownRpcTimeoutMs, signal);
+            const result = await this.requestLifecycleOnClient<{ started?: boolean }>(this.root.client, "agent.begin_turn", {}, `${operationBase}:begin`, FabricRuntime.shutdownRpcTimeoutMs, signal);
             if (result?.started === true) {
               brokerReservation = true;
               break;
@@ -318,17 +323,19 @@ export class FabricRuntime {
         : await this.modelCapacity.acquire(route, signal);
       if (epoch !== this.rootCompactionEpoch || this.stopped) {
         release?.();
-        if (brokerReservation && this.root) await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+        if (brokerReservation && this.root) await this.requestLifecycleOnClient(this.root.client, "agent.end_turn", { status: "ready" }, `${operationBase}:end`, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
         return;
       }
       this.rootCompactionReleases[releaseIndex] = release;
       this.rootCompactionBrokerReservations[reservationIndex] = brokerReservation;
+      if (brokerReservation) this.rootCompactionOperationIds[reservationIndex] = operationBase;
     } catch (error) {
-      if (brokerReservation && this.root) await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+      if (brokerReservation && this.root) await this.requestLifecycleOnClient(this.root.client, "agent.end_turn", { status: "ready" }, `${operationBase}:end`, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
       // Keep direct callers from leaking a compaction slot when admission or
       // the local gate is aborted before Pi can emit its failure hook.
       if (releaseIndex === this.rootCompactionReleases.length - 1) this.rootCompactionReleases.pop();
       if (reservationIndex === this.rootCompactionBrokerReservations.length - 1) this.rootCompactionBrokerReservations.pop();
+      if (reservationIndex === this.rootCompactionOperationIds.length - 1) this.rootCompactionOperationIds.pop();
       if (this.rootCompactionInFlight > 0) this.rootCompactionInFlight -= 1;
       throw error;
     }
@@ -338,8 +345,9 @@ export class FabricRuntime {
     if (this.rootCompactionInFlight > 0) this.rootCompactionInFlight -= 1;
     this.rootCompactionReleases.pop()?.();
     const brokerReservation = this.rootCompactionBrokerReservations.pop() ?? false;
+    const operationBase = this.rootCompactionOperationIds.pop();
     if (brokerReservation && this.root) {
-      await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+      await this.requestLifecycleOnClient(this.root.client, "agent.end_turn", { status: "ready" }, `${operationBase ?? `root-compaction-${this.rootCompactionSequence}`}:end`, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
     }
   }
 
@@ -347,10 +355,14 @@ export class FabricRuntime {
     this.rootCompactionEpoch += 1;
     this.rootCompactionInFlight = 0;
     const reservations = this.rootCompactionBrokerReservations.splice(0);
+    const operationIds = this.rootCompactionOperationIds.splice(0);
     for (const release of this.rootCompactionReleases.splice(0)) release?.();
     if (this.root) {
-      for (const reserved of reservations) {
-        if (reserved) void this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+      for (let index = 0; index < reservations.length; index += 1) {
+        if (reservations[index]) {
+          const operationBase = operationIds[index] ?? `root-compaction-${this.rootCompactionSequence}`;
+          void this.requestLifecycleOnClient(this.root.client, "agent.end_turn", { status: "ready" }, `${operationBase}:end`, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+        }
       }
     }
   }
@@ -543,6 +555,17 @@ export class FabricRuntime {
   ): Promise<T> {
     if (!this.root) throw new FabricError("BROKER_UNAVAILABLE", "Fabric root is not attached");
     return this.root.client.requestIdempotent<T>(operation, args, operationId, timeoutMs);
+  }
+
+  private requestLifecycleOnClient<T = unknown>(
+    client: BrokerClient,
+    operation: string,
+    args: Record<string, unknown>,
+    operationId: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return client.requestIdempotent<T>(operation, args, operationId, timeoutMs, signal);
   }
 
   /** Coordinate a root-session file mutation against live borrowing state. */
@@ -922,7 +945,7 @@ export class FabricRuntime {
     const targets = topLevel.length > 0 ? topLevel : children;
     const rootOperations = root
       ? [
-          root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined),
+          this.requestLifecycleOnClient(root.client, "agent.end_turn", { status: "ready" }, `root-stop-${this.lifecycleEpoch}:end`, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined),
           ...targets.map((child) => root.client.request("agent.drain", { agentId: child.agentId, reason: "session-shutdown" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined)),
           ...targets.map((child) => root.client.request("agent.cancel", { agentId: child.agentId }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined)),
         ]

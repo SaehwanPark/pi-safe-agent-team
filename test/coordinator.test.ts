@@ -121,6 +121,7 @@ test("maintenance stales actors, releases claims, and expires reconnect reservat
   registerRoot(coordinator);
   const spawned = coordinator.dispatch("root", "agent.spawn", { route, taskDescription: "recover me" }).value as { agent: AgentRecord; taskId: string };
   now.value = 1_101;
+  coordinator.dispatch("root", "agent.heartbeat", {});
   coordinator.maintenance();
   const stale = coordinator.dispatch("root", "agent.status", { agentId: spawned.agent.id }).value as AgentRecord;
   assert.equal(stale.status, "failed");
@@ -128,6 +129,7 @@ test("maintenance stales actors, releases claims, and expires reconnect reservat
   assert.equal(stale.taskId, spawned.taskId);
   assert.equal(coordinator.dispatch("root", "task.show", { taskId: spawned.taskId }).value.owner, undefined);
   now.value = 1_302;
+  coordinator.dispatch("root", "agent.heartbeat", {});
   coordinator.maintenance();
   const retired = coordinator.dispatch("root", "agent.status", { agentId: spawned.agent.id }).value as AgentRecord;
   assert.equal(retired.status, "cancelled");

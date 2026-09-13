@@ -12,7 +12,7 @@ starting -> ready -> running -> ready
                     +-> completed | failed | cancelled
 ```
 
-Terminal states are idempotent and permanent. A broker restart creates one explicit reconnectable liveness window for previously live actors; a matching token can reattach that actor once, but a completed, cancelled, or non-recoverable failed actor cannot be revived. The root can drain or cancel a descendant subtree. `draining` is a restrictive, non-terminal phase: no new turns, children, tasks, resource claims, or borrows are admitted, while final handoff messages and releases remain possible. A failed or cancelled parent always cascades to its descendants, and a parent cannot complete while a live descendant remains. Cancellation and crash recovery release runtime claims; clean worktrees are reclaimed on child shutdown, while dirty artifacts remain inspectable.
+Terminal states are idempotent and permanent. A broker restart creates one explicit reconnectable liveness window for previously live actors; a matching token can reattach that actor once, but a completed, cancelled, or non-recoverable failed actor cannot be revived. The broker also expires actors that miss `agentHeartbeatTimeoutMs`, releases their runtime claims, and retains their slot only through `reconnectGraceMs`; an actor that never reconnects is retired and unfinished work returns to the ready task pool. The root can drain or cancel a descendant subtree. `draining` is a restrictive, non-terminal phase: no new turns, children, tasks, resource claims, or borrows are admitted, while final handoff messages and releases remain possible. A failed or cancelled parent always cascades to its descendants, and a parent cannot complete while a live descendant remains. Cancellation and crash recovery release runtime claims; clean worktrees are reclaimed on child shutdown, while dirty artifacts remain inspectable.
 
 ## Recursion
 
@@ -23,6 +23,8 @@ A child may call `agent_spawn` only when `maySpawn` is granted. The broker enfor
 - maximum active agents per fabric;
 - maximum concurrent model turns;
 - capability ceilings inherited from the parent.
+
+Completing a task is rejected while its owner has live descendants. Reopening a completed prerequisite is rejected while any dependent task is still non-terminal; finish or cancel downstream work first so dependency readiness remains monotonic.
 
 The model chooses whether recursion is useful. The broker chooses whether another actor may be created. A denied spawn is a structured limit/capability error, not a retry invitation.
 
@@ -41,7 +43,7 @@ The child bootstrap prompt includes identity and protocol guidance. It explicitl
 
 ## Busy and waiting behavior
 
-Each managed child has one prompt tail. New parent/peer messages are queued durably. While a model turn is active, the host uses Pi steering/follow-up queues and retains broker messages until the Pi session transcript accepts them; in-flight IDs prevent notification/inbox races from executing one message twice. While idle or waiting, it schedules a fresh prompt. Clarification requests explicitly terminate the current turn so a reply can wake a fresh prompt without a synchronous cycle.
+Each managed child has one prompt tail. New parent/peer messages are queued durably. While a model turn is active, the host uses Pi steering/follow-up queues and retains broker messages until the Pi session transcript accepts an exact structured receipt; in-flight IDs prevent notification/inbox races from executing one message twice. While idle or waiting, it schedules a fresh prompt. Clarification requests explicitly terminate the current turn so a reply can wake a fresh prompt without a synchronous cycle. Root deliveries follow the same durable boundary: `api.sendMessage` acceptance alone never acknowledges the broker copy.
 
 ## Shell and mutation safety
 
@@ -54,7 +56,7 @@ The root session participates too: its ordinary Pi `edit`/`write` calls are veto
 - session creation/auth error: child is cancelled and the error is returned;
 - model turn error: terminal Pi outcomes are classified; fatal provider/auth failures become `failed`, while recoverable context/capacity/compaction/transient exhaustion becomes `blocked` with bounded context diagnostics and a durable parent notice. Explicit task facts still control completion and reopening;
 - lost socket: the host reconnects with its credential and syncs the inbox;
-- broker restart: old live actors are marked failed/reconnectable, leases are released, pending clarification records survive, matching sessions can re-register once, and each waiting actor keeps its `maxTotalAgents` slot reserved until it reconnects, resolves, or is cancelled (so newcomers cannot evict it);
+- broker restart: old live actors are marked failed/reconnectable, leases are released, pending clarification records survive, matching sessions can re-register once, and each waiting actor keeps its `maxTotalAgents` slot reserved until it reconnects or the bounded `reconnectGraceMs` expires (so newcomers cannot evict it forever);
 - parent cancellation: descendants are cancelled recursively;
 - host lifecycle race: root attach, begin-turn, and final end-turn requests are serialized; the root starts one logical broker turn across Pi's retry/compact `agent_start` continuations and ends it on `agent_settled`. `agent_end` is observation-only for the actual final outcome. Callbacks from an older session are ignored after shutdown, and a detached root during teardown is treated as a nonfatal unavailable-fabric condition.
 - model/runtime recovery: terminal provider results are classified before a child turn is ended. Logical overflow follows Pi's native bounded recovery; prefill/KV capacity gets one same-context retry after route capacity is released; exhausted capacity, runtime pressure, transient exhaustion, and compaction failures block the task with a bounded diagnostic and durable parent notice instead of returning `ready`. Entering `blocked` releases mutable runtime holds and pending waiters while retaining task ownership; the child reacquires them before writing. A blocked child does not re-run on ordinary inbox wakes until its task is explicitly reopened, which schedules one deterministic recovery turn.
