@@ -2,19 +2,46 @@ export const PI_EXTENSION_INTEROP = Symbol.for("pi.extension-interop.v1");
 export const LCM_EMBEDDED_CONTEXT_PROVIDER_NAME = "pi-local-context-manager.embedded-context.v1";
 export const LEGACY_LCM_EMBEDDED_CONTEXT_PROVIDER_NAME = "local-context-manager.embedded-context.v1";
 
+let privateRegistry: PiExtensionInteropRegistryV1 | undefined;
+
+function createInteropRegistry(): PiExtensionInteropRegistryV1 {
+  return { version: 1, providers: new Map() };
+}
+
+/**
+ * Preserve a well-formed future registry published by another extension. A
+ * private v1 table keeps safe-agent registration isolated without replacing
+ * state that this build cannot interpret.
+ */
+function interopRegistry(): PiExtensionInteropRegistryV1 {
+  const globalObj = globalThis as Record<symbol, unknown>;
+  const published = globalObj[PI_EXTENSION_INTEROP] as PiExtensionInteropRegistryV1 | undefined;
+  if (published === undefined || published === null) {
+    const registry = createInteropRegistry();
+    globalObj[PI_EXTENSION_INTEROP] = registry;
+    return registry;
+  }
+  const version = typeof (published as any)?.version === "number" && Number.isFinite((published as any).version)
+    ? (published as any).version as number
+    : undefined;
+  if (version !== undefined && version !== 1) {
+    privateRegistry ??= createInteropRegistry();
+    return privateRegistry;
+  }
+  if (version === 1 && (published as any).providers instanceof Map) return published;
+  // Unversioned/malformed data has no compatible peer state worth preserving.
+  const registry = createInteropRegistry();
+  globalObj[PI_EXTENSION_INTEROP] = registry;
+  return registry;
+}
+
 export interface PiExtensionInteropRegistryV1 {
   version: 1;
   providers: Map<string, unknown>;
 }
 
 export function getInteropRegistry(): PiExtensionInteropRegistryV1 {
-  const globalObj = globalThis as Record<symbol, unknown>;
-  let registry = globalObj[PI_EXTENSION_INTEROP] as PiExtensionInteropRegistryV1 | undefined;
-  if (!registry || registry.version !== 1 || !(registry.providers instanceof Map)) {
-    registry = { version: 1, providers: new Map() };
-    globalObj[PI_EXTENSION_INTEROP] = registry;
-  }
-  return registry;
+  return interopRegistry();
 }
 
 export function registerInteropProvider(name: string, provider: unknown): void {

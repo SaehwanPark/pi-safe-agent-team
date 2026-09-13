@@ -36,6 +36,7 @@ const CAPACITY_PATTERNS = [
   /prefill[_ -]?memory[_ -]?exceeded/i,
   /prefill.{0,80}(?:memory|kv|cache).{0,80}(?:exceed|insufficient|full|allocat|capacity)/i,
   /(?:kv|key.value).{0,80}(?:cache|memory).{0,80}(?:exceed|insufficient|full|allocat|capacity)/i,
+  /(?:prefill|kv|key.value).{0,120}(?:metal|cuda|gpu|memory).{0,120}(?:pressure|exhaust|fail|exceed|insufficient|full|allocat|capacity)/i,
   /(?:memory|ram|gpu).{0,80}(?:insufficient|allocat|capacity)/i,
   /failed to allocate.{0,80}(?:memory|kv|cache)/i,
 ];
@@ -72,20 +73,25 @@ function usageNumber(value: unknown): number | undefined {
 }
 
 function diagnosticText(message: AssistantLike): string | undefined {
+  const parts: string[] = [];
   const direct = text(message.errorMessage);
-  if (direct) return direct;
+  if (direct) parts.push(direct);
   for (const diagnostic of message.diagnostics ?? []) {
     const candidate = text(diagnostic.error?.message) ?? text((diagnostic as { message?: unknown }).message);
     const code = text(diagnostic.error?.code);
-    if (candidate || code) return [code, candidate].filter(Boolean).join(": ");
+    if (code || candidate) parts.push([code, candidate].filter(Boolean).join(": "));
   }
-  return undefined;
+  return parts.length > 0 ? parts.join(" | ") : undefined;
 }
 
 function failureKind(errorMessage: string | undefined): ModelTurnOutcomeKind {
   if (!errorMessage) return "fatal_provider";
-  if (RUNTIME_MEMORY_PATTERNS.some((pattern) => pattern.test(errorMessage))) return "runtime_memory_pressure";
+  // Prefer explicit prefill/KV evidence over broad runtime-memory wording.
+  // Local backends often mention Metal/CUDA memory while rejecting a single
+  // prefill allocation; treating that as generic process pressure loses the
+  // bounded capacity outcome and its recovery policy.
   if (CAPACITY_PATTERNS.some((pattern) => pattern.test(errorMessage))) return "prefill_capacity";
+  if (RUNTIME_MEMORY_PATTERNS.some((pattern) => pattern.test(errorMessage))) return "runtime_memory_pressure";
   if (TRANSIENT_PATTERNS.some((pattern) => pattern.test(errorMessage))) return "transient_error_exhausted";
   return "fatal_provider";
 }

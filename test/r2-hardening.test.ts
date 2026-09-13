@@ -36,6 +36,7 @@ test("R2 outcome classifier separates logical overflow, prefill capacity, runtim
   const base = { role: "assistant", usage: { input: 47_000, cacheRead: 0, output: 0 } };
   assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "omlx_code: prefill_memory_exceeded" }, 131_072).kind, "prefill_capacity");
   assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", diagnostics: [{ error: { code: "prefill_memory_exceeded", message: "backend rejected prefill" } }] }, 131_072).kind, "prefill_capacity");
+  assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "prefill rejected after Metal memory pressure" }, 131_072).kind, "prefill_capacity");
   assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "CUDA out of memory during decode" }, 131_072).kind, "runtime_memory_pressure");
   assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "prompt is too long: 140000 tokens" }, 131_072).kind, "context_overflow");
   assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "service unavailable (503)" }, 131_072).kind, "transient_error_exhausted");
@@ -168,9 +169,11 @@ function makePromptChild(prompt: () => Promise<void>, calls: Array<{ operation: 
     calls.push({ operation, args });
     if (operation === "agent.begin_turn") return { started: true };
     if (operation === "agent.status") return record;
+    if (operation === "task.show") return { id: "task-1", status: "active", owner: "child-1" };
     if (operation === "task.update") return {};
     if (operation === "message.send") return {};
     if (operation === "agent.update") return { ...record, contextDiagnostic: args.contextDiagnostic };
+    if (operation === "agent.finish_turn") return { agent: { ...record, status: args.status, statusReason: args.statusReason } };
     if (operation === "agent.end_turn") return { agent: { ...record, status: args.status, statusReason: args.statusReason } };
     return {};
   };
@@ -183,7 +186,7 @@ function makePromptChild(prompt: () => Promise<void>, calls: Array<{ operation: 
   return child;
 }
 
-test("R2 child terminal provider error blocks the task and does not become ready or loop", async () => {
+test("R3 child terminal provider error blocks the task and does not become ready or loop", async () => {
   let promptCalls = 0;
   const calls: Array<{ operation: string; args: any }> = [];
   let child!: ManagedChild;
@@ -198,14 +201,14 @@ test("R2 child terminal provider error blocks the task and does not become ready
 
   await (child as any).executePrompt("first");
   await (child as any).executePrompt("second");
-  assert.equal(promptCalls, 2, "one capacity relief retry is allowed, then the blocked gate prevents later wakes");
-  assert.equal(calls.filter((call) => call.operation === "task.update")[0]?.args.action, "block");
-  assert.equal(calls.filter((call) => call.operation === "agent.end_turn")[0]?.args.status, "blocked");
+  assert.equal(promptCalls, 1, "public prompt() is never called twice for a same-context retry");
+  assert.equal(calls.filter((call) => call.operation === "agent.finish_turn")[0]?.args.taskAction, "block");
+  assert.equal(calls.filter((call) => call.operation === "agent.finish_turn")[0]?.args.status, "blocked");
   assert.equal(calls.some((call) => call.operation === "agent.end_turn" && call.args.status === "ready"), false);
-  assert.equal(calls.some((call) => call.operation === "message.send" && call.args.type === "blocked"), true);
+  assert.equal(calls.some((call) => call.operation === "agent.finish_turn" && call.args.metadata?.cause === "prefill_capacity"), true);
 });
 
-test("R2 child capacity failure retries once before a successful turn", async () => {
+test("R3 child capacity failure blocks without duplicating the user turn", async () => {
   let promptCalls = 0;
   const calls: Array<{ operation: string; args: any }> = [];
   let child!: ManagedChild;
@@ -220,9 +223,9 @@ test("R2 child capacity failure retries once before a successful turn", async ()
   }, calls);
 
   await (child as any).executePrompt("retryable");
-  assert.equal(promptCalls, 2);
-  assert.equal(calls.some((call) => call.operation === "agent.end_turn" && call.args.status === "ready"), true);
-  assert.equal(calls.some((call) => call.operation === "task.update"), false);
+  assert.equal(promptCalls, 1);
+  assert.equal(calls.some((call) => call.operation === "agent.finish_turn" && call.args.status === "blocked"), true);
+  assert.equal(calls.some((call) => call.operation === "agent.finish_turn" && call.args.taskAction === "block"), true);
 });
 
 test("R2 embedded compaction diagnostics block instead of laundering the turn to ready", async () => {
@@ -238,6 +241,6 @@ test("R2 embedded compaction diagnostics block instead of laundering the turn to
   }, calls);
 
   await (child as any).executePrompt("compaction-failed");
-  assert.equal(calls.some((call) => call.operation === "agent.end_turn" && call.args.status === "blocked"), true);
-  assert.equal(calls.some((call) => call.operation === "agent.end_turn" && call.args.status === "ready"), false);
+  assert.equal(calls.some((call) => call.operation === "agent.finish_turn" && call.args.status === "blocked"), true);
+  assert.equal(calls.some((call) => call.operation === "agent.finish_turn" && call.args.status === "ready"), false);
 });

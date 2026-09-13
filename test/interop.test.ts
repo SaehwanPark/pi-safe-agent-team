@@ -73,3 +73,21 @@ test("canonical LCM provider name wins while the legacy alias remains compatible
     unregisterInteropProvider(LEGACY_LCM_EMBEDDED_CONTEXT_PROVIDER_NAME, legacy);
   }
 });
+
+test("interop registry preserves an unknown future registry version", () => {
+  const globalObj = globalThis as Record<symbol, unknown>;
+  const previous = globalObj[PI_EXTENSION_INTEROP];
+  const foreign = { version: 99, providers: new Map([["foreign.provider.v99", {}]]) };
+  globalObj[PI_EXTENSION_INTEROP] = foreign;
+  const provider = { name: "isolated" };
+  try {
+    const local = getInteropRegistry();
+    assert.notEqual(local, foreign);
+    registerInteropProvider("safe-agent-test.future", provider);
+    assert.equal(foreign.providers.has("safe-agent-test.future"), false);
+    assert.equal(getInteropProvider("safe-agent-test.future"), provider);
+    unregisterInteropProvider("safe-agent-test.future", provider);
+  } finally {
+    globalObj[PI_EXTENSION_INTEROP] = previous;
+  }
+});
