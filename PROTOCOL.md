@@ -147,7 +147,7 @@ When messages are delivered to the root session, `classifyRootDelivery` routes t
 | `cancel` | `steer` | **Yes** | Child cancellation notice |
 | `steer` | `steer` | **Yes** | Explicit steering directive |
 
-Messages with priority `"urgent"` always bypass default mode and trigger an immediate root model turn (`steer`, `triggerTurn: true`). Non-triggering messages remain durable in the session context and are processed on the root's next natural turn.
+Messages with priority `"urgent"` always bypass default mode and trigger an immediate root model turn (`steer`, `triggerTurn: true`) while the root context is healthy. During root compaction or a degraded root provider state, every message is instead accepted as durable `nextTurn` context with `triggerTurn: false`; a later user-led recovery can wake the root without losing the mailbox record.
 
 ## Clarification flow
 
@@ -315,6 +315,7 @@ Quiescence and session replacement rules are strictly conservative:
 - **Resource holds and write fences**: Zero active mutable borrows (`mutableHolds === 0`) and zero active write fences (`activeWriteFences === 0`) across the entire fabric.
 - **Pending root requests and deliveries**: Zero unresolved requests or unconsumed deliveries directed to the root (`pendingRootRequests === 0` and `pendingRootDeliveries === 0`).
 - **Root context mutation**: `rootCompactionInFlight === false`; manual, threshold, overflow, and embedded root compaction keep `sessionReplacementSafe === false` for the entire hook interval.
+- **Root provider health**: `rootContextHealth === "degraded"` is a visible recovery gate after an exhausted root provider/context outcome; diagnostics are bounded and automatic message wakes remain suppressed until recovery.
 - **Failure state**: If the broker is unreachable or a status query fails while the root is attached, the snapshot fails closed with `active: true, quiescent: false, state: "uncertain", sessionReplacementSafe: false`, and `quiescenceReasons: ["broker_status_query_failed"]`.
 
 ### Root Session Replacement and Descendant Cancellation

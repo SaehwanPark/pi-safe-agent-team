@@ -83,6 +83,9 @@ export interface FabricStateSnapshotV1 {
   pendingRootDeliveries: number;
   /** True while Pi is performing manual/automatic root compaction. */
   rootCompactionInFlight?: boolean;
+  /** Root provider health gate after an exhausted model/context outcome. */
+  rootContextHealth?: "healthy" | "degraded";
+  rootContextDiagnostic?: string;
 
   activeTasks: FabricTaskSnapshot[];
   mutableResources: FabricResourceSnapshot[];

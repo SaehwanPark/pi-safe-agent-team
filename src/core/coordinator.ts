@@ -528,7 +528,8 @@ export class Coordinator {
     const next = cloneAgent(agent);
     const requestedStatus = args.status as AgentStatus | undefined;
     if (args.route !== undefined) next.route = this.validateRoute(args.route as ModelRoute);
-    if (requestedStatus === "running" && agent.status !== "running") {
+    const routeChanged = next.route.provider !== agent.route.provider || next.route.model !== agent.route.model || next.route.thinking !== agent.route.thinking;
+    if ((requestedStatus === "running" && agent.status !== "running") || (agent.status === "running" && routeChanged)) {
       assertCondition(this.runningAgentCount() < this.config.maxConcurrentAgents, "AGENT_LIMIT_REACHED", "maxConcurrentAgents reached");
       this.assertRouteCapacity(next.route, agent.id);
     }

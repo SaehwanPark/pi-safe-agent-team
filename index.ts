@@ -333,11 +333,13 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
           const shutdownMode: DescendantShutdownMode = requestedMode === "--now" ? "now" : requestedMode === "--budget" ? "budget" : "graceful";
           // Start the local emergency kill switch before any broker-backed
           // root attach/status work. A frozen broker must not delay --now.
-          const urgentAbort = shutdownMode === "now"
-            ? runtime.abortDescendants({ reason: `agents-stop:${shutdownMode}`, mode: shutdownMode })
-            : undefined;
+          if (shutdownMode === "now") {
+            const snapshots = await runtime.abortDescendants({ reason: `agents-stop:${shutdownMode}`, mode: shutdownMode });
+            ctx.ui.notify(`safe-agents: stopped ${snapshots.length} descendant${snapshots.length === 1 ? "" : "s"} (${shutdownMode}); deterministic handoff captured`, "info");
+            return;
+          }
           await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
-          const snapshots = await (urgentAbort ?? runtime.abortDescendants({ reason: `agents-stop:${shutdownMode}`, mode: shutdownMode }));
+          const snapshots = await runtime.abortDescendants({ reason: `agents-stop:${shutdownMode}`, mode: shutdownMode });
           ctx.ui.notify(`safe-agents: stopped ${snapshots.length} descendant${snapshots.length === 1 ? "" : "s"} (${shutdownMode}); deterministic handoff captured`, "info");
           return;
         }
@@ -418,7 +420,7 @@ function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricState
     `mutable holds: ${mutableHolds}`,
     `pending root requests: ${pendingRequests}`,
     `pending root deliveries: ${pendingDeliveries}`,
-    `root context: ${snapshot?.rootCompactionInFlight ? "compacting" : "healthy"}`,
+    `root context: ${snapshot?.rootCompactionInFlight ? "compacting" : snapshot?.rootContextHealth === "degraded" ? `degraded${snapshot.rootContextDiagnostic ? ` (${snapshot.rootContextDiagnostic})` : ""}` : "healthy"}`,
     `agents: ${status.agents.length} (running ${status.runningChildren})`,
     `tasks: ${status.tasks.length}`,
     `resources: ${status.resources.length}`,

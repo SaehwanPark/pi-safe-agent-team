@@ -42,7 +42,7 @@ const CAPACITY_PATTERNS = [
 
 const RUNTIME_MEMORY_PATTERNS = [
   /out of memory/i,
-  /oom/i,
+  /\boom\b/i,
   /memory pressure/i,
   /model (?:was )?evict(?:ed|ion)/i,
   /process memory pressure/i,
@@ -120,8 +120,9 @@ export function classifyAssistantMessage(message: unknown, contextWindow?: numbe
   if (stopReason === "error") {
     let kind = failureKind(errorMessage);
     // Pi's provider-aware detector remains authoritative for genuine logical
-    // context overflow. Capacity patterns are checked first so KV pressure is
-    // never mislabeled as a token-window overflow.
+    // context overflow. Runtime-memory and prefill-capacity patterns are
+    // handled first so backend pressure is never mislabeled as a token-window
+    // overflow.
     if (kind === "fatal_provider" && errorMessage) {
       try {
         if (isContextOverflow(candidate as AssistantMessage, contextWindow)) kind = "context_overflow";

@@ -161,6 +161,7 @@ export class FabricRuntime {
   private rootCompactionInFlight = 0;
   private rootCompactionReleases: Array<() => void> = [];
   private rootCompactionBrokerReservations: boolean[] = [];
+  private rootCompactionEpoch = 0;
   private rootContextHealth: "healthy" | "degraded" = "healthy";
   private rootContextDiagnostic?: string;
   private drainPromise?: Promise<readonly HandoffSnapshot[]>;
@@ -230,19 +231,31 @@ export class FabricRuntime {
 
   /** Begin observing a root manual/automatic compaction before Pi mutates context. */
   async beginRootCompaction(): Promise<void> {
+    const epoch = this.rootCompactionEpoch;
     this.rootCompactionInFlight += 1;
     this.rootCompactionBrokerReservations.push(false);
     const route = this.root?.ctx.model ? routeFromModel(this.root.ctx.model, this.root.ctx.thinkingLevel ?? "medium") : undefined;
     if (!route) return;
     try {
-      this.rootCompactionReleases.push(await this.modelCapacity.acquire(route));
+      const release = await this.modelCapacity.acquire(route);
+      if (epoch !== this.rootCompactionEpoch || this.stopped) {
+        release();
+        return;
+      }
+      this.rootCompactionReleases.push(release);
     } catch {
       // The quiescence flag remains conservative when a local arbiter is unavailable.
     }
     if (this.root) {
       try {
         const result = await this.root.client.request<{ started?: boolean }>("agent.begin_turn", {});
-        if (result?.started === true) this.rootCompactionBrokerReservations[this.rootCompactionBrokerReservations.length - 1] = true;
+        if (result?.started === true) {
+          if (epoch !== this.rootCompactionEpoch || this.stopped) {
+            await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+          } else {
+            this.rootCompactionBrokerReservations[this.rootCompactionBrokerReservations.length - 1] = true;
+          }
+        }
       } catch {
         // An already-running root (automatic compaction) or unavailable broker
         // is still covered by the local compaction flag.
@@ -260,6 +273,7 @@ export class FabricRuntime {
   }
 
   resetRootCompactionState(): void {
+    this.rootCompactionEpoch += 1;
     this.rootCompactionInFlight = 0;
     this.rootCompactionBrokerReservations = [];
     for (const release of this.rootCompactionReleases.splice(0)) release();
@@ -489,6 +503,8 @@ export class FabricRuntime {
         pendingRootRequests: 0,
         pendingRootDeliveries: 0,
         rootCompactionInFlight: this.isRootCompactionInFlight,
+        rootContextHealth: this.rootHealth,
+        rootContextDiagnostic: this.rootHealthDiagnostic,
         activeTasks: [],
         mutableResources: [],
         quiescenceReasons: ["fabric_runtime_unattached_or_stopped"],
@@ -565,6 +581,8 @@ export class FabricRuntime {
         pendingRootRequests,
         pendingRootDeliveries,
         rootCompactionInFlight: this.isRootCompactionInFlight,
+        rootContextHealth: this.rootHealth,
+        rootContextDiagnostic: this.rootHealthDiagnostic,
         activeTasks,
         mutableResources,
         quiescenceReasons,
@@ -586,6 +604,8 @@ export class FabricRuntime {
         pendingRootRequests: 0,
         pendingRootDeliveries: this.pendingRootDeliveriesCount,
         rootCompactionInFlight: this.isRootCompactionInFlight,
+        rootContextHealth: this.rootHealth,
+        rootContextDiagnostic: this.rootHealthDiagnostic,
         activeTasks: [],
         mutableResources: [],
         quiescenceReasons: ["broker_status_query_failed"],
@@ -763,6 +783,7 @@ export class FabricRuntime {
     this.lifecycleEpoch += 1;
     this.stopped = true;
     this.draining = true;
+    this.resetRootCompactionState();
     if (this.rootHeartbeatTimer) clearInterval(this.rootHeartbeatTimer);
     this.rootEventUnsubscribe?.();
     this.rootCloseUnsubscribe?.();
@@ -1487,11 +1508,12 @@ export class ManagedChild {
         else await runPrompt();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        if (this.stopping) return;
         promptThrownOutcome = classifyAssistantMessage({
           role: "assistant",
           provider: this.route.provider,
           model: this.route.model,
-          stopReason: "error",
+          stopReason: /\b(?:abort|aborted|cancel|cancelled|canceled)\b/i.test(message) ? "aborted" : "error",
           errorMessage: message,
           usage: { input: 0, cacheRead: 0, output: 0 },
         }, typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined);
