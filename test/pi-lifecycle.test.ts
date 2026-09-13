@@ -77,7 +77,7 @@ async function withRuntimeSpies(
   return stopCalls;
 }
 
-test("finalizes the root turn once after Pi settles instead of on agent_end", async () => {
+test("finalizes the root turn once after Pi settles while observing agent_end", async () => {
   const operations: string[] = [];
   const stopCalls = await withRuntimeSpies(async (operation) => {
     operations.push(operation);
@@ -85,7 +85,7 @@ test("finalizes the root turn once after Pi settles instead of on agent_end", as
     const handlers = makeExtensionHarness();
     const context = makeContext();
     await handlers.get("session_start")?.[0]?.({}, context);
-    assert.equal(handlers.has("agent_end"), false);
+    assert.equal(handlers.has("agent_end"), true);
     handlers.get("agent_settled")?.[0]?.({}, context);
     await flushLifecycle();
     await handlers.get("session_shutdown")?.[0]?.({}, context);
@@ -105,6 +105,9 @@ test("an aborted root run drains descendants after settlement", async () => {
   await withRuntimeSpies(async () => {}, async () => {
     const handlers = makeExtensionHarness();
     await handlers.get("session_start")?.[0]?.({}, context);
+    handlers.get("agent_start")?.[0]?.({}, context);
+    await flushLifecycle();
+    handlers.get("agent_end")?.[0]?.({ messages: [{ role: "assistant", stopReason: "aborted", usage: { input: 0, cacheRead: 0, output: 0 } }] }, context);
     handlers.get("agent_settled")?.[0]?.({}, context);
     await flushLifecycle();
     await handlers.get("session_shutdown")?.[0]?.({}, context);
