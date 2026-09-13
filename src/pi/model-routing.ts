@@ -36,7 +36,16 @@ export function resolveModelRoute(input: RouteResolutionInput & { registry: Mode
   if (resolved.thinking !== "off" && model.thinkingLevelMap?.[resolved.thinking] === null) {
     throw new FabricError("MODEL_ROUTE_INVALID", `Model ${provider}/${resolved.model} does not support thinking level ${resolved.thinking}`);
   }
-  return { route: { provider, model: resolved.model, thinking: resolved.thinking }, model, source: resolved.source };
+  return {
+    route: {
+      provider,
+      model: resolved.model,
+      thinking: resolved.thinking,
+      ...(resolved.capacityGroup ? { capacityGroup: resolved.capacityGroup } : {}),
+    },
+    model,
+    source: resolved.source,
+  };
 }
 
 export function resolveChildModel(
