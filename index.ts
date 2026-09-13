@@ -22,6 +22,7 @@ export { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadO
 export { classifyRootShellCommand, type RootShellRisk } from "./src/pi/shell-classifier.ts";
 export { classifyRootDelivery, type RootDeliveryDecision, type RootDeliveryContext } from "./src/pi/delivery.ts";
 export { ModelRouteCapacityArbiter } from "./src/pi/model-capacity.ts";
+export { loadFabricConfig, type FabricConfigLoadOptions, type FabricConfigLoadResult } from "./src/pi/config.ts";
 export { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isBlockingOutcome, type ModelTurnOutcome, type ModelTurnOutcomeKind } from "./src/pi/turn-outcome.ts";
 export { getInteropRegistry, getInteropProvider, registerInteropProvider, unregisterInteropProvider, PI_EXTENSION_INTEROP } from "./src/pi/interop.ts";
 export type { FabricSnapshotRequest, FabricStateSnapshotV1, FabricStateProviderV1, EmbeddedContextHost, EmbeddedContextManager, EmbeddedToolResult } from "./src/pi/interop.ts";
@@ -215,9 +216,15 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     if (typeof sendUserMessage === "function") {
       // This starts a normal prompt, which flushes Pi's pending `nextTurn`
       // messages into the model context before generation begins.
-      void Promise.resolve(sendUserMessage("Review the deferred safe-agents messages that were waiting for root context recovery.", {
-        expandPromptTemplates: false,
-      })).catch(() => undefined);
+      try {
+        void Promise.resolve(sendUserMessage("Review the deferred safe-agents messages that were waiting for root context recovery.", {
+          expandPromptTemplates: false,
+        })).catch(() => undefined);
+      } catch {
+        // Some lightweight hosts expose a synchronous sendUserMessage shim;
+        // a throw there must not break the lifecycle callback or lose the
+        // still-unacknowledged broker message.
+      }
       return;
     }
     // Lightweight hosts predating sendUserMessage still get a visible wake;

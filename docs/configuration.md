@@ -1,6 +1,28 @@
 # Configuration
 
-The extension is intentionally usable with no project configuration. Defaults are conservative and can be supplied to `FabricRuntime` or a future role/config loader.
+The extension is intentionally usable with no project configuration. Defaults are conservative. The installed extension loads the first valid JSON configuration file below (highest precedence first); constructor options remain an explicit override for programmatic hosts and tests.
+
+```text
+PI_SAFE_AGENTS_CONFIG=/absolute/path/to/config.json
+<workspace>/.pi/safe-agents.json
+<workspace>/.safe-agents.json
+<agentDir>/safe-agents/config.json
+<agentDir>/safe-agents.json
+```
+
+The file may contain the fields directly or under a `safeAgents`, `piSafeAgents`, or `fabric` object. For example:
+
+```json
+{
+  "safeAgents": {
+    "modelRoutePolicies": {
+      "omlx/qwen3": { "maxConcurrent": 1, "effectivePrefillBudget": 48000 }
+    }
+  }
+}
+```
+
+Malformed or missing files are ignored and the broker validates any loaded values before startup.
 
 ## Canonical agent directory resolution
 
@@ -27,7 +49,7 @@ By default:
   worktrees/<id>/    # managed Git worktrees when selected
 ```
 
-`FabricRuntime` options can override `cwd`, `stateDirectory`, `endpoint`, `agentDir`, `fabricId`, and whether this process starts the broker or joins an existing endpoint.
+`FabricRuntime` options can override `cwd`, `stateDirectory`, `endpoint`, `agentDir`, `fabricId`, configuration, and whether this process starts the broker or joins an existing endpoint.
 
 The default fabric identity is finalized when the root attaches, because Pi's session ID
 is not available while the extension is being constructed. Reconnecting the same Pi

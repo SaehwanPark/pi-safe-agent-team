@@ -20,6 +20,7 @@ import { createEmbeddedContextController, type EmbeddedCompactionRequest, type E
 import { effectivePrefillBudget } from "../core/coordinator-wire.ts";
 import { ModelRouteCapacityArbiter } from "./model-capacity.ts";
 import { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isBlockingOutcome, type ModelTurnOutcome } from "./turn-outcome.ts";
+import { loadFabricConfig } from "./config.ts";
 
 export interface RoleConfig {
   model?: string;
@@ -134,7 +135,7 @@ export class FabricRuntime {
   private _stateDirectory: string;
   readonly agentDir: string;
   private _endpoint: string;
-  readonly config?: Partial<FabricConfig>;
+  readonly config: Partial<FabricConfig>;
   readonly workspaceStrategy: WorkspaceStrategy;
 
   private readonly options: FabricRuntimeOptions;
@@ -217,7 +218,8 @@ export class FabricRuntime {
     this.options = options;
     this.cwd = canonicalWorkspacePath(options.cwd ?? process.cwd());
     this.agentDir = options.agentDir ?? getAgentDir();
-    this.config = options.config;
+    const loadedConfig = loadFabricConfig({ cwd: this.cwd, agentDir: this.agentDir });
+    this.config = { ...loadedConfig.config, ...(options.config ?? {}) };
     this.caseInsensitivePaths = options.config?.caseInsensitivePaths;
     this.workspaceStrategy = options.workspaceStrategy ?? new GitWorkspaceStrategy();
     this.roles = options.roles ?? {};
@@ -226,7 +228,7 @@ export class FabricRuntime {
     this._fabricId = options.fabricId ?? `fabric-${hashIdentity(identityKey)}`;
     this._stateDirectory = options.stateDirectory ?? join(this.agentDir, "safe-agents", hashIdentity(identityKey));
     this._endpoint = options.endpoint ?? defaultEndpoint(this._stateDirectory);
-    this.modelCapacity = new ModelRouteCapacityArbiter({ ...DEFAULT_FABRIC_CONFIG, ...(options.config ?? {}) });
+    this.modelCapacity = new ModelRouteCapacityArbiter({ ...DEFAULT_FABRIC_CONFIG, ...this.config });
   }
 
   /** Begin observing a root manual/automatic compaction before Pi mutates context. */
@@ -1335,9 +1337,7 @@ export class ManagedChild {
       contextDiagnostic: this.lastDiagnostic,
     })).agent;
     this.taskId = this.record.taskId;
-    if (this.record.status === "blocked") {
-      this.blockedByOutcome = classifyCompactionFailure(this.record.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery");
-    }
+    await this.reconcileRecoveryGate(this.record);
     this.started = true;
     this.heartbeatTimer = setInterval(() => {
       void this.client.request("agent.heartbeat", {}).catch(() => undefined);
@@ -1445,9 +1445,12 @@ export class ManagedChild {
           });
           this.record = registered.agent;
           this.taskId = registered.agent.taskId;
+          await this.reconcileRecoveryGate(this.record);
           const inbox = await this.client.request<AgentMessage[]>("message.inbox", { limit: 100 });
           for (const message of inbox) void this.deliverMessage(message);
-          if (this.taskId && this.session && !this.session.isStreaming) this.enqueuePrompt(`Broker recovered. Resume assigned task ${this.taskId} from the durable task state.`);
+          if (!this.blockedByOutcome && this.taskId && this.session && !this.session.isStreaming) {
+            this.enqueuePrompt(`Broker recovered. Resume assigned task ${this.taskId} from the durable task state.`);
+          }
           return;
         } catch (error) {
           if (isTerminalReconnectFailure(error)) {
@@ -1462,6 +1465,26 @@ export class ManagedChild {
       this.reconnectPromise = undefined;
     });
     return this.reconnectPromise;
+  }
+
+  /**
+   * Rebuild the local recovery gate from durable broker state after startup or
+   * reconnect. Task updates and agent updates are separate event streams, so a
+   * transport gap can leave either one newer than the other; querying both
+   * makes a blocked fact authoritative even when its companion event was
+   * missed. Clearing first also lets an explicit task reopen release a stale
+   * in-memory gate before inbox delivery resumes.
+   */
+  private async reconcileRecoveryGate(agent: AgentRecord): Promise<void> {
+    this.blockedByOutcome = undefined;
+    if (agent.status === "blocked") {
+      this.blockedByOutcome = classifyCompactionFailure(agent.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery");
+      return;
+    }
+    if (!agent.taskId) return;
+    const task = await this.client.request<TaskRecord>("task.show", { taskId: agent.taskId }).catch(() => undefined);
+    if (task?.status !== "blocked") return;
+    this.blockedByOutcome = classifyCompactionFailure(task.blockedReason ?? agent.contextDiagnostic ?? "Assigned task remains blocked pending explicit recovery");
   }
 
   private enqueuePrompt(prompt: string): void {
