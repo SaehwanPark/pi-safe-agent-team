@@ -88,8 +88,8 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     ctx.ui.notify(`safe-agents: ${fabricError.message}`, severity);
   };
 
-  const rootDelivery = (api: ExtensionAPI) => (message: AgentMessage): void => {
-    const epoch = rootDeliveryEpoch;
+  const rootDelivery = (api: ExtensionAPI, deliveryEpoch = rootDeliveryEpoch) => (message: AgentMessage): void => {
+    const epoch = deliveryEpoch;
     const state = rootDeliveryStates.get(message.id);
     if (state === "acknowledged" || state === "delivering") return;
     if (state === "accepted") {
@@ -111,8 +111,8 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
           triggerTurn: decision.triggerTurn,
           deliverAs: decision.deliverAs,
         });
-        rememberRootMessage(message.id, "accepted");
         if (epoch !== rootDeliveryEpoch) return;
+        rememberRootMessage(message.id, "accepted");
         await runtime.request("message.ack", { messageId: message.id });
         rememberRootMessage(message.id, "acknowledged");
       } catch {
@@ -178,6 +178,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     rootDeliveryEpoch += 1;
+    rootDeliveryTail = Promise.resolve();
     registerInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);
     const generation = lifecycleQueue.beginSession();
     try {
@@ -216,6 +217,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     rootDeliveryEpoch += 1;
+    rootDeliveryTail = Promise.resolve();
     rootDeliveryStates.clear();
     runtime.setPendingRootDeliveriesCount(0);
     unregisterInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);

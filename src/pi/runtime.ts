@@ -726,6 +726,9 @@ export class FabricRuntime {
       await parentClient.request("agent.configure_child", { agentId: spawned.agent.id, workspace });
     } catch (error) {
       await parentClient.request("agent.cancel", { agentId: spawned.agent.id }).catch(() => undefined);
+      if (workspace?.mode === "worktree") {
+        await this.workspaceStrategy.cleanup(workspace).catch(() => undefined);
+      }
       throw asFabricError(error, "WORKSPACE_FAILURE");
     }
 
