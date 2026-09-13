@@ -643,9 +643,10 @@ test("duplicate unacknowledged notifications are queued and executed once", asyn
   const first = (child as any).deliverMessage(message) as Promise<void>;
   const second = (child as any).deliverMessage(message) as Promise<void>;
   await Promise.all([first, second]);
-  assert.equal(ackCalls, 1);
+  assert.equal(ackCalls, 0, "ACK waits for the queued prompt to settle");
   releasePrompt?.();
-  await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+  for (let attempt = 0; attempt < 20 && ackCalls === 0; attempt += 1) await new Promise<void>((resolveWait) => setImmediate(resolveWait));
+  assert.equal(ackCalls, 1);
   assert.equal(promptCalls, 1);
 });
 

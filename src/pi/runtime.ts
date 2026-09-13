@@ -1124,6 +1124,10 @@ export class ManagedChild {
   private readonly deliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
   /** Messages accepted by Pi but waiting for a durable session transcript boundary. */
   private readonly pendingChildAcks = new Map<string, AgentMessage>();
+  /** Prevent duplicate ACK RPCs when prompt completion and agent_settled race. */
+  private readonly childAckInFlight = new Map<string, Promise<void>>();
+  /** Set only after a prompt/settlement boundary has completed for this ID. */
+  private readonly persistedChildMessageIds = new Set<string>();
   private eventUnsubscribe?: () => void;
   private sessionEventUnsubscribe?: () => void;
   private closeUnsubscribe?: () => void;
@@ -1131,7 +1135,7 @@ export class ManagedChild {
   private reconnectPromise?: Promise<void>;
   private started = false;
   private stopping = false;
-  private promptTail: Promise<void> = Promise.resolve();
+  private promptTail: Promise<boolean> = Promise.resolve(true);
   private deliveryTail: Promise<void> = Promise.resolve();
   private readonly pendingReplyIds = new Set<string>();
   /** Cancels a route-capacity wait as soon as local child shutdown begins. */
@@ -1582,7 +1586,7 @@ export class ManagedChild {
     });
   }
 
-  private enqueuePrompt(prompt: string): Promise<void> {
+  private enqueuePrompt(prompt: string): Promise<boolean> {
     // The returned promise resolves only after Pi has finished the queued
     // prompt. Message callers additionally verify that the corresponding user
     // entry is present in the durable SessionManager transcript before ACKing.
@@ -1595,6 +1599,7 @@ export class ManagedChild {
       // may be delivered into a terminal session. If transport is unavailable,
       // leave the live runtime reconnectable instead of manufacturing failure.
       if (terminalized) await this.stop();
+      return false;
     });
     this.promptTail = operation;
     return operation;
@@ -1692,8 +1697,8 @@ export class ManagedChild {
     if (outcomeValue.lifecycle === "failed" || ["completed", "failed", "cancelled"].includes(ended.agent.status)) await this.stop();
   }
 
-  private async executePrompt(prompt: string): Promise<void> {
-    if (!this.session || this.stopping || this.blockedByOutcome) return;
+  private async executePrompt(prompt: string): Promise<boolean> {
+    if (!this.session || this.stopping || this.blockedByOutcome) return false;
     this.turnOutcome = undefined;
     this.lastObservedOutcome = undefined;
     this.compactionFailure = undefined;
@@ -1703,7 +1708,7 @@ export class ManagedChild {
       started = result.started;
       if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    if (!started || this.stopping) return;
+    if (!started || this.stopping) return false;
     if (this.embeddedManager && this.contextMode === "lcm-embedded") {
       try {
         this.embeddedManager.observeTurnStart();
@@ -1731,7 +1736,7 @@ export class ManagedChild {
       else await runPromptWithDepth();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (this.stopping) return;
+      if (this.stopping) return false;
       promptThrownOutcome = classifyAssistantMessage({
         role: "assistant",
         provider: this.route.provider,
@@ -1744,7 +1749,7 @@ export class ManagedChild {
     if (promptThrownOutcome) {
       const agent = await this.client.request<AgentRecord>("agent.status", {});
       await this.finishTurnWithOutcome(promptThrownOutcome, agent.taskId ?? this.taskId);
-      return;
+      return true;
     }
     if (this.embeddedManager && this.contextMode === "lcm-embedded") {
       try {
@@ -1760,7 +1765,7 @@ export class ManagedChild {
     const outcomeValue = this.compactionFailure ?? this.turnOutcome ?? this.lastObservedOutcome;
     if (outcomeValue && isBlockingOutcome(outcomeValue)) {
       await this.finishTurnWithOutcome(outcomeValue, assignedTaskId);
-      return;
+      return true;
     }
     const task = assignedTaskId
       ? await this.client.request<TaskRecord>("task.show", { taskId: assignedTaskId })
@@ -1770,6 +1775,7 @@ export class ManagedChild {
     this.record = ended.agent;
     this.taskId = ended.agent.taskId;
     if (["completed", "failed", "cancelled"].includes(ended.agent.status)) await this.stop();
+    return true;
   }
 
   private handleEvent(event: { event: string; data: unknown }): void {
@@ -1862,7 +1868,8 @@ export class ManagedChild {
         accepted = true;
         this.deliveryStates.set(message.id, "accepted");
         this.pendingChildAcks.set(message.id, message);
-        await this.acknowledgePersistedChildMessage(message);
+        this.persistedChildMessageIds.add(message.id);
+        await this.acknowledgePersistedChildMessage(message, true);
         return;
       }
       if (this.session.isStreaming) {
@@ -1873,15 +1880,19 @@ export class ManagedChild {
         if (message.type === "response" && message.requestId) this.pendingReplyIds.delete(message.requestId);
         this.deliveryStates.set(message.id, "accepted");
         this.pendingChildAcks.set(message.id, message);
-        void this.acknowledgePersistedChildMessage(message);
-        void promptCompletion.then(() => this.acknowledgePersistedChildMessage(message));
+        void promptCompletion.then((completed) => {
+          if (!completed) return;
+          this.persistedChildMessageIds.add(message.id);
+          return this.acknowledgePersistedChildMessage(message, true);
+        });
         return;
       }
       accepted = true;
       if (message.type === "response" && message.requestId) this.pendingReplyIds.delete(message.requestId);
       this.deliveryStates.set(message.id, "accepted");
       this.pendingChildAcks.set(message.id, message);
-      await this.acknowledgePersistedChildMessage(message);
+      // Steered messages are persisted with the surrounding turn. The
+      // agent_settled listener supplies the durable boundary for their ACK.
     } catch {
       if (accepted) this.deliveryStates.set(message.id, "accepted");
       else this.deliveryStates.delete(message.id);
@@ -1891,11 +1902,17 @@ export class ManagedChild {
 
   private markMessageAcknowledged(messageId: string): void {
     this.pendingChildAcks.delete(messageId);
+    this.persistedChildMessageIds.delete(messageId);
     this.deliveryStates.set(messageId, "acknowledged");
     while (this.deliveryStates.size > 2048) {
       const removable = [...this.deliveryStates.entries()].find(([, current]) => current === "acknowledged")?.[0];
       if (!removable) break;
       this.deliveryStates.delete(removable);
+    }
+    while (this.persistedChildMessageIds.size > 2048) {
+      const removable = this.persistedChildMessageIds.values().next().value as string | undefined;
+      if (!removable) break;
+      this.persistedChildMessageIds.delete(removable);
     }
   }
 
@@ -1918,27 +1935,35 @@ export class ManagedChild {
     }
   }
 
-  private async acknowledgePersistedChildMessage(message: AgentMessage): Promise<void> {
-    // Lightweight test/embedding sessions may not expose SessionManager. The
-    // host's queue admission is the only boundary available to such callers;
-    // managed children always expose a persistent SessionManager and take the
-    // stricter transcript check below.
+  private acknowledgePersistedChildMessage(message: AgentMessage, boundary = false): Promise<void> {
+    // `boundary` is supplied only after a completed prompt/settled turn or a
+    // reconnect scan of an existing transcript entry. Once that boundary is
+    // observed, a later compaction may legitimately remove the original user
+    // entry, so do not require a second transcript scan before ACKing.
+    const inFlight = this.childAckInFlight.get(message.id);
+    if (inFlight) return inFlight;
+    if (!boundary && !this.persistedChildMessageIds.has(message.id)) return Promise.resolve();
     const manager = (this.session as any)?.sessionManager as { getEntries?: () => readonly any[] } | undefined;
-    if (typeof manager?.getEntries === "function") {
-      if (!this.hasPersistedChildMessage(message.id)) return;
+    if (!boundary && typeof manager?.getEntries === "function") {
+      if (!this.hasPersistedChildMessage(message.id)) return Promise.resolve();
     }
-    try {
-      await this.client.request("message.ack", { messageId: message.id });
-      this.markMessageAcknowledged(message.id);
-    } catch {
-      // Keep the accepted marker and broker copy for a later settlement or
-      // reconnect retry. A lost ACK must never turn into message loss.
-    }
+    const operation = this.client.request("message.ack", { messageId: message.id })
+      .then(() => this.markMessageAcknowledged(message.id))
+      .catch(() => {
+        // Keep the accepted marker and broker copy for a later settlement or
+        // reconnect retry. A lost ACK must never turn into message loss.
+      })
+      .finally(() => {
+        if (this.childAckInFlight.get(message.id) === operation) this.childAckInFlight.delete(message.id);
+      });
+    this.childAckInFlight.set(message.id, operation);
+    return operation;
   }
 
   private async acknowledgePersistedChildMessages(): Promise<void> {
     for (const message of [...this.pendingChildAcks.values()]) {
-      await this.acknowledgePersistedChildMessage(message);
+      this.persistedChildMessageIds.add(message.id);
+      await this.acknowledgePersistedChildMessage(message, true);
     }
   }
 

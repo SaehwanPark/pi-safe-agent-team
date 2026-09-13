@@ -12,7 +12,7 @@ Each message has a broker ID, sender-local sequence, monotonic broker replay seq
 - duplicate client sends with the same sender/key return the original message;
 - a notification is only a wake-up hint; `message.inbox` is the recovery source of truth;
 - the managed host tracks delivering, accepted, and acknowledged IDs, so a notification plus inbox/reconnect replay cannot execute one message twice in the same host process;
-- a managed child acknowledges only after its Pi `SessionManager` contains the corresponding user message; lightweight embedding sessions without a transcript manager use queue admission as their only available boundary;
+- a managed child acknowledges only after its Pi `SessionManager` contains the corresponding user message and the queued prompt has settled; lightweight embedding sessions without a transcript manager use prompt settlement as their only available boundary;
 - acknowledgement means the host/session durably accepted the message, not that the model obeyed it.
 
 Busy workers receive a notification while their current turn continues. The host queues a steer/follow-up or starts a later prompt and retains the broker copy until the session transcript boundary is crossed. If queueing or persistence fails, the broker message remains unacknowledged and reconnect recovery will retry it.
