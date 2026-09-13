@@ -34,7 +34,17 @@ export class ModelRouteCapacityArbiter {
 
   async acquire(route: ModelRoute, signal?: AbortSignal): Promise<() => void> {
     const key = modelRouteCapacityKey(this.config, route);
-    const limit = this.capacity(route);
+    const requestedLimit = this.capacity(route);
+    // A physical backend may be referenced by several semantic aliases. Keep
+    // the strictest configured limit observed for the group so an alias with
+    // a larger value cannot widen a permit already constrained by another
+    // route. An unlimited alias inherits a previously known group limit.
+    const previousLimit = this.limits.get(key);
+    const limit = previousLimit === undefined
+      ? requestedLimit
+      : requestedLimit === undefined
+        ? previousLimit
+        : Math.min(previousLimit, requestedLimit);
     this.limits.set(key, limit);
     if (limit === undefined) return () => undefined;
     if (this.closed) throw new Error("model route capacity arbiter is closed");

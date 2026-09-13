@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import net from "node:net";
 import { join } from "node:path";
 import { BrokerClient } from "../src/broker/client.ts";
 import { BrokerServer, detectCaseInsensitivePaths, resolveBrokerConfig } from "../src/broker/server.ts";
 import { Journal } from "../src/broker/journal.ts";
+import { Coordinator } from "../src/core/coordinator.ts";
 import type { AgentRecord, CoordinatorEvent, IdempotencyRecord, ModelRoute } from "../src/core/types.ts";
 
 const route: ModelRoute = { provider: "test", model: "small", thinking: "medium" };
@@ -142,6 +143,34 @@ test("broker authenticates actors, journals mutations, and notifies durable mail
   }
 });
 
+test("broker checkpoints the journal at the configured transaction boundary", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "safe-agents-broker-checkpoint-"));
+  const server = new BrokerServer({
+    directory,
+    rootId: "fabric",
+    rootAgentId: "root",
+    maintenanceMs: 60_000,
+    checkpointTransactions: 1,
+    checkpointBytes: Number.MAX_SAFE_INTEGER,
+  });
+  const root = new BrokerClient({ endpoint: server.endpoint, agentId: "root" });
+  try {
+    await server.start();
+    await root.connect();
+    await root.request("agent.register", { rootId: "fabric", route, capabilities: { maySpawn: true } });
+    const journal = await readFile(server.journal.filePath, "utf8");
+    assert.match(journal, /"kind":"checkpoint"/);
+    const restored = new Coordinator({ rootId: "fabric" });
+    const replay = await server.journal.replay(restored);
+    assert.ok(replay.checkpoints >= 1);
+    assert.equal(restored.dispatch("root", "agent.status", {}).value.id, "root");
+  } finally {
+    root.close();
+    await server.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("broker coalesces duplicate request frames while the mutation is in flight", async () => {
   const directory = await mkdtemp(join(tmpdir(), "safe-agents-inflight-"));
   const journal = new GateJournal(directory);
@@ -267,4 +296,3 @@ test("broker client request aborts with AbortSignal and cleans up pending reques
     await rm(directory, { recursive: true, force: true });
   }
 });
-

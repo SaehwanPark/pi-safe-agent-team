@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Coordinator } from "../src/core/coordinator.ts";
 import { FabricError } from "../src/core/errors.ts";
-import type { AgentMessage, AgentRecord, ModelRoute } from "../src/core/types.ts";
+import type { AgentMessage, AgentRecord, ModelRoute, ResourceRecord } from "../src/core/types.ts";
 
 const route: ModelRoute = { provider: "test", model: "small", thinking: "medium" };
 
@@ -16,11 +16,11 @@ function makeCoordinator(config: Record<string, number> = {}, nowRef?: { value: 
   });
 }
 
-function registerRoot(coordinator: Coordinator, capabilities: Partial<AgentRecord["capabilities"]> = {}): AgentRecord {
+function registerRoot(coordinator: Coordinator, capabilities: Partial<AgentRecord["capabilities"]> = {}, routeValue = route): AgentRecord {
   return coordinator.dispatch("root", "agent.register", {
     rootId: "fabric",
     role: "root",
-    route,
+    route: routeValue,
     capabilities: {
       maySpawn: true,
       mayMessagePeers: true,
@@ -33,12 +33,12 @@ function registerRoot(coordinator: Coordinator, capabilities: Partial<AgentRecor
   }).value.agent;
 }
 
-function registerChild(coordinator: Coordinator, id: string, parentId = "root", capabilities: Partial<AgentRecord["capabilities"]> = {}): AgentRecord {
+function registerChild(coordinator: Coordinator, id: string, parentId = "root", capabilities: Partial<AgentRecord["capabilities"]> = {}, routeValue = route): AgentRecord {
   return coordinator.dispatch(id, "agent.register", {
     rootId: "fabric",
     parentId,
     role: "worker",
-    route,
+    route: routeValue,
     capabilities: { mayMessagePeers: true, ...capabilities },
   }).value.agent;
 }
@@ -191,6 +191,72 @@ test("lease expiry and cancellation release runtime claims", () => {
   coordinator.dispatch("root", "agent.cancel", { agentId: "child" });
   assert.equal(coordinator.dispatch("root", "resource.inspect", { resourceId: "file:a" }).value.mutableHold, undefined);
   assert.equal(coordinator.dispatch("root", "agent.status", { agentId: "child" }).value.status, "cancelled");
+});
+
+test("blocked children release mutable holds while retaining task ownership", () => {
+  const coordinator = makeCoordinator({ maxTotalAgents: 8 }, { value: 1_000 });
+  registerRoot(coordinator);
+  const blocked = registerChild(coordinator, "blocked");
+  const waiter = registerChild(coordinator, "waiter");
+  const task = coordinator.dispatch("root", "task.create", { description: "recoverable task" }).value;
+  coordinator.dispatch(blocked.id, "task.claim", { taskId: task.id });
+  coordinator.dispatch("root", "resource.define", { resourceId: "file:shared.ts", kind: "file", path: "shared.ts" });
+  for (const agentId of [blocked.id, waiter.id]) coordinator.dispatch("root", "resource.grant", { resourceId: "file:shared.ts", agentId, permissions: ["read", "write"] });
+  coordinator.dispatch(blocked.id, "resource.borrow", { resourceId: "file:shared.ts", mode: "mutable" });
+  coordinator.dispatch(blocked.id, "agent.begin_turn", {});
+  const waiting = coordinator.dispatch(waiter.id, "resource.borrow", { resourceId: "file:shared.ts", mode: "mutable", wait: true }).value as { status: string };
+  assert.equal(waiting.status, "waiting");
+
+  coordinator.dispatch(blocked.id, "agent.end_turn", { status: "blocked", statusReason: "provider unavailable" });
+  const resource = coordinator.dispatch("root", "resource.inspect", { resourceId: "file:shared.ts" }).value as ResourceRecord;
+  assert.equal(resource.mutableHold?.agentId, waiter.id);
+  assert.equal(resource.waiters.length, 0);
+  assert.equal(coordinator.dispatch("root", "task.show", { taskId: task.id }).value.owner, blocked.id);
+  assert.equal(coordinator.dispatch("root", "agent.status", { agentId: blocked.id }).value.status, "blocked");
+});
+
+test("inbox cursor drains durable messages beyond one recovery batch", () => {
+  const coordinator = makeCoordinator({ maxMailboxMessages: 512, maxTotalAgents: 4 });
+  registerRoot(coordinator);
+  registerChild(coordinator, "child");
+  for (let index = 0; index < 205; index += 1) {
+    coordinator.dispatch("root", "message.send", { to: "child", type: "inform", body: `message-${index}` });
+  }
+  const received: AgentMessage[] = [];
+  let afterBrokerSequence = 0;
+  while (received.length < 205) {
+    const batch = coordinator.dispatch("child", "message.inbox", { limit: 100, afterBrokerSequence }).value as AgentMessage[];
+    assert.ok(batch.length > 0);
+    received.push(...batch);
+    afterBrokerSequence = batch.at(-1)?.brokerSequence ?? afterBrokerSequence;
+  }
+  assert.equal(received.length, 205);
+  assert.equal(new Set(received.map((message) => message.id)).size, 205);
+  assert.deepEqual(received.map((message) => message.body), Array.from({ length: 205 }, (_, index) => `message-${index}`));
+  assert.deepEqual((coordinator.dispatch("child", "message.inbox", { limit: 100, afterBrokerSequence }).value as AgentMessage[]), []);
+});
+
+test("capacity groups serialize semantic route aliases", () => {
+  const routeA: ModelRoute = { provider: "alias-a", model: "model", thinking: "medium", capacityGroup: "gpu-0" };
+  const routeB: ModelRoute = { provider: "alias-b", model: "model", thinking: "medium", capacityGroup: "gpu-0" };
+  const coordinator = new Coordinator({
+    rootId: "fabric",
+    config: {
+      modelRoutePolicies: {
+        "alias-a/model": { maxConcurrent: 1, capacityGroup: "gpu-0" },
+        "alias-b/model": { maxConcurrent: 1, capacityGroup: "gpu-0" },
+      },
+    },
+  });
+  registerRoot(coordinator, {}, routeA);
+  const child = registerChild(coordinator, "alias-child", "root", {}, routeB);
+  assert.equal(coordinator.dispatch("root", "agent.begin_turn", {}).value.started, true);
+  assert.deepEqual(coordinator.dispatch(child.id, "agent.begin_turn", {}).value, {
+    started: false,
+    reason: "model route capacity reached for alias-b/model",
+  });
+  coordinator.dispatch("root", "agent.end_turn", { status: "ready" });
+  assert.equal(coordinator.dispatch(child.id, "agent.begin_turn", {}).value.started, true);
 });
 
 test("message dedupe returns the original message", () => {

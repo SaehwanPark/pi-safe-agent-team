@@ -218,10 +218,10 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
 
 export function routeFromSpawnInput(input: SpawnToolInput, fallback: ModelRoute): { route: ModelRoute; capabilities: Record<string, boolean> } {
   const route: ModelRoute = {
-      provider: input.provider ?? fallback.provider,
-      model: input.model ?? fallback.model,
-      thinking: (input.thinking as ModelRoute["thinking"] | undefined) ?? fallback.thinking,
-      ...(input.capacityGroup ? { capacityGroup: input.capacityGroup } : {}),
+    provider: input.provider ?? fallback.provider,
+    model: input.model ?? fallback.model,
+    thinking: (input.thinking as ModelRoute["thinking"] | undefined) ?? fallback.thinking,
+    ...(input.capacityGroup ? { capacityGroup: input.capacityGroup } : {}),
   };
   const capabilities: Record<string, boolean> = {};
   for (const key of ["maySpawn", "mayMessagePeers", "mayEscalate", "mayTransferOwnership", "mayWriteRepo", "mayUseShell"] as const) {

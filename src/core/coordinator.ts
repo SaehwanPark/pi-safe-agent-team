@@ -549,7 +549,7 @@ export class Coordinator {
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
-    if (requestedStatus === "blocked") this.releaseAgentResourceClaims(actorId, "blocked", events);
+    if (requestedStatus === "blocked") this.releaseAgentResourceClaims(actorId, events);
     return publicAgent(next);
   }
 
@@ -603,7 +603,7 @@ export class Coordinator {
     // A blocked context/provider turn is deliberately recoverable, but it is
     // not making progress. Release mutable claims immediately so another actor
     // can proceed while the task remains assigned for explicit recovery.
-    if (effectiveStatus === "blocked") this.releaseAgentResourceClaims(actorId, "blocked", events);
+    if (effectiveStatus === "blocked") this.releaseAgentResourceClaims(actorId, events);
 
     let task = agent.taskId ? cloneTask(this.requireTask(agent.taskId)) : undefined;
     if (isTerminal(effectiveStatus)) {
@@ -964,7 +964,7 @@ export class Coordinator {
         task.blockedReason = parseString(args.reason, "reason", 4096);
         task.updatedAt = this.clock();
         events.push({ type: "task_changed", task: cloneTask(task) });
-        if (task.owner) this.releaseAgentResourceClaims(task.owner, "blocked", events);
+        if (task.owner) this.releaseAgentResourceClaims(task.owner, events);
         return cloneTask(task);
       case "ready":
       case "reopen":
@@ -1707,7 +1707,7 @@ export class Coordinator {
   }
 
   /** Release leases, waiters, and in-flight write fences without changing task ownership. */
-  private releaseAgentResourceClaims(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
+  private releaseAgentResourceClaims(agentId: AgentId, events: CoordinatorEvent[]): void {
     for (const resource of this.resources.values()) {
       let changed = false;
       const beforeShared = resource.sharedHolds.length;
@@ -1733,7 +1733,7 @@ export class Coordinator {
   }
 
   private releaseAgentRuntime(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
-    this.releaseAgentResourceClaims(agentId, reason, events);
+    this.releaseAgentResourceClaims(agentId, events);
     let ownerTaskCleared = false;
     const owner = this.agents.get(agentId);
     for (const task of this.tasks.values()) {

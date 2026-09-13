@@ -2,10 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Coordinator } from "../src/core/coordinator.ts";
 import { DEFAULT_FABRIC_CONFIG, type AgentRecord, type FabricConfig, type ModelRoute, type TaskRecord } from "../src/core/types.ts";
-import { effectivePrefillBudget, modelRouteCapacity, modelRoutePolicy } from "../src/core/coordinator-wire.ts";
+import { effectivePrefillBudget, modelRouteCapacity, modelRouteCapacityKey, modelRoutePolicy } from "../src/core/coordinator-wire.ts";
 import { classifyRootDelivery } from "../src/pi/delivery.ts";
 import { ModelRouteCapacityArbiter } from "../src/pi/model-capacity.ts";
-import { classifyAssistantMessage, classifyCompactionFailure, isBlockingOutcome } from "../src/pi/turn-outcome.ts";
+import { classifyAssistantMessage, classifyCompactionFailure, isBlockingOutcome, isAbortLikeMessage } from "../src/pi/turn-outcome.ts";
 import { FabricRuntime, ManagedChild } from "../src/pi/runtime.ts";
 
 const localRoute: ModelRoute = { provider: "omlx", model: "qwen3", thinking: "medium" };
@@ -42,6 +42,14 @@ test("R2 outcome classifier separates logical overflow, prefill capacity, runtim
   assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "service unavailable (503)" }, 131_072).kind, "transient_error_exhausted");
   assert.equal(classifyCompactionFailure("summary backend failed").kind, "compaction_failed");
   assert.equal(isBlockingOutcome(classifyCompactionFailure()), true);
+});
+
+test("abort-like provider errors are recognized without broad substring matching", () => {
+  const base = { role: "assistant", usage: { input: 1, cacheRead: 0, output: 0 } };
+  assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "This operation was aborted" }).kind, "aborted");
+  assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "AbortError: request cancelled by user" }).kind, "aborted");
+  assert.equal(isAbortLikeMessage("error", "provider reported an aborted upstream request"), false);
+  assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "provider reported an aborted upstream request" }).kind, "fatal_provider");
 });
 test("R2 route policy coordinates broker turns and derives an effective prefill budget", () => {
   const config: FabricConfig = {
@@ -81,6 +89,33 @@ test("R2 local route arbiter serializes heavy operations and releases FIFO waite
   const releaseSecond = await second;
   assert.equal(secondEntered, true);
   releaseSecond();
+});
+
+test("explicit capacity groups share the strictest alias limit", async () => {
+  const routeA: ModelRoute = { provider: "home-a", model: "qwen", thinking: "medium", capacityGroup: "gpu-0" };
+  const routeB: ModelRoute = { provider: "home-b", model: "qwen", thinking: "medium", capacityGroup: "gpu-0" };
+  const config: FabricConfig = {
+    ...DEFAULT_FABRIC_CONFIG,
+    modelRoutePolicies: {
+      "home-a/qwen": { maxConcurrent: 2, capacityGroup: "gpu-0" },
+      "home-b/qwen": { maxConcurrent: 1, capacityGroup: "gpu-0" },
+    },
+  };
+  assert.equal(modelRouteCapacityKey(config, routeA), "gpu-0");
+  assert.equal(modelRouteCapacityKey(config, routeB), "gpu-0");
+  const arbiter = new ModelRouteCapacityArbiter(config);
+  const first = await arbiter.acquire(routeA);
+  let entered = false;
+  const queued = arbiter.acquire(routeB).then((release) => {
+    entered = true;
+    return release;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(entered, false);
+  first();
+  const release = await queued;
+  assert.equal(entered, true);
+  release();
 });
 
 test("R2 root delivery remains durable/context-only during compaction or degraded context", () => {

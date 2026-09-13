@@ -88,6 +88,14 @@ export function loadFabricConfig(options: FabricConfigLoadOptions): FabricConfig
         join(options.agentDir, "safe-agents.json"),
       ];
 
+  if (explicit && !existsSync(explicit)) {
+    return {
+      config: {},
+      source: explicit,
+      errors: [`Safe-agents configuration ${explicit} was explicitly requested but was not found`],
+    };
+  }
+
   for (const path of candidates) {
     if (!existsSync(path)) continue;
     const config = readCandidate(path, errors);
