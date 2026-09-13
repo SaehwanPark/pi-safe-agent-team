@@ -733,7 +733,8 @@ export class FabricRuntime {
       await parentClient.request("agent.configure_child", { agentId: spawned.agent.id, workspace });
       this.assertSpawnEpoch(spawnEpoch);
     } catch (error) {
-      await parentClient.request("agent.cancel", { agentId: spawned.agent.id }).catch(() => undefined);
+      const cancelTimeout = this.draining || spawnEpoch !== this.lifecycleEpoch ? FabricRuntime.shutdownRpcTimeoutMs : undefined;
+      await parentClient.request("agent.cancel", { agentId: spawned.agent.id }, cancelTimeout).catch(() => undefined);
       if (workspace?.mode === "worktree") {
         await this.workspaceStrategy.cleanup(workspace).catch(() => undefined);
       }
@@ -761,7 +762,8 @@ export class FabricRuntime {
       await child.start();
       this.assertSpawnEpoch(spawnEpoch);
     } catch (error) {
-      await parentClient.request("agent.cancel", { agentId: child.agentId }).catch(() => undefined);
+      const cancelTimeout = this.draining || spawnEpoch !== this.lifecycleEpoch ? FabricRuntime.shutdownRpcTimeoutMs : undefined;
+      await parentClient.request("agent.cancel", { agentId: child.agentId }, cancelTimeout).catch(() => undefined);
       await child.stop().catch(() => undefined);
       this.children.delete(child.agentId);
       throw asFabricError(error, "CHILD_SESSION_FAILURE");
