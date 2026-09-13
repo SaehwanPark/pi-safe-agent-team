@@ -1477,9 +1477,20 @@ export class ManagedChild {
    */
   private async reconcileRecoveryGate(agent: AgentRecord): Promise<void> {
     this.blockedByOutcome = undefined;
-    const task = agent.taskId
-      ? await this.client.request<TaskRecord>("task.show", { taskId: agent.taskId }).catch(() => undefined)
-      : undefined;
+    let task: TaskRecord | undefined;
+    if (agent.taskId) {
+      try {
+        task = await this.client.request<TaskRecord>("task.show", { taskId: agent.taskId });
+      } catch {
+        // A successful re-register followed by an uncertain task read must
+        // not resume provider work with an unknown semantic state. Keep the
+        // child gated until a later task event/reconnect can reconcile it.
+        this.blockedByOutcome = classifyCompactionFailure(
+          agent.contextDiagnostic ?? "Unable to reconcile assigned task state after broker reconnect",
+        );
+        return;
+      }
+    }
     // A durable terminal task is stronger than a stale agent status. Do not
     // re-arm a recovery gate (or resume work) from an older blocked event.
     if (task && ["completed", "failed", "cancelled"].includes(task.status)) return;
