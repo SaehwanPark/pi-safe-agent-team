@@ -1477,14 +1477,17 @@ export class ManagedChild {
    */
   private async reconcileRecoveryGate(agent: AgentRecord): Promise<void> {
     this.blockedByOutcome = undefined;
-    if (agent.status === "blocked") {
-      this.blockedByOutcome = classifyCompactionFailure(agent.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery");
-      return;
+    const task = agent.taskId
+      ? await this.client.request<TaskRecord>("task.show", { taskId: agent.taskId }).catch(() => undefined)
+      : undefined;
+    // A durable terminal task is stronger than a stale agent status. Do not
+    // re-arm a recovery gate (or resume work) from an older blocked event.
+    if (task && ["completed", "failed", "cancelled"].includes(task.status)) return;
+    if (agent.status === "blocked" || task?.status === "blocked") {
+      this.blockedByOutcome = classifyCompactionFailure(
+        task?.blockedReason ?? agent.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery",
+      );
     }
-    if (!agent.taskId) return;
-    const task = await this.client.request<TaskRecord>("task.show", { taskId: agent.taskId }).catch(() => undefined);
-    if (task?.status !== "blocked") return;
-    this.blockedByOutcome = classifyCompactionFailure(task.blockedReason ?? agent.contextDiagnostic ?? "Assigned task remains blocked pending explicit recovery");
   }
 
   private enqueuePrompt(prompt: string): void {
