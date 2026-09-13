@@ -262,8 +262,8 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   // Manual, threshold, and overflow compaction all mutate root context outside
   // a normal broker turn. Keep the fabric conservative through the full hook
   // interval and let durable deliveries queue as nextTurn/context-only.
-  pi.on("session_before_compact", async () => {
-    await runtime.beginRootCompaction();
+  pi.on("session_before_compact", async (event) => {
+    await runtime.beginRootCompaction(event.signal);
   });
   pi.on("session_compact", async (_event, ctx) => {
     await runtime.endRootCompaction();

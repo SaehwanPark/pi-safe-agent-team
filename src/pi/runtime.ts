@@ -230,7 +230,7 @@ export class FabricRuntime {
   }
 
   /** Begin observing a root manual/automatic compaction before Pi mutates context. */
-  async beginRootCompaction(): Promise<void> {
+  async beginRootCompaction(signal?: AbortSignal): Promise<void> {
     const epoch = this.rootCompactionEpoch;
     const reservationIndex = this.rootCompactionBrokerReservations.length;
     this.rootCompactionInFlight += 1;
@@ -240,7 +240,7 @@ export class FabricRuntime {
     const route = this.root?.ctx.model ? routeFromModel(this.root.ctx.model, this.root.ctx.thinkingLevel ?? "medium") : undefined;
     if (!route) return;
     try {
-      const release = await this.modelCapacity.acquire(route);
+      const release = await this.modelCapacity.acquire(route, signal);
       if (epoch !== this.rootCompactionEpoch || this.stopped) {
         release();
         return;
@@ -251,7 +251,7 @@ export class FabricRuntime {
     }
     if (this.root) {
       try {
-        const result = await this.root.client.request<{ started?: boolean }>("agent.begin_turn", {});
+        const result = await this.root.client.request<{ started?: boolean }>("agent.begin_turn", {}, FabricRuntime.shutdownRpcTimeoutMs, signal);
         if (result?.started === true) {
           if (epoch !== this.rootCompactionEpoch || this.stopped) {
             await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
