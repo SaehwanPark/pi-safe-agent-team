@@ -37,3 +37,32 @@ jobs:
         run: npm run check
       - name: Build package
         run: npm run build
+
+  smoke-with-lcm:
+    name: Pi + local-context-manager smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out safe-agent-team
+        uses: actions/checkout@v4
+      - name: Check out local-context-manager
+        uses: actions/checkout@v4
+        with:
+          repository: SaehwanPark/pi-local-context-manager
+          path: local-context-manager
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.19.0"
+          cache: npm
+      - name: Install safe-agent-team dependencies
+        run: npm ci
+      - name: Install local-context-manager dependencies
+        working-directory: local-context-manager
+        run: npm ci
+      - name: Install Pi CLI
+        run: npm install --global @earendil-works/pi-coding-agent@0.85.1
+      - name: Run isolated extension-load smoke
+        env:
+          LCM_DIR: ${{ github.workspace }}/local-context-manager
+        run: npm run smoke:pi:with-lcm
