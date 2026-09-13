@@ -1049,6 +1049,8 @@ export class ManagedChild {
   /** Cancels a route-capacity wait as soon as local child shutdown begins. */
   private readonly stopController = new AbortController();
   private embeddedManager?: EmbeddedContextManager;
+  /** Number of model operations currently holding the child route token. */
+  private modelCapacityDepth = 0;
   private resolvingToolCount = 0;
   private hasInFlightWrite = 0;
   private turnOutcome?: ModelTurnOutcome;
@@ -1166,11 +1168,22 @@ export class ManagedChild {
         if (this.session?.isStreaming || this.hasInFlightWrite > 0 || this.resolvingToolCount > 0) {
           throw new FabricError("CAPABILITY_DENIED", "Cannot compact child context while active operations are in flight");
         }
-        if (this.session && typeof this.session.compact === "function") {
-          // `reason` is protocol metadata (for example, "threshold"), not
-          // necessarily prose intended for the model. Only an explicit
-          // customInstructions value should become Pi compaction guidance.
-          await this.session.compact(request.customInstructions);
+        const compact = async (): Promise<void> => {
+          if (this.session && typeof this.session.compact === "function") {
+            // `reason` is protocol metadata (for example, "threshold"), not
+            // necessarily prose intended for the model. Only an explicit
+            // customInstructions value should become Pi compaction guidance.
+            await this.session.compact(request.customInstructions);
+          }
+        };
+        // LCM normally requests compaction after the generation token has been
+        // released. If a future provider requests it reentrantly during a
+        // generation, avoid self-deadlocking on the same non-reentrant token;
+        // Pi's streaming/in-flight guards above still reject unsafe overlap.
+        if (this.modelCapacityDepth > 0 || typeof (this.runtime as any).withModelRouteCapacity !== "function") {
+          await compact();
+        } else {
+          await this.runtime.withModelRouteCapacity(this.route, compact, this.stopController.signal);
         }
       },
       onStatus: (_snapshot) => {},
@@ -1519,9 +1532,17 @@ export class ManagedChild {
     let promptThrownOutcome: ModelTurnOutcome | undefined;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       promptThrownOutcome = undefined;
+      const runPromptWithDepth = async (): Promise<void> => {
+        this.modelCapacityDepth += 1;
+        try {
+          await runPrompt();
+        } finally {
+          this.modelCapacityDepth -= 1;
+        }
+      };
       try {
-        if (typeof (this.runtime as any).withModelRouteCapacity === "function") await this.runtime.withModelRouteCapacity(this.route, runPrompt, this.stopController.signal);
-        else await runPrompt();
+        if (typeof (this.runtime as any).withModelRouteCapacity === "function") await this.runtime.withModelRouteCapacity(this.route, runPromptWithDepth, this.stopController.signal);
+        else await runPromptWithDepth();
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (this.stopping) return;
