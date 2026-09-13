@@ -47,6 +47,48 @@ test("Pi root reattaches with its persisted reconnect credential", async () => {
   }
 });
 
+test("fresh root attachment drains messages left unacknowledged by the prior session", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "safe-agents-root-inbox-recovery-"));
+  const options = {
+    cwd: directory,
+    fabricId: "fabric-root-inbox-recovery",
+    stateDirectory: join(directory, "state"),
+    agentDir: directory,
+    endpoint: process.platform === "win32" ? undefined : join("/tmp", `pi-safe-root-inbox-${process.pid}-${Date.now()}.sock`),
+    config: { heartbeatMs: 1_000 },
+  };
+  const firstRuntime = new FabricRuntime(options);
+  const firstMessages: string[] = [];
+  let child: BrokerClient | undefined;
+  try {
+    await firstRuntime.ensureRoot({} as ExtensionAPI, runtimeContext(directory, "session-1"), (message) => firstMessages.push(message.id));
+    const spawned = await firstRuntime.request<{ agent: AgentRecord; token: string }>("agent.spawn", { route });
+    child = new BrokerClient({ endpoint: firstRuntime.endpoint, agentId: spawned.agent.id, token: spawned.token });
+    await child.connect();
+    await child.request("agent.register", { rootId: firstRuntime.fabricId, parentId: firstRuntime.rootAgentId, route, token: spawned.token });
+    await child.request("message.send", { to: firstRuntime.rootAgentId, type: "inform", body: "recover root message" });
+    for (let attempt = 0; attempt < 20 && firstMessages.length === 0; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(firstMessages.length, 1);
+
+    await firstRuntime.stop();
+    child.close();
+    child = undefined;
+
+    const secondRuntime = new FabricRuntime(options);
+    const secondMessages: string[] = [];
+    try {
+      await secondRuntime.ensureRoot({} as ExtensionAPI, runtimeContext(directory, "session-2"), (message) => secondMessages.push(message.id));
+      assert.deepEqual(secondMessages, firstMessages);
+    } finally {
+      await secondRuntime.stop();
+    }
+  } finally {
+    child?.close();
+    await firstRuntime.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("default fabric identity is finalized from the root Pi session at attachment", async () => {
   const directory = await mkdtemp(join(tmpdir(), "safe-agents-session-scope-"));
   const endpoint = join("/tmp", `pi-safe-identity-${process.pid}-${Date.now()}.sock`);

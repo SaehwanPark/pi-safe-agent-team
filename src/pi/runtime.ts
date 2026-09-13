@@ -431,6 +431,10 @@ export class FabricRuntime {
         this.rootToken = refreshed.token;
         this.root.client.setIdentity(this.root.agentId, refreshed.token);
       }
+      if (this.rootDelivery) {
+        const inbox = await this.drainRootInbox();
+        for (const message of inbox) this.rootDelivery(message);
+      }
       return this.root;
     }
     if (!ctx.model) throw new FabricError("MODEL_ROUTE_INVALID", "Pi has no selected model; select a model before starting the agent fabric");
@@ -470,6 +474,10 @@ export class FabricRuntime {
     this.rootCloseUnsubscribe = client.onClose(() => {
       void this.reconnectRoot();
     });
+    if (this.rootDelivery) {
+      const inbox = await this.drainRootInbox();
+      for (const message of inbox) this.rootDelivery(message);
+    }
     return this.root;
   }
 
