@@ -341,9 +341,9 @@ export class FabricRuntime {
   }
 
   /** Best-effort lift of a root write fence taken by guardRootMutation. */
-  async releaseRootFence(fenceId: string): Promise<void> {
+  async releaseRootFence(fenceId: string, timeoutMs?: number): Promise<void> {
     if (!this.root) return;
-    await releaseRootWriteFence(this.root.client, fenceId);
+    await releaseRootWriteFence(this.root.client, fenceId, timeoutMs);
   }
 
   /** Coordinate a root-session shell command against live child holds. */

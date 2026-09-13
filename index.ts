@@ -64,6 +64,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
 
   const rootDeliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
   let rootDeliveryTail: Promise<void> = Promise.resolve();
+  let rootDeliveryEpoch = 0;
   const lifecycleQueue = new LifecycleQueue();
 
   const enqueueLifecycle = (generation: number, operation: () => Promise<void>): Promise<void> =>
@@ -88,6 +89,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   };
 
   const rootDelivery = (api: ExtensionAPI) => (message: AgentMessage): void => {
+    const epoch = rootDeliveryEpoch;
     const state = rootDeliveryStates.get(message.id);
     if (state === "acknowledged" || state === "delivering") return;
     if (state === "accepted") {
@@ -102,6 +104,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     // root model in the reverse order.
     rootDeliveryTail = rootDeliveryTail.then(async () => {
       try {
+        if (epoch !== rootDeliveryEpoch) return;
         const content = `[${message.type} from ${message.from}]\n${message.body}`;
         const decision = classifyRootDelivery(message);
         await api.sendMessage({ customType: "safe-agents.message", content, display: decision.display, details: message }, {
@@ -109,6 +112,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
           deliverAs: decision.deliverAs,
         });
         rememberRootMessage(message.id, "accepted");
+        if (epoch !== rootDeliveryEpoch) return;
         await runtime.request("message.ack", { messageId: message.id });
         rememberRootMessage(message.id, "acknowledged");
       } catch {
@@ -173,6 +177,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    rootDeliveryEpoch += 1;
     registerInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);
     const generation = lifecycleQueue.beginSession();
     try {
@@ -210,9 +215,16 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    rootDeliveryEpoch += 1;
+    rootDeliveryStates.clear();
+    runtime.setPendingRootDeliveriesCount(0);
     unregisterInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);
     const pendingLifecycle = lifecycleQueue.shutdown();
     await pendingLifecycle.catch(() => undefined);
+    const pendingFences = [...pendingRootFences.values()];
+    pendingRootFences.clear();
+    runtime.setPendingRootFencesCount(0);
+    await Promise.allSettled(pendingFences.map((fenceId) => runtime.releaseRootFence(fenceId, FabricRuntime.shutdownRpcTimeoutMs)));
     await runtime.stop().catch((error) => notifyLifecycleFailure(ctx, error, "warning"));
   });
 

@@ -21,7 +21,7 @@ import { classifyRootShellCommand } from "./shell-classifier.ts";
 import { detectCaseInsensitivePaths } from "../broker/server.ts";
 
 export interface WriteAuthorizationClient {
-  request<T = unknown>(operation: string, args?: Record<string, unknown>): Promise<T>;
+  request<T = unknown>(operation: string, args?: Record<string, unknown>, timeoutMs?: number): Promise<T>;
 }
 
 export type ChildShellMode = "read-only" | "workspace";
@@ -338,8 +338,8 @@ export interface RootWriteGuardOutcome {
   fenceId?: string;
 }
 
-export async function releaseRootWriteFence(client: WriteAuthorizationClient, fenceId: string): Promise<void> {
-  await client.request("resource.end_write", { fenceId }).catch(() => undefined);
+export async function releaseRootWriteFence(client: WriteAuthorizationClient, fenceId: string, timeoutMs?: number): Promise<void> {
+  await client.request("resource.end_write", { fenceId }, timeoutMs).catch(() => undefined);
 }
 
 export async function evaluateRootWriteGuard(options: RootWriteGuardOptions, toolName: string, input: unknown): Promise<RootWriteGuardOutcome | undefined> {
