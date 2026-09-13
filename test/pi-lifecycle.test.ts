@@ -94,6 +94,27 @@ test("finalizes the root turn once after Pi settles while observing agent_end", 
   assert.equal(stopCalls, 1);
 });
 
+test("automatic retry/compaction agent_start events share one logical root broker turn", async () => {
+  const operations: string[] = [];
+  await withRuntimeSpies(async (operation) => {
+    operations.push(operation);
+  }, async () => {
+    const handlers = makeExtensionHarness();
+    const context = makeContext();
+    await handlers.get("session_start")?.[0]?.({}, context);
+    handlers.get("agent_start")?.[0]?.({}, context);
+    await flushLifecycle();
+    handlers.get("agent_end")?.[0]?.({ messages: [{ role: "assistant", stopReason: "error", errorMessage: "temporary provider failure", usage: { input: 1, cacheRead: 0, output: 0 } }] }, context);
+    handlers.get("agent_start")?.[0]?.({}, context);
+    await flushLifecycle();
+    handlers.get("agent_end")?.[0]?.({ messages: [{ role: "assistant", stopReason: "stop", usage: { input: 1, cacheRead: 0, output: 1 } }] }, context);
+    handlers.get("agent_settled")?.[0]?.({}, context);
+    await flushLifecycle();
+    await handlers.get("session_shutdown")?.[0]?.({}, context);
+  });
+  assert.deepEqual(operations, ["agent.begin_turn", "agent.end_turn"]);
+});
+
 test("an aborted root run drains descendants after settlement", async () => {
   let abortCalls = 0;
   const context = {

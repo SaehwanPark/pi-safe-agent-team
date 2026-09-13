@@ -21,6 +21,7 @@ export type { DescendantShutdownMode, HandoffSnapshot } from "./src/pi/runtime.t
 export { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootShellGuard, evaluateRootWriteGuard, workspaceRelativePath } from "./src/pi/guards.ts";
 export { classifyRootShellCommand, type RootShellRisk } from "./src/pi/shell-classifier.ts";
 export { classifyRootDelivery, type RootDeliveryDecision, type RootDeliveryContext } from "./src/pi/delivery.ts";
+export { ModelRouteCapacityArbiter } from "./src/pi/model-capacity.ts";
 export { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isBlockingOutcome, type ModelTurnOutcome, type ModelTurnOutcomeKind } from "./src/pi/turn-outcome.ts";
 export { getInteropRegistry, getInteropProvider, registerInteropProvider, unregisterInteropProvider, PI_EXTENSION_INTEROP } from "./src/pi/interop.ts";
 export type { FabricSnapshotRequest, FabricStateSnapshotV1, FabricStateProviderV1, EmbeddedContextHost, EmbeddedContextManager, EmbeddedToolResult } from "./src/pi/interop.ts";
@@ -147,6 +148,13 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
 
   function wakeDeferredRoot(api: ExtensionAPI): void {
     if (deferredRootMessages.size === 0 || runtime.isRootCompactionInFlight || runtime.rootHealth === "degraded") return;
+    // A retry/continuation is already running in Pi. The messages were
+    // delivered as next-turn context, so do not enqueue a second synthetic
+    // wake against the same logical run.
+    if (rootLogicalRunActive) {
+      deferredRootMessages.clear();
+      return;
+    }
     deferredRootMessages.clear();
     void api.sendMessage({
       customType: "safe-agents.status",

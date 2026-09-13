@@ -160,7 +160,7 @@ export class FabricRuntime {
   private readonly modelCapacity: ModelRouteCapacityArbiter;
   private rootCompactionInFlight = 0;
   private rootCompactionReleases: Array<() => void> = [];
-  private rootCompactionBrokerTurn = false;
+  private rootCompactionBrokerReservations: boolean[] = [];
   private rootContextHealth: "healthy" | "degraded" = "healthy";
   private rootContextDiagnostic?: string;
   private drainPromise?: Promise<readonly HandoffSnapshot[]>;
@@ -231,6 +231,7 @@ export class FabricRuntime {
   /** Begin observing a root manual/automatic compaction before Pi mutates context. */
   async beginRootCompaction(): Promise<void> {
     this.rootCompactionInFlight += 1;
+    this.rootCompactionBrokerReservations.push(false);
     const route = this.root?.ctx.model ? routeFromModel(this.root.ctx.model, this.root.ctx.thinkingLevel ?? "medium") : undefined;
     if (!route) return;
     try {
@@ -241,7 +242,7 @@ export class FabricRuntime {
     if (this.root) {
       try {
         const result = await this.root.client.request<{ started?: boolean }>("agent.begin_turn", {});
-        this.rootCompactionBrokerTurn = result?.started === true;
+        if (result?.started === true) this.rootCompactionBrokerReservations[this.rootCompactionBrokerReservations.length - 1] = true;
       } catch {
         // An already-running root (automatic compaction) or unavailable broker
         // is still covered by the local compaction flag.
@@ -252,15 +253,15 @@ export class FabricRuntime {
   async endRootCompaction(): Promise<void> {
     if (this.rootCompactionInFlight > 0) this.rootCompactionInFlight -= 1;
     this.rootCompactionReleases.pop()?.();
-    if (this.rootCompactionInFlight === 0 && this.rootCompactionBrokerTurn && this.root) {
-      this.rootCompactionBrokerTurn = false;
+    const brokerReservation = this.rootCompactionBrokerReservations.pop() ?? false;
+    if (brokerReservation && this.root) {
       await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
     }
   }
 
   resetRootCompactionState(): void {
     this.rootCompactionInFlight = 0;
-    this.rootCompactionBrokerTurn = false;
+    this.rootCompactionBrokerReservations = [];
     for (const release of this.rootCompactionReleases.splice(0)) release();
   }
 
@@ -1021,6 +1022,8 @@ export class ManagedChild {
   private lastObservedOutcome?: ModelTurnOutcome;
   private compactionFailure?: ModelTurnOutcome;
   private lastDiagnostic?: string;
+  /** A blocked context/provider turn must not be retried by ordinary inbox wakes. */
+  private blockedByOutcome?: ModelTurnOutcome;
 
   constructor(runtime: FabricRuntime, options: {
     agentId: string;
@@ -1070,7 +1073,9 @@ export class ManagedChild {
   }
 
   get effectiveContextBudget(): number | undefined {
-    return this.runtime.getEffectivePrefillBudget(this.route, typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined);
+    const logicalContextWindow = typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined;
+    const resolver = (this.runtime as any).getEffectivePrefillBudget;
+    return typeof resolver === "function" ? resolver.call(this.runtime, this.route, logicalContextWindow) : logicalContextWindow;
   }
 
   get contextDiagnostic(): string | undefined {
@@ -1150,7 +1155,7 @@ export class ManagedChild {
       contextWindow: logicalContextWindow,
     };
     if (logicalContextWindow !== undefined) embeddedOptions.logicalContextWindow = logicalContextWindow;
-    if (effectiveContextBudget !== undefined && effectiveContextBudget !== logicalContextWindow) {
+    if (effectiveContextBudget !== undefined) {
       embeddedOptions.effectiveContextBudget = effectiveContextBudget;
       embeddedOptions.effectivePrefillBudget = effectiveContextBudget;
     }
@@ -1247,6 +1252,9 @@ export class ManagedChild {
       contextDiagnostic: this.lastDiagnostic,
     })).agent;
     this.taskId = this.record.taskId;
+    if (this.record.status === "blocked") {
+      this.blockedByOutcome = classifyCompactionFailure(this.record.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery");
+    }
     this.started = true;
     this.heartbeatTimer = setInterval(() => {
       void this.client.request("agent.heartbeat", {}).catch(() => undefined);
@@ -1416,6 +1424,7 @@ export class ManagedChild {
 
   private async finishTurnWithOutcome(outcomeValue: ModelTurnOutcome, taskId: string | undefined): Promise<void> {
     const reason = describeTurnOutcome(outcomeValue);
+    if (outcomeValue.lifecycle === "blocked") this.blockedByOutcome = outcomeValue;
     if (taskId && outcomeValue.lifecycle === "blocked") {
       await this.client.request("task.update", { taskId, action: "block", reason }).catch(() => undefined);
     } else if (taskId && outcomeValue.lifecycle === "failed") {
@@ -1430,12 +1439,24 @@ export class ManagedChild {
     if (outcomeValue.lifecycle === "blocked") {
       this.lastDiagnostic = reason;
       void this.client.request("agent.update", { contextDiagnostic: reason }).catch(() => undefined);
+      await this.client.request("message.send", {
+        to: this.parentId,
+        type: "blocked",
+        body: reason,
+        metadata: {
+          cause: outcomeValue.kind,
+          provider: outcomeValue.provider,
+          model: outcomeValue.model,
+          contextTokens: outcomeValue.contextTokens,
+          contextWindow: outcomeValue.contextWindow,
+        },
+      }).catch(() => undefined);
     }
     if (outcomeValue.lifecycle === "failed") await this.stop();
   }
 
   private async executePrompt(prompt: string): Promise<void> {
-    if (!this.session || this.stopping) return;
+    if (!this.session || this.stopping || this.blockedByOutcome) return;
     this.turnOutcome = undefined;
     this.lastObservedOutcome = undefined;
     this.compactionFailure = undefined;
@@ -1454,8 +1475,41 @@ export class ManagedChild {
       }
     }
     const runPrompt = () => this.session!.prompt(prompt, { expandPromptTemplates: false });
-    if (typeof (this.runtime as any).withModelRouteCapacity === "function") await this.runtime.withModelRouteCapacity(this.route, runPrompt);
-    else await runPrompt();
+    // A structured prefill/KV failure is capacity pressure, not proof that the
+    // logical context is too large. The route token is released by the first
+    // attempt; retry the same context once after competing work has drained,
+    // then block rather than entering an unbounded compact/retry loop.
+    let promptThrownOutcome: ModelTurnOutcome | undefined;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      promptThrownOutcome = undefined;
+      try {
+        if (typeof (this.runtime as any).withModelRouteCapacity === "function") await this.runtime.withModelRouteCapacity(this.route, runPrompt);
+        else await runPrompt();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        promptThrownOutcome = classifyAssistantMessage({
+          role: "assistant",
+          provider: this.route.provider,
+          model: this.route.model,
+          stopReason: "error",
+          errorMessage: message,
+          usage: { input: 0, cacheRead: 0, output: 0 },
+        }, typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined);
+      }
+      const observed = this.compactionFailure ?? this.turnOutcome ?? this.lastObservedOutcome ?? promptThrownOutcome;
+      if (observed?.kind === "prefill_capacity" && attempt === 0) {
+        this.turnOutcome = undefined;
+        this.lastObservedOutcome = undefined;
+        this.compactionFailure = undefined;
+        continue;
+      }
+      break;
+    }
+    if (promptThrownOutcome) {
+      const agent = await this.client.request<AgentRecord>("agent.status", {});
+      await this.finishTurnWithOutcome(promptThrownOutcome, agent.taskId ?? this.taskId);
+      return;
+    }
     if (this.embeddedManager && this.contextMode === "lcm-embedded") {
       try {
         this.embeddedManager.observeTurnEnd();
@@ -1494,7 +1548,19 @@ export class ManagedChild {
       const agent = (event.data as { agent?: AgentRecord }).agent;
       if (agent?.id === this.agentId) {
         this.record = agent;
+        if (agent.status === "ready" && this.blockedByOutcome) {
+          this.blockedByOutcome = undefined;
+          this.drainPendingMessages();
+        }
         if (agent.status === "completed" || agent.status === "cancelled" || agent.status === "failed" && agent.reconnectable !== true) void this.stop();
+      }
+      return;
+    }
+    if (event.event === "task_changed") {
+      const task = (event.data as { task?: TaskRecord }).task;
+      if (task?.owner === this.agentId && task.status !== "blocked" && !["completed", "failed", "cancelled"].includes(task.status) && this.blockedByOutcome) {
+        this.blockedByOutcome = undefined;
+        this.drainPendingMessages();
       }
       return;
     }
@@ -1528,6 +1594,14 @@ export class ManagedChild {
   }
 
   private async acceptMessage(message: AgentMessage): Promise<void> {
+    if (this.blockedByOutcome) {
+      this.deliveryStates.delete(message.id);
+      if (!this.pendingMessageIds.has(message.id)) {
+        this.pendingMessageIds.add(message.id);
+        this.pendingMessages.push(message);
+      }
+      return;
+    }
     const text = `[Fabric message from ${message.from} | ${message.type} | ${message.id}]\n${message.body}`;
     let accepted = false;
     try {
@@ -1554,6 +1628,15 @@ export class ManagedChild {
       const removable = [...this.deliveryStates.entries()].find(([, current]) => current === "acknowledged")?.[0];
       if (!removable) break;
       this.deliveryStates.delete(removable);
+    }
+  }
+
+  private drainPendingMessages(): void {
+    if (this.blockedByOutcome || !this.session || this.stopping) return;
+    const pending = this.pendingMessages.splice(0);
+    for (const message of pending) {
+      this.pendingMessageIds.delete(message.id);
+      void this.deliverMessage(message);
     }
   }
 

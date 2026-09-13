@@ -183,7 +183,7 @@ export class Coordinator {
       if (!map) continue;
       for (const [key, value] of Object.entries(map)) {
         assertCondition(Boolean(key) && key.length <= 1024, "INVALID_ARGUMENT", "model route policy keys must be bounded");
-        assertCondition(typeof value === "number" && Number.isFinite(value) && value >= 0, "INVALID_ARGUMENT", `model route capacity for ${key} must be a finite non-negative number`);
+        assertCondition(typeof value === "number" && Number.isInteger(value) && value > 0, "INVALID_ARGUMENT", `model route capacity for ${key} must be a positive integer`);
       }
     }
     if (this.config.effectivePrefillBudgets) {
@@ -196,7 +196,7 @@ export class Coordinator {
       for (const [key, policy] of Object.entries(this.config.modelRoutePolicies)) {
         assertCondition(Boolean(key) && key.length <= 1024, "INVALID_ARGUMENT", "model route policy keys must be bounded");
         assertCondition(Boolean(policy) && typeof policy === "object" && !Array.isArray(policy), "INVALID_ARGUMENT", `model route policy for ${key} must be an object`);
-        if (policy.maxConcurrent !== undefined) assertCondition(typeof policy.maxConcurrent === "number" && Number.isFinite(policy.maxConcurrent) && policy.maxConcurrent >= 0, "INVALID_ARGUMENT", `model route maxConcurrent for ${key} must be a finite non-negative number`);
+        if (policy.maxConcurrent !== undefined) assertCondition(typeof policy.maxConcurrent === "number" && Number.isInteger(policy.maxConcurrent) && policy.maxConcurrent > 0, "INVALID_ARGUMENT", `model route maxConcurrent for ${key} must be a positive integer`);
         if (policy.effectivePrefillBudget !== undefined) assertCondition(typeof policy.effectivePrefillBudget === "number" && Number.isFinite(policy.effectivePrefillBudget) && policy.effectivePrefillBudget > 0, "INVALID_ARGUMENT", `effective prefill budget for ${key} must be a positive finite number`);
       }
     }
@@ -527,18 +527,19 @@ export class Coordinator {
     const agent = this.requireAgent(actorId);
     const next = cloneAgent(agent);
     const requestedStatus = args.status as AgentStatus | undefined;
+    if (args.route !== undefined) next.route = this.validateRoute(args.route as ModelRoute);
     if (requestedStatus === "running" && agent.status !== "running") {
       assertCondition(this.runningAgentCount() < this.config.maxConcurrentAgents, "AGENT_LIMIT_REACHED", "maxConcurrentAgents reached");
-      this.assertRouteCapacity(agent.route, agent.id);
+      this.assertRouteCapacity(next.route, agent.id);
     }
     if (requestedStatus && isTerminal(requestedStatus)) {
       throw new FabricError("LIFECYCLE_CONFLICT", "Use agent.end_turn for terminal transitions so runtime claims are released");
     }
     if (requestedStatus) this.transitionStatus(next, requestedStatus, parseOptionalString(args.statusReason, "statusReason", 2048));
     assertCondition(args.taskId === undefined, "IDENTITY_CONFLICT", "Use task.claim or task.update to change task ownership");
-    if (args.route !== undefined) next.route = this.validateRoute(args.route as ModelRoute);
     if (args.workspace !== undefined) next.workspace = parseWorkspace(args.workspace);
     if (args.contextMode !== undefined) next.contextMode = parseOptionalString(args.contextMode, "contextMode", 128);
+    if (args.contextDiagnostic !== undefined) next.contextDiagnostic = parseOptionalString(args.contextDiagnostic, "contextDiagnostic", 2048);
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });

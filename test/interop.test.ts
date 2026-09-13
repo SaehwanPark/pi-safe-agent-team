@@ -6,6 +6,11 @@ import {
   registerInteropProvider,
   unregisterInteropProvider,
   getInteropProvider,
+  createEmbeddedContextController,
+  LCM_EMBEDDED_CONTEXT_PROVIDER_NAME,
+  LEGACY_LCM_EMBEDDED_CONTEXT_PROVIDER_NAME,
+  type EmbeddedContextHost,
+  type EmbeddedContextManager,
 } from "../src/pi/interop.ts";
 
 test("interop registry uses Symbol.for('pi.extension-interop.v1') and handles registration", () => {
@@ -39,4 +44,32 @@ test("interop registry uses Symbol.for('pi.extension-interop.v1') and handles re
   // Unregister with matching instance removes it
   unregisterInteropProvider("test.provider.v1", testProvider);
   assert.equal(getInteropProvider("test.provider.v1"), undefined);
+});
+
+test("canonical LCM provider name wins while the legacy alias remains compatible", () => {
+  const manager = (): EmbeddedContextManager => ({
+    observeTurnStart() {},
+    observeTurnEnd() {},
+    async observeSettled() {},
+    async transformToolResult(result) { return result; },
+    snapshot() { return { tokens: null, contextWindow: null, tokenSource: "estimated" }; },
+    dispose() {},
+  });
+  const host: EmbeddedContextHost = {
+    getContextUsage: () => null,
+    getContextEntries: () => [],
+    compact: async () => {},
+  };
+  const canonical = () => manager();
+  const legacy = () => ({ ...manager(), snapshot: () => ({ tokens: 1, contextWindow: 1, tokenSource: "estimated" }) });
+  registerInteropProvider(LEGACY_LCM_EMBEDDED_CONTEXT_PROVIDER_NAME, legacy);
+  registerInteropProvider(LCM_EMBEDDED_CONTEXT_PROVIDER_NAME, canonical);
+  try {
+    const selected = createEmbeddedContextController(host);
+    assert.ok(selected);
+    assert.equal(selected.snapshot().tokens, null);
+  } finally {
+    unregisterInteropProvider(LCM_EMBEDDED_CONTEXT_PROVIDER_NAME, canonical);
+    unregisterInteropProvider(LEGACY_LCM_EMBEDDED_CONTEXT_PROVIDER_NAME, legacy);
+  }
 });

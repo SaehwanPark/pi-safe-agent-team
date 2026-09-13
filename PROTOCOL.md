@@ -78,6 +78,15 @@ The public tool/command layer maps to these operation families:
 - `resource.define`, `resource.inspect`, `resource.snapshot`, `resource.borrow`, `resource.transfer`, `resource.release`, `resource.grant`, `resource.check_write`, `resource.begin_write`, `resource.end_write`, `resource.list`;
 - `fabric.status`.
 
+Implementations may configure model-runtime limits alongside the agent limits. A route
+policy is keyed by `provider/model` (with provider and `*` aliases) and can set a
+positive-integer `maxConcurrent` plus an optional positive `effectivePrefillBudget`.
+The latter is a conservative context-management budget and is clamped to the model's
+logical context window; it does not rewrite model metadata. The coordinator enforces
+route slots for durable turns, while each host serializes local heavy operations with
+the same route key so normal generations and compaction summaries cannot race one
+another.
+
 The broker may add internal operations, but unknown operations fail closed.
 
 ## Idempotent durable writes
@@ -305,6 +314,7 @@ Quiescence and session replacement rules are strictly conservative:
 - **Child tasks**: All child tasks must have reached a terminal state (`completed`, `failed`, `cancelled`), ensuring `unresolvedChildTasks === 0`.
 - **Resource holds and write fences**: Zero active mutable borrows (`mutableHolds === 0`) and zero active write fences (`activeWriteFences === 0`) across the entire fabric.
 - **Pending root requests and deliveries**: Zero unresolved requests or unconsumed deliveries directed to the root (`pendingRootRequests === 0` and `pendingRootDeliveries === 0`).
+- **Root context mutation**: `rootCompactionInFlight === false`; manual, threshold, overflow, and embedded root compaction keep `sessionReplacementSafe === false` for the entire hook interval.
 - **Failure state**: If the broker is unreachable or a status query fails while the root is attached, the snapshot fails closed with `active: true, quiescent: false, state: "uncertain", sessionReplacementSafe: false`, and `quiescenceReasons: ["broker_status_query_failed"]`.
 
 ### Root Session Replacement and Descendant Cancellation

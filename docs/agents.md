@@ -52,11 +52,12 @@ The root session participates too: its ordinary Pi `edit`/`write` calls are veto
 ## Failure behavior
 
 - session creation/auth error: child is cancelled and the error is returned;
-- model turn error: child becomes `failed`, task ownership is released/requeued, and the parent receives `agent_failed`;
+- model turn error: terminal Pi outcomes are classified; fatal provider/auth failures become `failed`, while recoverable context/capacity/compaction/transient exhaustion becomes `blocked` with bounded context diagnostics and a durable parent notice. Explicit task facts still control completion and reopening;
 - lost socket: the host reconnects with its credential and syncs the inbox;
 - broker restart: old live actors are marked failed/reconnectable, leases are released, pending clarification records survive, matching sessions can re-register once, and each waiting actor keeps its `maxTotalAgents` slot reserved until it reconnects, resolves, or is cancelled (so newcomers cannot evict it);
 - parent cancellation: descendants are cancelled recursively;
-- host lifecycle race: root attach, begin-turn, and final end-turn requests are serialized; the root ends its broker turn on Pi's `agent_settled` event rather than `agent_end` because Pi may retry, compact, or continue after `agent_end`. Callbacks from an older session are ignored after shutdown, and a detached root during teardown is treated as a nonfatal unavailable-fabric condition.
+- host lifecycle race: root attach, begin-turn, and final end-turn requests are serialized; the root starts one logical broker turn across Pi's retry/compact `agent_start` continuations and ends it on `agent_settled`. `agent_end` is observation-only for the actual final outcome. Callbacks from an older session are ignored after shutdown, and a detached root during teardown is treated as a nonfatal unavailable-fabric condition.
+- model/runtime recovery: terminal provider results are classified before a child turn is ended. Logical overflow follows Pi's native bounded recovery; prefill/KV capacity gets one same-context retry after route capacity is released; exhausted capacity, runtime pressure, transient exhaustion, and compaction failures block the task with a bounded diagnostic and durable parent notice instead of returning `ready`. A blocked child does not re-run on ordinary inbox wakes until its task is explicitly reopened.
 - Pi session-control methods such as `newSession`, `fork`, and `switchSession` are command-only operations. Do not call them from lifecycle event handlers, where they can deadlock; use a command/`withSession` flow and let lifecycle handlers remain best-effort.
 
 ## Workspace modes

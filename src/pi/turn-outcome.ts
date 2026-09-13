@@ -36,13 +36,14 @@ const CAPACITY_PATTERNS = [
   /prefill[_ -]?memory[_ -]?exceeded/i,
   /prefill.{0,80}(?:memory|kv|cache).{0,80}(?:exceed|insufficient|full|allocat|capacity)/i,
   /(?:kv|key.value).{0,80}(?:cache|memory).{0,80}(?:exceed|insufficient|full|allocat|capacity)/i,
-  /(?:memory|ram|gpu).{0,80}(?:pressure|insufficient|exhaust|allocat|capacity)/i,
+  /(?:memory|ram|gpu).{0,80}(?:insufficient|allocat|capacity)/i,
   /failed to allocate.{0,80}(?:memory|kv|cache)/i,
 ];
 
 const RUNTIME_MEMORY_PATTERNS = [
   /out of memory/i,
   /oom/i,
+  /memory pressure/i,
   /model (?:was )?evict(?:ed|ion)/i,
   /process memory pressure/i,
   /cuda.*out of memory/i,
@@ -74,7 +75,7 @@ function diagnosticText(message: AssistantLike): string | undefined {
   const direct = text(message.errorMessage);
   if (direct) return direct;
   for (const diagnostic of message.diagnostics ?? []) {
-    const candidate = text(diagnostic.error?.message);
+    const candidate = text(diagnostic.error?.message) ?? text((diagnostic as { message?: unknown }).message);
     if (candidate) return candidate;
   }
   return undefined;
@@ -82,8 +83,8 @@ function diagnosticText(message: AssistantLike): string | undefined {
 
 function failureKind(errorMessage: string | undefined): ModelTurnOutcomeKind {
   if (!errorMessage) return "fatal_provider";
-  if (CAPACITY_PATTERNS.some((pattern) => pattern.test(errorMessage))) return "prefill_capacity";
   if (RUNTIME_MEMORY_PATTERNS.some((pattern) => pattern.test(errorMessage))) return "runtime_memory_pressure";
+  if (CAPACITY_PATTERNS.some((pattern) => pattern.test(errorMessage))) return "prefill_capacity";
   if (TRANSIENT_PATTERNS.some((pattern) => pattern.test(errorMessage))) return "transient_error_exhausted";
   return "fatal_provider";
 }
@@ -164,4 +165,3 @@ export function describeTurnOutcome(outcomeValue: ModelTurnOutcome): string {
   const detail = outcomeValue.errorMessage ? `: ${outcomeValue.errorMessage.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 1200)}` : "";
   return `model turn ${outcomeValue.kind}${route}${context}${detail}`.slice(0, 1900);
 }
-

@@ -213,7 +213,15 @@ export function modelRoutePolicy(config: FabricConfig, route: Pick<ModelRoute, "
   const providerKey = route.provider;
   const wildcard = "*";
   const configured = configuredRouteValue(config, key) ?? configuredRouteValue(config, providerKey) ?? configuredRouteValue(config, wildcard);
-  if (configured) return { ...configured };
+  if (configured) {
+    // A local backend remains conservatively serialized even when a caller
+    // configures only its effective prefill budget. An explicit capacity still
+    // wins, including a deliberately larger local value.
+    return {
+      maxConcurrent: configured.maxConcurrent ?? (localProvider(route.provider) ? 1 : undefined),
+      effectivePrefillBudget: configured.effectivePrefillBudget,
+    };
+  }
   return localProvider(route.provider) ? { maxConcurrent: 1 } : {};
 }
 

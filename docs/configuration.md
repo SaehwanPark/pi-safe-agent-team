@@ -56,6 +56,23 @@ Current defaults:
 | `fenceMs` (per `resource.begin_write`) | 30s, clamped 1s-120s | Lifetime of a guarded-write fence. Not a config field: passed per call by the guarded host. Fences are ephemeral and are never journaled. |
 | `caseInsensitivePaths` | auto | Fold policy keys so differently-cased spellings share one resource. Undefined = probe the broker volume at startup (always true on Windows). Set `false` to keep keys case-sensitive. |
 
+Model-runtime coordination is configured independently from the global agent count:
+
+```ts
+modelRoutePolicies: {
+  "omlx/qwen3": { maxConcurrent: 1, effectivePrefillBudget: 48_000 },
+  "openai/gpt-5.6-sol": { maxConcurrent: 4 },
+}
+```
+
+`modelRouteCapacity`/`modelRouteCapacities` are accepted as simple
+`provider/model -> positive integer` capacity maps. Exact route entries take
+precedence over provider and `*` entries. Local providers (`omlx`, `llama.cpp`,
+LM Studio, Ollama, and `local`) default to one heavy operation when no capacity is
+specified. `effectivePrefillBudget` is optional and is clamped to the model's
+logical context window; it is the budget passed to embedded context management,
+not a claim that the provider's advertised window changed.
+
 Limits fail closed. There is no automatic unbounded retry or fallback provider.
 
 ## Roles and capabilities

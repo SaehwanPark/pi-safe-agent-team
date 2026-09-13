@@ -101,7 +101,8 @@ export interface EmbeddedContextUsage {
   logicalContextWindow?: number | null;
   /** Hardware-safe operational prefill budget, if known. */
   effectiveContextBudget?: number | null;
-  source: "reported" | "estimated";
+  /** Provider integrations may use their own bounded provenance labels. */
+  source: string;
 }
 
 export interface EmbeddedCompactionRequest {
@@ -114,7 +115,7 @@ export interface EmbeddedContextSnapshot {
   contextWindow: number | null;
   logicalContextWindow?: number | null;
   effectiveContextBudget?: number | null;
-  tokenSource: "reported" | "estimated";
+  tokenSource: string;
   thresholdRatio?: number;
   mode?: string;
   reductionRatio?: number;
