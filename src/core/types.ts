@@ -58,6 +58,14 @@ export interface ModelRoute {
   thinking: ThinkingLevel;
 }
 
+/** Optional policy for a concrete provider/model runtime. */
+export interface ModelRoutePolicy {
+  /** Maximum number of logical model turns using this route at once. */
+  maxConcurrent?: number;
+  /** Conservative operational prefill budget, in tokens. */
+  effectivePrefillBudget?: number;
+}
+
 export interface AgentCapabilities {
   maySpawn: boolean;
   mayMessagePeers: boolean;
@@ -103,6 +111,8 @@ export interface AgentRecord {
   reconnectable?: boolean;
   /** Context management mode (e.g. lcm-embedded or native). */
   contextMode?: string;
+  /** Bounded last context/provider diagnostic, for recovery visibility. */
+  contextDiagnostic?: string;
 }
 
 export interface TaskResult {
@@ -236,6 +246,14 @@ export interface FabricConfig {
   leaseMs: number;
   heartbeatMs: number;
   messageRetention: number;
+  /** Exact provider/model route capacities, keyed as `provider/model`. */
+  modelRouteCapacity?: Record<string, number>;
+  /** Pluggable route policy form; `maxConcurrent` and budget are optional. */
+  modelRoutePolicies?: Record<string, ModelRoutePolicy>;
+  /** Compatibility alias for callers that prefer the plural spelling. */
+  modelRouteCapacities?: Record<string, number>;
+  /** Explicit effective prefill budgets keyed as `provider/model`. */
+  effectivePrefillBudgets?: Record<string, number>;
 }
 
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
@@ -279,6 +297,7 @@ export interface AgentSummary {
   workspace?: WorkspaceInfo;
   lastActivity: number;
   contextMode?: string;
+  contextDiagnostic?: string;
   capabilities?: AgentCapabilities;
 }
 

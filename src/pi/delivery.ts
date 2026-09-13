@@ -2,13 +2,17 @@ import type { AgentMessage } from "../core/types.ts";
 
 export interface RootDeliveryDecision {
   triggerTurn: boolean;
-  deliverAs: "steer" | "followUp";
+  deliverAs: "steer" | "followUp" | "nextTurn";
   modelVisible: boolean;
   display: boolean;
 }
 
 export interface RootDeliveryContext {
   hasPendingRootRequest?: boolean;
+  /** Root session is currently compacting; durable delivery must not wake it. */
+  rootCompactionInFlight?: boolean;
+  /** Provider/context is degraded after an exhausted capacity failure. */
+  rootContextHealth?: "healthy" | "degraded";
 }
 
 /**
@@ -21,6 +25,14 @@ export function classifyRootDelivery(
   message: AgentMessage,
   state?: RootDeliveryContext,
 ): RootDeliveryDecision {
+  if (state?.rootCompactionInFlight || state?.rootContextHealth === "degraded") {
+    return {
+      triggerTurn: false,
+      deliverAs: "nextTurn",
+      modelVisible: true,
+      display: true,
+    };
+  }
   if (message.priority === "urgent") {
     return {
       triggerTurn: true,

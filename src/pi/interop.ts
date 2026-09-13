@@ -1,4 +1,6 @@
 export const PI_EXTENSION_INTEROP = Symbol.for("pi.extension-interop.v1");
+export const LCM_EMBEDDED_CONTEXT_PROVIDER_NAME = "pi-local-context-manager.embedded-context.v1";
+export const LEGACY_LCM_EMBEDDED_CONTEXT_PROVIDER_NAME = "local-context-manager.embedded-context.v1";
 
 export interface PiExtensionInteropRegistryV1 {
   version: 1;
@@ -79,6 +81,11 @@ export interface FabricStateSnapshotV1 {
   activeWriteFences: number;
   pendingRootRequests: number;
   pendingRootDeliveries: number;
+  /** True while Pi is performing manual/automatic root compaction. */
+  rootCompactionInFlight?: boolean;
+  /** Root provider health gate after an exhausted model/context outcome. */
+  rootContextHealth?: "healthy" | "degraded";
+  rootContextDiagnostic?: string;
 
   activeTasks: FabricTaskSnapshot[];
   mutableResources: FabricResourceSnapshot[];
@@ -93,7 +100,12 @@ export interface FabricStateProviderV1 {
 export interface EmbeddedContextUsage {
   tokens: number | null;
   contextWindow: number | null;
-  source: "reported" | "estimated";
+  /** Logical model window, when an operational prefill budget is applied. */
+  logicalContextWindow?: number | null;
+  /** Hardware-safe operational prefill budget, if known. */
+  effectiveContextBudget?: number | null;
+  /** Provider integrations may use their own bounded provenance labels. */
+  source: string;
 }
 
 export interface EmbeddedCompactionRequest {
@@ -104,7 +116,9 @@ export interface EmbeddedCompactionRequest {
 export interface EmbeddedContextSnapshot {
   tokens: number | null;
   contextWindow: number | null;
-  tokenSource: "reported" | "estimated";
+  logicalContextWindow?: number | null;
+  effectiveContextBudget?: number | null;
+  tokenSource: string;
   thresholdRatio?: number;
   mode?: string;
   reductionRatio?: number;
@@ -113,6 +127,8 @@ export interface EmbeddedContextSnapshot {
 export interface EmbeddedContextDiagnostic {
   message: string;
   level: "info" | "warning" | "error";
+  code?: string;
+  details?: Record<string, unknown>;
 }
 
 export interface EmbeddedContextHost {
@@ -126,7 +142,13 @@ export interface EmbeddedContextHost {
 export interface EmbeddedContextManagerOptions {
   config?: Record<string, unknown>;
   mode?: "root" | "managed-child";
+  /** Advertised/logical model context window. */
   contextWindow?: number;
+  logicalContextWindow?: number;
+  /** Operational budget used by proactive context management. */
+  effectiveContextBudget?: number;
+  /** Alias accepted by newer LCM builds. */
+  effectivePrefillBudget?: number;
 }
 
 export interface ToolContentBlock {
@@ -165,7 +187,10 @@ export function createEmbeddedContextController(
   host: EmbeddedContextHost,
   options?: EmbeddedContextManagerOptions,
 ): EmbeddedContextManager | undefined {
-  const provider = getInteropProvider<EmbeddedContextProviderV1>("local-context-manager.embedded-context.v1");
+  // Prefer LCM's canonical package-qualified provider name. Keep the legacy
+  // alias for older companion versions so an upgrade remains non-breaking.
+  const provider = getInteropProvider<EmbeddedContextProviderV1>(LCM_EMBEDDED_CONTEXT_PROVIDER_NAME)
+    ?? getInteropProvider<EmbeddedContextProviderV1>(LEGACY_LCM_EMBEDDED_CONTEXT_PROVIDER_NAME);
   if (!provider) return undefined;
   try {
     if (typeof provider === "function") {

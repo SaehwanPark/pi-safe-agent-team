@@ -7,7 +7,7 @@
  */
 import { createHash } from "node:crypto";
 import { FabricError, assertCondition } from "./errors.ts";
-import { cloneAgent, type AgentCapabilities, type AgentRecord, type AgentStatus, type DispatchResult, type FabricConfig, type MessageType, type ResourcePermission, type TaskRecord } from "./types.ts";
+import { cloneAgent, type AgentCapabilities, type AgentRecord, type AgentStatus, type DispatchResult, type FabricConfig, type MessageType, type ModelRoute, type ResourcePermission, type TaskRecord } from "./types.ts";
 
 export const TERMINAL_STATUSES = new Set<AgentStatus>(["completed", "failed", "cancelled"]);
 export const ACTIVE_STATUSES = new Set<AgentStatus>(["starting", "ready", "running", "waiting", "blocked", "draining"]);
@@ -176,7 +176,65 @@ export function parseWorkspace(value: unknown): AgentRecord["workspace"] | undef
 }
 
 export function cloneConfig(config: FabricConfig): FabricConfig {
-  return { ...config };
+  return {
+    ...config,
+    modelRouteCapacity: config.modelRouteCapacity ? { ...config.modelRouteCapacity } : undefined,
+    modelRouteCapacities: config.modelRouteCapacities ? { ...config.modelRouteCapacities } : undefined,
+    modelRoutePolicies: config.modelRoutePolicies
+      ? Object.fromEntries(Object.entries(config.modelRoutePolicies).map(([key, policy]) => [key, { ...policy }]))
+      : undefined,
+    effectivePrefillBudgets: config.effectivePrefillBudgets ? { ...config.effectivePrefillBudgets } : undefined,
+  };
+}
+
+/** Stable capacity/configuration key for a concrete provider/model route. */
+export function modelRouteKey(route: Pick<ModelRoute, "provider" | "model">): string {
+  return `${route.provider}/${route.model}`;
+}
+
+function configuredRouteValue(config: FabricConfig, key: string): { maxConcurrent?: number; effectivePrefillBudget?: number } | undefined {
+  const direct = config.modelRoutePolicies?.[key];
+  if (direct) return direct;
+  const aliases = [config.modelRouteCapacity?.[key], config.modelRouteCapacities?.[key]];
+  const maxConcurrent = aliases.find((value) => value !== undefined);
+  const budget = config.effectivePrefillBudgets?.[key];
+  if (maxConcurrent === undefined && budget === undefined) return undefined;
+  return { maxConcurrent, effectivePrefillBudget: budget };
+}
+
+function localProvider(provider: string): boolean {
+  const normalized = provider.toLowerCase();
+  return normalized === "local" || normalized.includes("omlx") || normalized.includes("llama.cpp") || normalized.includes("llamacpp") || normalized.includes("lmstudio") || normalized.includes("ollama");
+}
+
+/** Resolve route policy, including a conservative one-turn default for local runtimes. */
+export function modelRoutePolicy(config: FabricConfig, route: Pick<ModelRoute, "provider" | "model">): { maxConcurrent?: number; effectivePrefillBudget?: number } {
+  const key = modelRouteKey(route);
+  const providerKey = route.provider;
+  const wildcard = "*";
+  const configured = configuredRouteValue(config, key) ?? configuredRouteValue(config, providerKey) ?? configuredRouteValue(config, wildcard);
+  if (configured) {
+    // A local backend remains conservatively serialized even when a caller
+    // configures only its effective prefill budget. An explicit capacity still
+    // wins, including a deliberately larger local value.
+    return {
+      maxConcurrent: configured.maxConcurrent ?? (localProvider(route.provider) ? 1 : undefined),
+      effectivePrefillBudget: configured.effectivePrefillBudget,
+    };
+  }
+  return localProvider(route.provider) ? { maxConcurrent: 1 } : {};
+}
+
+export function modelRouteCapacity(config: FabricConfig, route: Pick<ModelRoute, "provider" | "model">): number | undefined {
+  const value = modelRoutePolicy(config, route).maxConcurrent;
+  return value !== undefined && value > 0 ? Math.floor(value) : undefined;
+}
+
+export function effectivePrefillBudget(config: FabricConfig, route: Pick<ModelRoute, "provider" | "model">, logicalContextWindow: number | undefined): number | undefined {
+  const configured = modelRoutePolicy(config, route).effectivePrefillBudget;
+  if (configured === undefined || !Number.isFinite(configured) || configured <= 0) return logicalContextWindow;
+  if (logicalContextWindow === undefined || !Number.isFinite(logicalContextWindow) || logicalContextWindow <= 0) return Math.floor(configured);
+  return Math.min(Math.floor(configured), Math.floor(logicalContextWindow));
 }
 
 export function idempotencyKey(actorId: string, operationId: string): string {

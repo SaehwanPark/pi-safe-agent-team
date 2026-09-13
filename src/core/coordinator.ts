@@ -54,6 +54,8 @@ import {
   isTaskTerminal,
   isTerminal,
   mergeCapabilities,
+  modelRouteCapacity,
+  modelRouteKey,
   normalizeClone,
   normalizeResourcePath,
   parseAgentId,
@@ -88,6 +90,7 @@ export interface RegisterAgentArgs {
   token?: string;
   initialStatus?: "starting" | "ready";
   contextMode?: string;
+  contextDiagnostic?: string;
 }
 
 export interface SpawnAgentArgs {
@@ -171,6 +174,32 @@ export class Coordinator {
     assertCondition(this.config.messageRetention > 0, "INVALID_ARGUMENT", "messageRetention must be positive");
     assertCondition(this.config.leaseMs > 0, "INVALID_ARGUMENT", "leaseMs must be positive");
     assertCondition(this.config.heartbeatMs > 0, "INVALID_ARGUMENT", "heartbeatMs must be positive");
+    this.validateRoutePolicies();
+  }
+
+  private validateRoutePolicies(): void {
+    const maps = [this.config.modelRouteCapacity, this.config.modelRouteCapacities] as const;
+    for (const map of maps) {
+      if (!map) continue;
+      for (const [key, value] of Object.entries(map)) {
+        assertCondition(Boolean(key) && key.length <= 1024, "INVALID_ARGUMENT", "model route policy keys must be bounded");
+        assertCondition(typeof value === "number" && Number.isInteger(value) && value > 0, "INVALID_ARGUMENT", `model route capacity for ${key} must be a positive integer`);
+      }
+    }
+    if (this.config.effectivePrefillBudgets) {
+      for (const [key, value] of Object.entries(this.config.effectivePrefillBudgets)) {
+        assertCondition(Boolean(key) && key.length <= 1024, "INVALID_ARGUMENT", "effective prefill budget keys must be bounded");
+        assertCondition(typeof value === "number" && Number.isFinite(value) && value > 0, "INVALID_ARGUMENT", `effective prefill budget for ${key} must be a positive finite number`);
+      }
+    }
+    if (this.config.modelRoutePolicies) {
+      for (const [key, policy] of Object.entries(this.config.modelRoutePolicies)) {
+        assertCondition(Boolean(key) && key.length <= 1024, "INVALID_ARGUMENT", "model route policy keys must be bounded");
+        assertCondition(Boolean(policy) && typeof policy === "object" && !Array.isArray(policy), "INVALID_ARGUMENT", `model route policy for ${key} must be an object`);
+        if (policy.maxConcurrent !== undefined) assertCondition(typeof policy.maxConcurrent === "number" && Number.isInteger(policy.maxConcurrent) && policy.maxConcurrent > 0, "INVALID_ARGUMENT", `model route maxConcurrent for ${key} must be a positive integer`);
+        if (policy.effectivePrefillBudget !== undefined) assertCondition(typeof policy.effectivePrefillBudget === "number" && Number.isFinite(policy.effectivePrefillBudget) && policy.effectivePrefillBudget > 0, "INVALID_ARGUMENT", `effective prefill budget for ${key} must be a positive finite number`);
+      }
+    }
   }
 
   setCaseInsensitivePaths(caseInsensitive: boolean): void {
@@ -352,6 +381,7 @@ export class Coordinator {
         next.status = "ready";
       }
       next.statusReason = undefined;
+      if (input.contextDiagnostic !== undefined) next.contextDiagnostic = parseOptionalString(input.contextDiagnostic, "contextDiagnostic", 2048);
       next.lastActivity = now;
       next.sessionId = sessionId ?? next.sessionId;
       next.workspace = workspace ?? next.workspace;
@@ -413,6 +443,7 @@ export class Coordinator {
       authToken: token ?? this.idFactory("token"),
       reconnectable: false,
       contextMode: parseOptionalString(input.contextMode, "contextMode", 128),
+      contextDiagnostic: parseOptionalString(input.contextDiagnostic, "contextDiagnostic", 2048),
     };
     this.agents.set(id, record);
     this.nextMessageSequence.set(id, 0);
@@ -485,6 +516,7 @@ export class Coordinator {
     if (args.sessionId !== undefined) next.sessionId = parseString(args.sessionId, "sessionId", 512);
     if (args.workspace !== undefined) next.workspace = parseWorkspace(args.workspace);
     if (args.contextMode !== undefined) next.contextMode = parseOptionalString(args.contextMode, "contextMode", 128);
+    if (args.contextDiagnostic !== undefined) next.contextDiagnostic = parseOptionalString(args.contextDiagnostic, "contextDiagnostic", 2048);
     next.lastActivity = this.clock();
     this.agents.set(target.id, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
@@ -495,17 +527,21 @@ export class Coordinator {
     const agent = this.requireAgent(actorId);
     const next = cloneAgent(agent);
     const requestedStatus = args.status as AgentStatus | undefined;
-    if (requestedStatus === "running" && agent.status !== "running") {
-      assertCondition(this.runningAgentCount() < this.config.maxConcurrentAgents, "AGENT_LIMIT_REACHED", "maxConcurrentAgents reached");
+    if (args.route !== undefined) next.route = this.validateRoute(args.route as ModelRoute);
+    const routeChanged = next.route.provider !== agent.route.provider || next.route.model !== agent.route.model || next.route.thinking !== agent.route.thinking;
+    if ((requestedStatus === "running" && agent.status !== "running") || (agent.status === "running" && routeChanged)) {
+      const runningExcludingSelf = this.runningAgentCount() - (agent.status === "running" ? 1 : 0);
+      assertCondition(runningExcludingSelf < this.config.maxConcurrentAgents, "AGENT_LIMIT_REACHED", "maxConcurrentAgents reached");
+      this.assertRouteCapacity(next.route, agent.id);
     }
     if (requestedStatus && isTerminal(requestedStatus)) {
       throw new FabricError("LIFECYCLE_CONFLICT", "Use agent.end_turn for terminal transitions so runtime claims are released");
     }
     if (requestedStatus) this.transitionStatus(next, requestedStatus, parseOptionalString(args.statusReason, "statusReason", 2048));
     assertCondition(args.taskId === undefined, "IDENTITY_CONFLICT", "Use task.claim or task.update to change task ownership");
-    if (args.route !== undefined) next.route = this.validateRoute(args.route as ModelRoute);
     if (args.workspace !== undefined) next.workspace = parseWorkspace(args.workspace);
     if (args.contextMode !== undefined) next.contextMode = parseOptionalString(args.contextMode, "contextMode", 128);
+    if (args.contextDiagnostic !== undefined) next.contextDiagnostic = parseOptionalString(args.contextDiagnostic, "contextDiagnostic", 2048);
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
@@ -519,6 +555,10 @@ export class Coordinator {
     assertCondition(agent.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot start another turn`);
     if (this.runningAgentCount() >= this.config.maxConcurrentAgents) {
       return { started: false, reason: "maxConcurrentAgents reached" };
+    }
+    const routeLimit = modelRouteCapacity(this.config, agent.route);
+    if (routeLimit !== undefined && this.runningRouteCount(agent.route, agent.id) >= routeLimit) {
+      return { started: false, reason: `model route capacity reached for ${modelRouteKey(agent.route)}` };
     }
     const next = cloneAgent(agent);
     if (next.status === "starting") next.status = "ready";
@@ -1944,6 +1984,17 @@ export class Coordinator {
     return [...this.agents.values()].filter((agent) => agent.status === "running").length;
   }
 
+  private runningRouteCount(route: ModelRoute, excludeAgentId?: string): number {
+    return [...this.agents.values()].filter((agent) => agent.status === "running" && agent.id !== excludeAgentId && agent.route.provider === route.provider && agent.route.model === route.model).length;
+  }
+
+  private assertRouteCapacity(route: ModelRoute, excludeAgentId?: string): void {
+    const limit = modelRouteCapacity(this.config, route);
+    if (limit !== undefined) {
+      assertCondition(this.runningRouteCount(route, excludeAgentId) < limit, "AGENT_LIMIT_REACHED", `model route capacity reached for ${modelRouteKey(route)}`);
+    }
+  }
+
   private toSummary(agent: AgentRecord): AgentSummary {
     return {
       id: agent.id,
@@ -1956,6 +2007,7 @@ export class Coordinator {
       workspace: agent.workspace ? { ...agent.workspace } : undefined,
       lastActivity: agent.lastActivity,
       contextMode: agent.contextMode,
+      contextDiagnostic: agent.contextDiagnostic,
       capabilities: cloneCapabilities(agent.capabilities),
     };
   }

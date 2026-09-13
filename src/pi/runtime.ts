@@ -9,7 +9,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { FabricError, asFabricError } from "../core/errors.ts";
 import { Coordinator } from "../core/coordinator.ts";
-import type { AgentStatus, FabricConfig, AgentMessage, AgentRecord, FabricStatus, ModelRoute, TaskRecord } from "../core/types.ts";
+import { DEFAULT_FABRIC_CONFIG, type AgentStatus, type FabricConfig, type AgentMessage, type AgentRecord, type FabricStatus, type ModelRoute, type TaskRecord } from "../core/types.ts";
 import { BrokerClient } from "../broker/client.ts";
 import { BrokerServer, defaultEndpoint, detectCaseInsensitivePaths } from "../broker/server.ts";
 import { GitWorkspaceStrategy, type WorkspaceStrategy } from "../workspace.ts";
@@ -17,6 +17,9 @@ import { resolveChildModel, routeFromModel } from "./model-routing.ts";
 import { createCoordinationTools, type SpawnToolInput } from "./tools.ts";
 import { createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootShellGuard, evaluateRootWriteGuard, releaseRootWriteFence, type RootWriteGuardOutcome } from "./guards.ts";
 import { createEmbeddedContextController, type EmbeddedCompactionRequest, type EmbeddedContextHost, type EmbeddedContextManager, type FabricSnapshotRequest, type FabricStateSnapshotV1 } from "./interop.ts";
+import { effectivePrefillBudget } from "../core/coordinator-wire.ts";
+import { ModelRouteCapacityArbiter } from "./model-capacity.ts";
+import { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isBlockingOutcome, type ModelTurnOutcome } from "./turn-outcome.ts";
 
 export interface RoleConfig {
   model?: string;
@@ -154,6 +157,17 @@ export class FabricRuntime {
   /** Invalidates in-flight spawns when a shutdown begins, even after draining ends. */
   private lifecycleEpoch = 0;
   private lastHandoffSnapshots: HandoffSnapshot[] = [];
+  private readonly modelCapacity: ModelRouteCapacityArbiter;
+  private rootCompactionInFlight = 0;
+  private rootCompactionReleases: Array<(() => void) | undefined> = [];
+  private rootCompactionBrokerReservations: boolean[] = [];
+  private rootCompactionEpoch = 0;
+  private rootContextHealth: "healthy" | "degraded" = "healthy";
+  private rootContextDiagnostic?: string;
+  private drainPromise?: Promise<readonly HandoffSnapshot[]>;
+  private drainDeadlineAt = 0;
+  private drainWake?: () => void;
+  private drainChildren: ManagedChild[] = [];
 
   static readonly shutdownRpcTimeoutMs = 1_500;
   static readonly shutdownAbortTimeoutMs = 1_500;
@@ -173,6 +187,18 @@ export class FabricRuntime {
 
   get isDraining(): boolean {
     return this.draining;
+  }
+
+  get isRootCompactionInFlight(): boolean {
+    return this.rootCompactionInFlight > 0;
+  }
+
+  get rootHealth(): "healthy" | "degraded" {
+    return this.rootContextHealth;
+  }
+
+  get rootHealthDiagnostic(): string | undefined {
+    return this.rootContextDiagnostic;
   }
 
   get handoffSnapshots(): readonly HandoffSnapshot[] {
@@ -200,6 +226,83 @@ export class FabricRuntime {
     this._fabricId = options.fabricId ?? `fabric-${hashIdentity(identityKey)}`;
     this._stateDirectory = options.stateDirectory ?? join(this.agentDir, "safe-agents", hashIdentity(identityKey));
     this._endpoint = options.endpoint ?? defaultEndpoint(this._stateDirectory);
+    this.modelCapacity = new ModelRouteCapacityArbiter({ ...DEFAULT_FABRIC_CONFIG, ...(options.config ?? {}) });
+  }
+
+  /** Begin observing a root manual/automatic compaction before Pi mutates context. */
+  async beginRootCompaction(signal?: AbortSignal): Promise<void> {
+    const epoch = this.rootCompactionEpoch;
+    const reservationIndex = this.rootCompactionBrokerReservations.length;
+    this.rootCompactionInFlight += 1;
+    this.rootCompactionBrokerReservations.push(false);
+    const releaseIndex = this.rootCompactionReleases.length;
+    this.rootCompactionReleases.push(undefined);
+    const route = this.root?.ctx.model ? routeFromModel(this.root.ctx.model, this.root.ctx.thinkingLevel ?? "medium") : undefined;
+    if (!route) return;
+    try {
+      const release = await this.modelCapacity.acquire(route, signal);
+      if (epoch !== this.rootCompactionEpoch || this.stopped) {
+        release();
+        return;
+      }
+      this.rootCompactionReleases[releaseIndex] = release;
+    } catch {
+      // The quiescence flag remains conservative when a local arbiter is unavailable.
+    }
+    if (this.root) {
+      try {
+        const result = await this.root.client.request<{ started?: boolean }>("agent.begin_turn", {}, FabricRuntime.shutdownRpcTimeoutMs, signal);
+        if (result?.started === true) {
+          if (epoch !== this.rootCompactionEpoch || this.stopped) {
+            await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+          } else {
+            this.rootCompactionBrokerReservations[reservationIndex] = true;
+          }
+        }
+      } catch {
+        // An already-running root (automatic compaction) or unavailable broker
+        // is still covered by the local compaction flag.
+      }
+    }
+  }
+
+  async endRootCompaction(): Promise<void> {
+    if (this.rootCompactionInFlight > 0) this.rootCompactionInFlight -= 1;
+    this.rootCompactionReleases.pop()?.();
+    const brokerReservation = this.rootCompactionBrokerReservations.pop() ?? false;
+    if (brokerReservation && this.root) {
+      await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+    }
+  }
+
+  resetRootCompactionState(): void {
+    this.rootCompactionEpoch += 1;
+    this.rootCompactionInFlight = 0;
+    this.rootCompactionBrokerReservations = [];
+    for (const release of this.rootCompactionReleases.splice(0)) release?.();
+  }
+
+  markRootContextDegraded(outcome: ModelTurnOutcome): void {
+    if (outcome.kind === "success" || outcome.kind === "aborted") return;
+    this.rootContextHealth = "degraded";
+    this.rootContextDiagnostic = describeTurnOutcome(outcome);
+  }
+
+  markRootContextHealthy(): void {
+    this.rootContextHealth = "healthy";
+    this.rootContextDiagnostic = undefined;
+  }
+
+  resetRootContextHealth(): void {
+    this.markRootContextHealthy();
+  }
+
+  async withModelRouteCapacity<T>(route: ModelRoute, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return this.modelCapacity.withCapacity(route, operation, signal);
+  }
+
+  getEffectivePrefillBudget(route: ModelRoute, logicalContextWindow?: number): number | undefined {
+    return effectivePrefillBudget({ ...DEFAULT_FABRIC_CONFIG, ...(this.config ?? {}) }, route, logicalContextWindow);
   }
 
   private identityKey(sessionId: string): string {
@@ -402,6 +505,9 @@ export class FabricRuntime {
         activeWriteFences: 0,
         pendingRootRequests: 0,
         pendingRootDeliveries: 0,
+        rootCompactionInFlight: this.isRootCompactionInFlight,
+        rootContextHealth: this.rootHealth,
+        rootContextDiagnostic: this.rootHealthDiagnostic,
         activeTasks: [],
         mutableResources: [],
         quiescenceReasons: ["fabric_runtime_unattached_or_stopped"],
@@ -413,24 +519,30 @@ export class FabricRuntime {
       if (status.config?.caseInsensitivePaths !== undefined) {
         this.caseInsensitivePaths = status.config.caseInsensitivePaths;
       }
-      const rootAgent = status.agents.find((a) => a.id === status.rootId);
+      // `FabricStatus.rootId` is the durable fabric identity, not necessarily
+      // the broker agent ID (the normal host uses `fabric-*` and `root-*`
+      // respectively). Prefer the attached binding and retain the historical
+      // status-root fallback for lightweight callers that use one ID for both.
+      const rootAgentId = this.root?.agentId ?? status.rootId;
+      const rootAgent = status.agents.find((a) => a.id === rootAgentId);
       const rootBusy = !rootAgent || rootAgent.status === "starting" || rootAgent.status === "running";
 
       const runningChildren = status.agents.filter(
         (a) => a.depth > 0 && (a.status === "starting" || a.status === "running" || a.status === "draining"),
       ).length;
       const unresolvedChildTasks = status.tasks.filter(
-        (t) => t.owner && t.owner !== status.rootId && ["pending", "ready", "active", "waiting", "blocked"].includes(t.status),
+        (t) => t.owner && t.owner !== rootAgentId && ["pending", "ready", "active", "waiting", "blocked"].includes(t.status),
       ).length;
       const mutableHolds = status.resources.filter((r) => r.mutableHold !== undefined).length;
       const pendingRootRequests = status.pendingRequests.filter(
-        (r) => r.to === status.rootId && r.status === "pending",
+        (r) => r.to === rootAgentId && r.status === "pending",
       ).length;
       const pendingRootDeliveries = this.pendingRootDeliveriesCount;
       const activeWriteFences = status.activeFences ?? 0;
 
       const quiescenceReasons: string[] = [];
       if (this.draining) quiescenceReasons.push("fabric_draining");
+      if (this.isRootCompactionInFlight) quiescenceReasons.push("root_compaction_in_flight");
       if (rootBusy) quiescenceReasons.push("root_agent_active_or_running");
       if (runningChildren > 0) quiescenceReasons.push("running_children_active");
       if (unresolvedChildTasks > 0) quiescenceReasons.push("unresolved_child_tasks");
@@ -476,6 +588,9 @@ export class FabricRuntime {
         activeWriteFences,
         pendingRootRequests,
         pendingRootDeliveries,
+        rootCompactionInFlight: this.isRootCompactionInFlight,
+        rootContextHealth: this.rootHealth,
+        rootContextDiagnostic: this.rootHealthDiagnostic,
         activeTasks,
         mutableResources,
         quiescenceReasons,
@@ -496,6 +611,9 @@ export class FabricRuntime {
         activeWriteFences: 0,
         pendingRootRequests: 0,
         pendingRootDeliveries: this.pendingRootDeliveriesCount,
+        rootCompactionInFlight: this.isRootCompactionInFlight,
+        rootContextHealth: this.rootHealth,
+        rootContextDiagnostic: this.rootHealthDiagnostic,
         activeTasks: [],
         mutableResources: [],
         quiescenceReasons: ["broker_status_query_failed"],
@@ -530,6 +648,11 @@ export class FabricRuntime {
     return this.spawnChild(parent.agentId, parent.client, input, parent.session?.model, parent.session?.thinkingLevel ?? "medium", parent.workspacePath, this.lifecycleEpoch);
   }
 
+  /** Remove only the stopped instance; a replacement with the same id wins. */
+  onChildStopped(child: ManagedChild): void {
+    if (this.children.get(child.agentId) === child) this.children.delete(child.agentId);
+  }
+
   /**
    * Capture deterministic recovery metadata and stop every managed descendant.
    * This is deliberately separate from stop(): the root remains attached and
@@ -538,39 +661,89 @@ export class FabricRuntime {
   async abortDescendants(options: { reason?: string; mode?: DescendantShutdownMode } = {}): Promise<readonly HandoffSnapshot[]> {
     const reason = options.reason ?? "descendants-aborted";
     const mode = options.mode ?? "graceful";
-    if (this.draining) return this.handoffSnapshots;
+    if (this.drainPromise) {
+      this.escalateDrain(mode);
+      return this.drainPromise;
+    }
     this.lifecycleEpoch += 1;
     this.draining = true;
     const root = this.root;
     const children = [...this.children.values()];
-    try {
-      this.lastHandoffSnapshots = await this.captureHandoffSnapshots(reason).catch(() => this.captureLocalHandoffSnapshots(reason));
-      const topLevel = root
-        ? children.filter((child) => child.parentId === root.agentId)
-        : children.filter((child) => !children.some((candidate) => candidate.parentId === child.agentId));
-      const targets = topLevel.length > 0 ? topLevel : children;
-
-      // Freeze the coordinator first. This prevents a queued child turn or
-      // spawn from racing the emergency stop while local sessions are aborted.
-      if (root) {
-        await Promise.allSettled(targets.map((child) => root.client.request("agent.drain", { agentId: child.agentId, reason }, FabricRuntime.shutdownRpcTimeoutMs)));
+    this.drainChildren = children;
+    this.drainDeadlineAt = Date.now() + this.drainBudgetMs(mode);
+    // Snapshot local state and start the expensive compute kill switch before
+    // touching the broker. --now must remain useful when RPC is frozen.
+    this.lastHandoffSnapshots = this.captureLocalHandoffSnapshots(reason);
+    const localStops = children.map((child) => child.stop({ abortTimeoutMs: FabricRuntime.shutdownAbortTimeoutMs }));
+    const topLevel = root
+      ? children.filter((child) => child.parentId === root.agentId)
+      : children.filter((child) => !children.some((candidate) => candidate.parentId === child.agentId));
+    const targets = topLevel.length > 0 ? topLevel : children;
+    const handoff = this.captureHandoffSnapshots(reason)
+      .then((snapshots) => {
+        // Broker status may observe the subtree after drain/cancel has already
+        // committed. Preserve the synchronous local snapshot in that case,
+        // while enriching each entry whenever durable metadata is available.
+        const enriched = new Map(snapshots.map((snapshot) => [snapshot.agentId, snapshot]));
+        const merged = this.lastHandoffSnapshots.map((snapshot) => enriched.get(snapshot.agentId) ?? snapshot);
+        const seen = new Set(merged.map((snapshot) => snapshot.agentId));
+        for (const snapshot of snapshots) if (!seen.has(snapshot.agentId)) merged.push(snapshot);
+        this.lastHandoffSnapshots = merged;
+        return merged;
+      })
+      .catch(() => this.lastHandoffSnapshots);
+    const brokerDrains = root
+      ? targets.map((child) => root.client.request("agent.drain", { agentId: child.agentId, reason }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined))
+      : [];
+    const cancellations = root
+      ? targets.map((child) => root.client.request("agent.cancel", { agentId: child.agentId }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined))
+      : [];
+    const all = Promise.allSettled([...localStops, ...brokerDrains, ...cancellations, handoff]);
+    const run = (async (): Promise<readonly HandoffSnapshot[]> => {
+      try {
+        await this.waitForDrainDeadline(all);
+        for (const child of children) child.disposeNow();
+        this.children.clear();
+        return this.handoffSnapshots;
+      } finally {
+        this.drainChildren = [];
+        this.drainWake = undefined;
+        this.drainDeadlineAt = 0;
+        this.draining = false;
       }
+    })();
+    this.drainPromise = run.finally(() => {
+      this.drainPromise = undefined;
+    });
+    return this.drainPromise;
+  }
 
-      const aborts = children.map((child) => child.stop({ abortTimeoutMs: FabricRuntime.shutdownAbortTimeoutMs }));
-      const cancellations = root
-        ? targets.map((child) => root.client.request("agent.cancel", { agentId: child.agentId }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined))
-        : [];
-      const all = Promise.allSettled([...aborts, ...cancellations]);
-      const graceMs = mode === "now" ? 0 : mode === "budget" ? 750 : 2_000;
-      await Promise.race([all, new Promise<void>((resolve) => setTimeout(resolve, graceMs))]);
-      // A child abort is cooperative. Ensure disposal still happens if a
-      // provider ignored the abort promise or the grace deadline elapsed.
-      for (const child of children) child.disposeNow();
-      this.children.clear();
-      void all;
-      return this.handoffSnapshots;
-    } finally {
-      this.draining = false;
+  private drainBudgetMs(mode: DescendantShutdownMode): number {
+    return mode === "now" ? 0 : mode === "budget" ? 750 : 2_000;
+  }
+
+  private escalateDrain(mode: DescendantShutdownMode): void {
+    const requestedDeadline = Date.now() + this.drainBudgetMs(mode);
+    if (requestedDeadline < this.drainDeadlineAt) this.drainDeadlineAt = requestedDeadline;
+    if (mode === "now") for (const child of this.drainChildren) child.abortImmediately();
+    this.drainWake?.();
+  }
+
+  private async waitForDrainDeadline(all: Promise<PromiseSettledResult<unknown>[]>): Promise<void> {
+    const completed = all.then(() => "completed" as const);
+    while (true) {
+      const remaining = Math.max(0, this.drainDeadlineAt - Date.now());
+      let timer: NodeJS.Timeout | undefined;
+      const deadline = new Promise<"deadline">((resolve) => {
+        timer = setTimeout(() => resolve("deadline"), remaining);
+      });
+      const wake = new Promise<"wake">((resolve) => {
+        this.drainWake = () => resolve("wake");
+      });
+      const result = await Promise.race([completed, deadline, wake]);
+      if (timer) clearTimeout(timer);
+      if (result === "wake") continue;
+      return;
     }
   }
 
@@ -625,6 +798,7 @@ export class FabricRuntime {
     this.lifecycleEpoch += 1;
     this.stopped = true;
     this.draining = true;
+    this.resetRootCompactionState();
     if (this.rootHeartbeatTimer) clearInterval(this.rootHeartbeatTimer);
     this.rootEventUnsubscribe?.();
     this.rootCloseUnsubscribe?.();
@@ -868,6 +1042,7 @@ export class ManagedChild {
   private readonly pendingMessageIds = new Set<string>();
   private readonly deliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
   private eventUnsubscribe?: () => void;
+  private sessionEventUnsubscribe?: () => void;
   private closeUnsubscribe?: () => void;
   private heartbeatTimer?: NodeJS.Timeout;
   private reconnectPromise?: Promise<void>;
@@ -876,9 +1051,19 @@ export class ManagedChild {
   private promptTail: Promise<void> = Promise.resolve();
   private deliveryTail: Promise<void> = Promise.resolve();
   private readonly pendingReplyIds = new Set<string>();
+  /** Cancels a route-capacity wait as soon as local child shutdown begins. */
+  private readonly stopController = new AbortController();
   private embeddedManager?: EmbeddedContextManager;
+  /** Number of model operations currently holding the child route token. */
+  private modelCapacityDepth = 0;
   private resolvingToolCount = 0;
   private hasInFlightWrite = 0;
+  private turnOutcome?: ModelTurnOutcome;
+  private lastObservedOutcome?: ModelTurnOutcome;
+  private compactionFailure?: ModelTurnOutcome;
+  private lastDiagnostic?: string;
+  /** A blocked context/provider turn must not be retried by ordinary inbox wakes. */
+  private blockedByOutcome?: ModelTurnOutcome;
 
   constructor(runtime: FabricRuntime, options: {
     agentId: string;
@@ -927,6 +1112,16 @@ export class ManagedChild {
     };
   }
 
+  get effectiveContextBudget(): number | undefined {
+    const logicalContextWindow = typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined;
+    const resolver = (this.runtime as any).getEffectivePrefillBudget;
+    return typeof resolver === "function" ? resolver.call(this.runtime, this.route, logicalContextWindow) : logicalContextWindow;
+  }
+
+  get contextDiagnostic(): string | undefined {
+    return this.lastDiagnostic;
+  }
+
   async start(): Promise<void> {
     if (this.started) return;
     if (this.runtime.isDraining) throw new FabricError("LIFECYCLE_CONFLICT", "The fabric is draining; child startup was cancelled");
@@ -950,6 +1145,8 @@ export class ManagedChild {
             return {
               tokens: typeof usage.tokens === "number" ? usage.tokens : null,
               contextWindow: typeof usage.contextWindow === "number" ? usage.contextWindow : ((this.model as any)?.contextWindow ?? null),
+              logicalContextWindow: typeof usage.logicalContextWindow === "number" ? usage.logicalContextWindow : ((this.model as any)?.contextWindow ?? null),
+              effectiveContextBudget: this.effectiveContextBudget,
               source: usage.source ?? "estimated",
             };
           }
@@ -957,6 +1154,8 @@ export class ManagedChild {
         return {
           tokens: null,
           contextWindow: (this.model as any)?.contextWindow ?? null,
+          logicalContextWindow: (this.model as any)?.contextWindow ?? null,
+          effectiveContextBudget: this.effectiveContextBudget,
           source: "estimated",
         };
       },
@@ -974,21 +1173,55 @@ export class ManagedChild {
         if (this.session?.isStreaming || this.hasInFlightWrite > 0 || this.resolvingToolCount > 0) {
           throw new FabricError("CAPABILITY_DENIED", "Cannot compact child context while active operations are in flight");
         }
-        if (this.session && typeof this.session.compact === "function") {
-          // `reason` is protocol metadata (for example, "threshold"), not
-          // necessarily prose intended for the model. Only an explicit
-          // customInstructions value should become Pi compaction guidance.
-          await this.session.compact(request.customInstructions);
+        const compact = async (): Promise<void> => {
+          if (this.session && typeof this.session.compact === "function") {
+            // `reason` is protocol metadata (for example, "threshold"), not
+            // necessarily prose intended for the model. Only an explicit
+            // customInstructions value should become Pi compaction guidance.
+            await this.session.compact(request.customInstructions);
+          }
+        };
+        // LCM normally requests compaction after the generation token has been
+        // released. If a future provider requests it reentrantly during a
+        // generation, avoid self-deadlocking on the same non-reentrant token;
+        // Pi's streaming/in-flight guards above still reject unsafe overlap.
+        if (this.modelCapacityDepth > 0 || typeof (this.runtime as any).withModelRouteCapacity !== "function") {
+          await compact();
+        } else {
+          await this.runtime.withModelRouteCapacity(this.route, compact, this.stopController.signal);
         }
       },
       onStatus: (_snapshot) => {},
-      onDiagnostic: (_diagnostic) => {},
+      onDiagnostic: (diagnostic) => {
+        const message = typeof diagnostic?.message === "string" ? diagnostic.message : String(diagnostic);
+        this.lastDiagnostic = message.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 1800);
+        // The companion LCM intentionally catches host.compact() failures so
+        // it can keep its own gate consistent. Promote only its explicit
+        // compaction-failure diagnostic to a lifecycle outcome; storage and
+        // output-reduction warnings remain non-blocking.
+        if (/\b(?:embedded\s+)?compaction failed\b/i.test(message)) {
+          this.compactionFailure = classifyCompactionFailure(
+            this.lastDiagnostic,
+            false,
+            typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined,
+          );
+        }
+        void this.client.request("agent.update", { contextDiagnostic: this.lastDiagnostic }).catch(() => undefined);
+      },
     };
 
-    const embedded = createEmbeddedContextController(host, {
+    const logicalContextWindow = typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined;
+    const effectiveContextBudget = this.effectiveContextBudget;
+    const embeddedOptions: Record<string, unknown> = {
       mode: "managed-child",
-      contextWindow: (this.model as any)?.contextWindow,
-    });
+      contextWindow: logicalContextWindow,
+    };
+    if (logicalContextWindow !== undefined) embeddedOptions.logicalContextWindow = logicalContextWindow;
+    if (effectiveContextBudget !== undefined) {
+      embeddedOptions.effectiveContextBudget = effectiveContextBudget;
+      embeddedOptions.effectivePrefillBudget = effectiveContextBudget;
+    }
+    const embedded = createEmbeddedContextController(host, embeddedOptions);
     if (embedded) {
       this.embeddedManager = embedded;
       this.contextMode = "lcm-embedded";
@@ -1067,6 +1300,7 @@ export class ManagedChild {
       tools: [...builtins, ...coordinationTools.map((tool) => tool.name)],
     });
     this.session = session;
+    this.sessionEventUnsubscribe = session.subscribe((event: any) => this.observeSessionEvent(event));
     this.record = (await this.client.request<{ agent: AgentRecord }>("agent.register", {
       rootId: this.runtime.fabricId,
       parentId: this.parentId,
@@ -1077,8 +1311,12 @@ export class ManagedChild {
       workspace: this.workspace,
       token: this.token,
       contextMode: this.contextMode,
+      contextDiagnostic: this.lastDiagnostic,
     })).agent;
     this.taskId = this.record.taskId;
+    if (this.record.status === "blocked") {
+      this.blockedByOutcome = classifyCompactionFailure(this.record.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery");
+    }
     this.started = true;
     this.heartbeatTimer = setInterval(() => {
       void this.client.request("agent.heartbeat", {}).catch(() => undefined);
@@ -1098,8 +1336,10 @@ export class ManagedChild {
   async stop(options: { abortTimeoutMs?: number } = {}): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.stopController.abort();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.eventUnsubscribe?.();
+    this.sessionEventUnsubscribe?.();
     this.closeUnsubscribe?.();
     let abortCompleted = true;
     try {
@@ -1119,11 +1359,31 @@ export class ManagedChild {
     if (abortCompleted) await this.cleanupWorkspace();
   }
 
+  /** Escalate an in-progress cooperative stop without waiting for its promise. */
+  abortImmediately(): void {
+    if (this.stopping) {
+      this.stopController.abort();
+      try {
+        void this.session?.abort();
+      } catch {}
+      this.disposeNow();
+      return;
+    }
+    this.stopping = true;
+    this.stopController.abort();
+    try {
+      void this.session?.abort();
+    } catch {}
+    this.disposeNow();
+  }
+
   /** Synchronous best-effort disposal used after an emergency deadline. */
   disposeNow(): void {
     this.stopping = true;
+    this.stopController.abort();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.eventUnsubscribe?.();
+    this.sessionEventUnsubscribe?.();
     this.closeUnsubscribe?.();
     try {
       this.session?.dispose();
@@ -1133,6 +1393,7 @@ export class ManagedChild {
     } catch {}
     this.embeddedManager = undefined;
     this.client.close();
+    (this.runtime as any).onChildStopped?.(this);
   }
 
   private async cleanupWorkspace(): Promise<void> {
@@ -1159,6 +1420,7 @@ export class ManagedChild {
             workspace: this.workspace,
             token: this.token,
             contextMode: this.contextMode,
+            contextDiagnostic: this.lastDiagnostic,
           });
           this.record = registered.agent;
           this.taskId = registered.agent.taskId;
@@ -1210,8 +1472,60 @@ export class ManagedChild {
     } catch {}
   }
 
+  private observeSessionEvent(event: any): void {
+    if (!event || typeof event.type !== "string") return;
+    if (event.type === "agent_end") {
+      const assistant = findFinalAssistantMessage(event.messages ?? []);
+      if (assistant !== undefined) {
+        const classified = classifyAssistantMessage(assistant, typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined);
+        this.lastObservedOutcome = classified;
+        if (event.willRetry !== true) this.turnOutcome = classified;
+      }
+      return;
+    }
+    if (event.type === "compaction_end" && event.result === undefined && !event.aborted) {
+      this.compactionFailure = classifyCompactionFailure(event.errorMessage, false, typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined);
+    }
+  }
+
+  private async finishTurnWithOutcome(outcomeValue: ModelTurnOutcome, taskId: string | undefined): Promise<void> {
+    const reason = describeTurnOutcome(outcomeValue);
+    if (outcomeValue.lifecycle === "blocked") this.blockedByOutcome = outcomeValue;
+    if (taskId && outcomeValue.lifecycle === "blocked") {
+      await this.client.request("task.update", { taskId, action: "block", reason }).catch(() => undefined);
+    } else if (taskId && outcomeValue.lifecycle === "failed") {
+      await this.client.request("task.update", { taskId, action: "fail", reason }).catch(() => undefined);
+    }
+    const ended = await this.client.request<{ agent: AgentRecord }>("agent.end_turn", {
+      status: outcomeValue.lifecycle === "blocked" ? "blocked" : outcomeValue.lifecycle === "failed" ? "failed" : "ready",
+      statusReason: reason,
+    });
+    this.record = ended.agent;
+    this.taskId = ended.agent.taskId;
+    if (outcomeValue.lifecycle === "blocked") {
+      this.lastDiagnostic = reason;
+      void this.client.request("agent.update", { contextDiagnostic: reason }).catch(() => undefined);
+      await this.client.request("message.send", {
+        to: this.parentId,
+        type: "blocked",
+        body: reason,
+        metadata: {
+          cause: outcomeValue.kind,
+          provider: outcomeValue.provider,
+          model: outcomeValue.model,
+          contextTokens: outcomeValue.contextTokens,
+          contextWindow: outcomeValue.contextWindow,
+        },
+      }).catch(() => undefined);
+    }
+    if (outcomeValue.lifecycle === "failed") await this.stop();
+  }
+
   private async executePrompt(prompt: string): Promise<void> {
-    if (!this.session || this.stopping) return;
+    if (!this.session || this.stopping || this.blockedByOutcome) return;
+    this.turnOutcome = undefined;
+    this.lastObservedOutcome = undefined;
+    this.compactionFailure = undefined;
     let started = false;
     while (!started && !this.stopping) {
       const result = await this.client.request<{ started: boolean }>("agent.begin_turn", {});
@@ -1226,17 +1540,67 @@ export class ManagedChild {
         await this.degradeToNativeContext();
       }
     }
-    await this.session.prompt(prompt, { expandPromptTemplates: false });
+    const runPrompt = () => this.session!.prompt(prompt, { expandPromptTemplates: false });
+    // A structured prefill/KV failure is capacity pressure, not proof that the
+    // logical context is too large. The route token is released by the first
+    // attempt; retry the same context once after competing work has drained,
+    // then block rather than entering an unbounded compact/retry loop.
+    let promptThrownOutcome: ModelTurnOutcome | undefined;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      promptThrownOutcome = undefined;
+      const runPromptWithDepth = async (): Promise<void> => {
+        this.modelCapacityDepth += 1;
+        try {
+          await runPrompt();
+        } finally {
+          this.modelCapacityDepth -= 1;
+        }
+      };
+      try {
+        if (typeof (this.runtime as any).withModelRouteCapacity === "function") await this.runtime.withModelRouteCapacity(this.route, runPromptWithDepth, this.stopController.signal);
+        else await runPromptWithDepth();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (this.stopping) return;
+        promptThrownOutcome = classifyAssistantMessage({
+          role: "assistant",
+          provider: this.route.provider,
+          model: this.route.model,
+          stopReason: /\b(?:abort|aborted|cancel|cancelled|canceled)\b/i.test(message) ? "aborted" : "error",
+          errorMessage: message,
+          usage: { input: 0, cacheRead: 0, output: 0 },
+        }, typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined);
+      }
+      const observed = this.compactionFailure ?? this.turnOutcome ?? this.lastObservedOutcome ?? promptThrownOutcome;
+      if (observed?.kind === "prefill_capacity" && attempt === 0) {
+        this.turnOutcome = undefined;
+        this.lastObservedOutcome = undefined;
+        this.compactionFailure = undefined;
+        continue;
+      }
+      break;
+    }
+    if (promptThrownOutcome) {
+      const agent = await this.client.request<AgentRecord>("agent.status", {});
+      await this.finishTurnWithOutcome(promptThrownOutcome, agent.taskId ?? this.taskId);
+      return;
+    }
     if (this.embeddedManager && this.contextMode === "lcm-embedded") {
       try {
         this.embeddedManager.observeTurnEnd();
         await this.embeddedManager.observeSettled();
       } catch {
+        this.compactionFailure = classifyCompactionFailure("Embedded context compaction failed", false, typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined);
         await this.degradeToNativeContext();
       }
     }
     const agent = await this.client.request<AgentRecord>("agent.status", {});
     const assignedTaskId = agent.taskId ?? this.taskId;
+    const outcomeValue = this.compactionFailure ?? this.turnOutcome ?? this.lastObservedOutcome;
+    if (outcomeValue && isBlockingOutcome(outcomeValue)) {
+      await this.finishTurnWithOutcome(outcomeValue, assignedTaskId);
+      return;
+    }
     const task = assignedTaskId
       ? await this.client.request<TaskRecord>("task.show", { taskId: assignedTaskId })
       : undefined;
@@ -1259,7 +1623,19 @@ export class ManagedChild {
       const agent = (event.data as { agent?: AgentRecord }).agent;
       if (agent?.id === this.agentId) {
         this.record = agent;
+        if (agent.status === "ready" && this.blockedByOutcome) {
+          this.blockedByOutcome = undefined;
+          this.drainPendingMessages();
+        }
         if (agent.status === "completed" || agent.status === "cancelled" || agent.status === "failed" && agent.reconnectable !== true) void this.stop();
+      }
+      return;
+    }
+    if (event.event === "task_changed") {
+      const task = (event.data as { task?: TaskRecord }).task;
+      if (task?.owner === this.agentId && task.status !== "blocked" && !["completed", "failed", "cancelled"].includes(task.status) && this.blockedByOutcome) {
+        this.blockedByOutcome = undefined;
+        this.drainPendingMessages();
       }
       return;
     }
@@ -1293,6 +1669,14 @@ export class ManagedChild {
   }
 
   private async acceptMessage(message: AgentMessage): Promise<void> {
+    if (this.blockedByOutcome) {
+      this.deliveryStates.delete(message.id);
+      if (!this.pendingMessageIds.has(message.id)) {
+        this.pendingMessageIds.add(message.id);
+        this.pendingMessages.push(message);
+      }
+      return;
+    }
     const text = `[Fabric message from ${message.from} | ${message.type} | ${message.id}]\n${message.body}`;
     let accepted = false;
     try {
@@ -1319,6 +1703,15 @@ export class ManagedChild {
       const removable = [...this.deliveryStates.entries()].find(([, current]) => current === "acknowledged")?.[0];
       if (!removable) break;
       this.deliveryStates.delete(removable);
+    }
+  }
+
+  private drainPendingMessages(): void {
+    if (this.blockedByOutcome || !this.session || this.stopping) return;
+    const pending = this.pendingMessages.splice(0);
+    for (const message of pending) {
+      this.pendingMessageIds.delete(message.id);
+      void this.deliverMessage(message);
     }
   }
 

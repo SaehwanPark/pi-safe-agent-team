@@ -57,6 +57,46 @@ test("fabric-state: newly attached idle root -> active and quiescent", async () 
   assert.equal(snapshot.pendingRootDeliveries, 0);
 });
 
+test("fabric-state: separates the fabric identity from the attached root agent identity", async () => {
+  const runtime = new FabricRuntime({ cwd: "/test/repo", startBroker: false });
+  (runtime as any).root = {
+    agentId: "root-agent",
+    ctx: { cwd: "/test/repo", sessionId: "sess-1" },
+  };
+  (runtime as any).status = async () =>
+    makeMockStatus({
+      rootId: "fabric-1",
+      agents: [
+        {
+          id: "root-agent",
+          depth: 0,
+          role: "root",
+          route: { provider: "openai", model: "gpt-5.6-sol", thinking: "high" },
+          status: "ready",
+          lastActivity: Date.now(),
+        },
+      ],
+      tasks: [
+        {
+          id: "root-task",
+          creator: "root-agent",
+          description: "Root-owned task",
+          status: "active",
+          owner: "root-agent",
+          dependencies: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+      ],
+    });
+
+  const snapshot = await runtime.getFabricStateSnapshot({ cwd: "/test/repo" });
+  assert.ok(snapshot);
+  assert.equal(snapshot.quiescent, true);
+  assert.deepEqual(snapshot.quiescenceReasons, []);
+  assert.equal(snapshot.unresolvedChildTasks, 0);
+});
+
 test("fabric-state: running child -> non-quiescent", async () => {
   const runtime = new FabricRuntime({ cwd: "/test/repo", startBroker: false });
   (runtime as any).root = {
@@ -488,4 +528,3 @@ test("fabric-state: aborted signal passes to status and yields uncertain snapsho
   assert.equal(snapshot.quiescent, false);
   assert.deepEqual(snapshot.quiescenceReasons, ["broker_status_query_failed"]);
 });
-

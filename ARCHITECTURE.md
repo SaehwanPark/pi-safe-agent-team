@@ -97,12 +97,25 @@ Root capabilities such as web access, browser automation, MCP tools, and compute
 ### Extension interop and embedded context
 
 A process-local interop registry via `Symbol.for("pi.extension-interop.v1")` allows safe cooperation between extensions without hard dependencies:
-- **`safe-agent-team.fabric-state.v1`**: The fabric runtime exports a deterministic and conservative state snapshot (`quiescent: boolean`, `state: "known" | "uncertain"`, `sessionReplacementSafe: boolean`, active tasks, mutable holds, write fences, pending requests). Root session replacement (`session_shutdown`) cancels managed child agents; companion context managers (like `local-context-manager`) consume this to defer destructive compaction, semantic resets, or root session rewinds until `sessionReplacementSafe === true`.
-- **`local-context-manager.embedded-context.v1`**: When present, `ManagedChild` obtains an embedded context controller. It applies adaptive output reduction and turn compaction to child tool outputs while retaining `noExtensions: true`. Compaction instructions are delegated as `string | undefined` to upstream Pi's `AgentSession.compact(customInstructions?: string)`. Any provider failure deactivates the controller while retaining its reference and manager-owned recovery files, synchronizes to the coordinator with `agent.update({ contextMode: "native" })`, and lets final child shutdown call `dispose()` for cleanup.
+- **`safe-agent-team.fabric-state.v1`**: The fabric runtime exports a deterministic and conservative state snapshot (`quiescent: boolean`, `state: "known" | "uncertain"`, `sessionReplacementSafe: boolean`, active tasks, mutable holds, write fences, pending requests, `rootCompactionInFlight`, and root context health/diagnostic). Root manual/automatic/embedded compaction keeps replacement unsafe until its terminal hook; root session replacement (`session_shutdown`) cancels managed child agents. Companion context managers consume this to defer destructive compaction, semantic resets, or root session rewinds until `sessionReplacementSafe === true`.
+- **`pi-local-context-manager.embedded-context.v1`** (legacy alias `local-context-manager.embedded-context.v1`): When present, `ManagedChild` obtains an embedded context controller. It applies adaptive output reduction and turn compaction to child tool outputs while retaining `noExtensions: true`. Options distinguish `logicalContextWindow` from an optional effective prefill budget, and compaction instructions are delegated as `string | undefined` to upstream Pi's `AgentSession.compact(customInstructions?: string)`. Any provider failure deactivates the controller while retaining its reference and manager-owned recovery files, synchronizes to the coordinator with `agent.update({ contextMode: "native" })`, and exposes a bounded diagnostic; final child shutdown calls `dispose()` for cleanup.
+
+### Model-route capacity and turn outcomes
+
+The coordinator's global `maxConcurrentAgents` limit is not a proxy for model-runtime
+memory. `modelRoutePolicies` therefore add a provider/model capacity and optional
+effective prefill budget. The process-local FIFO `ModelRouteCapacityArbiter` gates
+managed-child generations and compaction on the same route; the coordinator enforces
+the durable route slot for cross-process state. Local providers default to one heavy
+operation. Pi terminal responses are classified by `src/pi/turn-outcome.ts`, keeping
+logical context overflow separate from structured prefill/KV pressure and runtime
+memory pressure. Capacity gets one bounded retry; exhausted or failed recovery blocks
+the task with a parent-visible diagnostic and preserves the session for explicit
+reopening.
 
 ### Root message delivery policy
 
-Root message delivery is centralized in `src/pi/delivery.ts` (`classifyRootDelivery`). Background notifications (`progress`, `inform`) append silently to the session history for the next natural model turn without waking the model (`triggerTurn: false`). High-priority notifications (`clarification`, `escalation`, `blocked`, `agent_failed`, `task_result`, `steer`, `urgent`) steer and trigger a root model turn immediately.
+Root message delivery is centralized in `src/pi/delivery.ts` (`classifyRootDelivery`). Background notifications (`progress`, `inform`) append silently to the session history for the next natural model turn without waking the model (`triggerTurn: false`). High-priority notifications (`clarification`, `escalation`, `blocked`, `agent_failed`, `task_result`, `steer`, `urgent`) steer and trigger a root model turn immediately while the context is healthy. During root compaction or after an exhausted root provider/capacity outcome, deliveries remain durable, model-visible, and displayable as `nextTurn` without triggering competing work; a successful user-led recovery clears the degraded gate.
 
 ### Model routing
 

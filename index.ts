@@ -7,10 +7,12 @@ import { LifecycleQueue } from "./src/pi/lifecycle.ts";
 import { createCoordinationTools } from "./src/pi/tools.ts";
 import { classifyRootDelivery } from "./src/pi/delivery.ts";
 import { registerInteropProvider, unregisterInteropProvider, type FabricSnapshotRequest, type FabricStateProviderV1, type FabricStateSnapshotV1 } from "./src/pi/interop.ts";
+import { classifyAssistantMessage, classifyCompactionFailure, findFinalAssistantMessage, type ModelTurnOutcome } from "./src/pi/turn-outcome.ts";
 
 export { Coordinator } from "./src/core/coordinator.ts";
 export { FabricError } from "./src/core/errors.ts";
 export { resolveRoute, routeId } from "./src/core/routing.ts";
+export { effectivePrefillBudget, modelRouteCapacity, modelRouteKey, modelRoutePolicy } from "./src/core/coordinator-wire.ts";
 export { BrokerClient } from "./src/broker/client.ts";
 export { BrokerServer, startBroker } from "./src/broker/server.ts";
 export { Journal } from "./src/broker/journal.ts";
@@ -19,6 +21,8 @@ export type { DescendantShutdownMode, HandoffSnapshot } from "./src/pi/runtime.t
 export { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootShellGuard, evaluateRootWriteGuard, workspaceRelativePath } from "./src/pi/guards.ts";
 export { classifyRootShellCommand, type RootShellRisk } from "./src/pi/shell-classifier.ts";
 export { classifyRootDelivery, type RootDeliveryDecision, type RootDeliveryContext } from "./src/pi/delivery.ts";
+export { ModelRouteCapacityArbiter } from "./src/pi/model-capacity.ts";
+export { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isBlockingOutcome, type ModelTurnOutcome, type ModelTurnOutcomeKind } from "./src/pi/turn-outcome.ts";
 export { getInteropRegistry, getInteropProvider, registerInteropProvider, unregisterInteropProvider, PI_EXTENSION_INTEROP } from "./src/pi/interop.ts";
 export type { FabricSnapshotRequest, FabricStateSnapshotV1, FabricStateProviderV1, EmbeddedContextHost, EmbeddedContextManager, EmbeddedToolResult } from "./src/pi/interop.ts";
 export { GitWorkspaceStrategy, SharedWorkspaceStrategy } from "./src/workspace.ts";
@@ -65,7 +69,11 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   const rootDeliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
   let rootDeliveryTail: Promise<void> = Promise.resolve();
   let rootDeliveryEpoch = 0;
+  const deferredRootMessages = new Map<string, AgentMessage>();
+  let deferredRootWakePending = false;
   const lifecycleQueue = new LifecycleQueue();
+  let rootLogicalRunActive = false;
+  let lastFinalRootOutcome: ModelTurnOutcome | undefined;
 
   const enqueueLifecycle = (generation: number, operation: () => Promise<void>): Promise<void> =>
     lifecycleQueue.enqueue(generation, operation);
@@ -107,13 +115,17 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       try {
         if (epoch !== rootDeliveryEpoch) return;
         const content = `[${message.type} from ${message.from}]\n${message.body}`;
-        const decision = classifyRootDelivery(message);
+        const decision = classifyRootDelivery(message, {
+          rootCompactionInFlight: runtime.isRootCompactionInFlight,
+          rootContextHealth: runtime.rootHealth,
+        });
         await api.sendMessage({ customType: "safe-agents.message", content, display: decision.display, details: message }, {
           triggerTurn: decision.triggerTurn,
           deliverAs: decision.deliverAs,
         });
         if (epoch !== rootDeliveryEpoch) return;
         rememberRootMessage(message.id, "accepted");
+        if (decision.deliverAs === "nextTurn") deferredRootMessages.set(message.id, message);
         await runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs);
         rememberRootMessage(message.id, "acknowledged");
       } catch {
@@ -133,6 +145,39 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       if (!removable) break;
       rootDeliveryStates.delete(removable);
     }
+  }
+
+  function wakeDeferredRoot(api: ExtensionAPI): void {
+    if (deferredRootMessages.size === 0 || runtime.isRootCompactionInFlight || runtime.rootHealth === "degraded") return;
+    // A retry/continuation is already running in Pi. The messages were
+    // delivered as next-turn context, so wait until that logical run settles
+    // before enqueueing a synthetic wake. `nextTurn` messages are injected by
+    // Pi only when a real prompt starts, so a custom-message wake would leave
+    // them stranded in the pending-next-turn queue.
+    if (rootLogicalRunActive) {
+      deferredRootWakePending = true;
+      return;
+    }
+    deferredRootMessages.clear();
+    deferredRootWakePending = false;
+    const sendUserMessage = (api as ExtensionAPI & { sendUserMessage?: (content: string, options?: { expandPromptTemplates?: boolean }) => void }).sendUserMessage;
+    if (typeof sendUserMessage === "function") {
+      // This starts a normal prompt, which flushes Pi's pending `nextTurn`
+      // messages into the model context before generation begins.
+      sendUserMessage("Review the deferred safe-agents messages that were waiting for root context recovery.", {
+        expandPromptTemplates: false,
+      });
+      return;
+    }
+    // Lightweight hosts predating sendUserMessage still get a visible wake;
+    // their custom-message implementation may not expose Pi's pending-next-turn
+    // queue, so retain the compatibility fallback.
+    void api.sendMessage({
+      customType: "safe-agents.status",
+      content: "Deferred fabric messages are available in the session context; review them before continuing.",
+      display: true,
+      details: { reason: "root-compaction-settled" },
+    }, { triggerTurn: true, deliverAs: "followUp" });
   }
 
   // The root participates in borrowing too: ordinary Pi edit/write calls are
@@ -181,6 +226,12 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     rootDeliveryEpoch += 1;
     rootDeliveryTail = Promise.resolve();
+    deferredRootMessages.clear();
+    deferredRootWakePending = false;
+    rootLogicalRunActive = false;
+    lastFinalRootOutcome = undefined;
+    runtime.resetRootCompactionState();
+    runtime.resetRootContextHealth();
     registerInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);
     const generation = lifecycleQueue.beginSession();
     try {
@@ -197,10 +248,56 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   pi.on("agent_start", (_event, ctx) => {
     const generation = lifecycleQueue.currentGeneration;
     void enqueueLifecycle(generation, async () => {
+      if (rootLogicalRunActive) return;
       await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
       if (generation !== lifecycleQueue.currentGeneration) return;
-      await runtime.request("agent.begin_turn", {});
-    }).catch((error) => notifyLifecycleFailure(ctx, error, "warning", generation));
+      rootLogicalRunActive = true;
+      lastFinalRootOutcome = undefined;
+      runtime.resetRootContextHealth();
+      // A user-led run consumes any messages queued as `nextTurn`. Automatic
+      // compaction/retry continuations set deferredRootWakePending instead and
+      // must keep the queue until the logical run finally settles.
+      if (!deferredRootWakePending) deferredRootMessages.clear();
+      let started = false;
+      while (!started && generation === lifecycleQueue.currentGeneration) {
+        const result = await runtime.request<{ started?: boolean }>("agent.begin_turn", {});
+        started = result?.started !== false;
+        if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }).catch((error) => {
+      rootLogicalRunActive = false;
+      notifyLifecycleFailure(ctx, error, "warning", generation);
+    });
+  });
+
+  // Observe the actual low-level terminal response. Pi may emit multiple
+  // agent_end events while retrying/compacting; the latest one before
+  // agent_settled is the logical run outcome, without transcript inference.
+  pi.on("agent_end", (event, ctx) => {
+    const assistant = findFinalAssistantMessage(event.messages ?? []);
+    if (assistant !== undefined) {
+      lastFinalRootOutcome = classifyAssistantMessage(assistant, ctx.model?.contextWindow);
+    }
+  });
+
+  // Manual, threshold, and overflow compaction all mutate root context outside
+  // a normal broker turn. Keep the fabric conservative through the full hook
+  // interval and let durable deliveries queue as nextTurn/context-only.
+  pi.on("session_before_compact", async (event) => {
+    await runtime.beginRootCompaction(event.signal);
+  });
+  pi.on("session_compact", async (_event, ctx) => {
+    await runtime.endRootCompaction();
+    runtime.markRootContextHealthy();
+    wakeDeferredRoot(pi);
+  });
+  pi.on("session_compact_failed", async (event, ctx) => {
+    await runtime.endRootCompaction();
+    if (!event.aborted) {
+      const outcome = classifyCompactionFailure(event.errorMessage, false, ctx.model?.contextWindow);
+      lastFinalRootOutcome = outcome;
+      runtime.markRootContextDegraded(outcome);
+    }
   });
 
   // agent_end can be followed by Pi's automatic retry, compaction, or queued
@@ -210,16 +307,30 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     const generation = lifecycleQueue.currentGeneration;
     void enqueueLifecycle(generation, async () => {
       if (!runtime.rootAgentId) return;
-      if (rootSessionEndedWithAbort(ctx)) {
+      const outcome = lastFinalRootOutcome;
+      if (outcome?.kind === "aborted") {
         await runtime.abortDescendants({ reason: "root-aborted", mode: "budget" });
       }
-      await runtime.request("agent.end_turn", { status: "ready" });
+      if (outcome && outcome.kind !== "success" && outcome.kind !== "aborted") runtime.markRootContextDegraded(outcome);
+      else if (outcome?.kind === "success") runtime.markRootContextHealthy();
+      try {
+        await runtime.request("agent.end_turn", { status: "ready" });
+      } finally {
+        rootLogicalRunActive = false;
+        lastFinalRootOutcome = undefined;
+      }
+      if (deferredRootWakePending || deferredRootMessages.size > 0) wakeDeferredRoot(pi);
     }).catch((error) => notifyLifecycleFailure(ctx, error, "warning", generation));
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
     rootDeliveryEpoch += 1;
     rootDeliveryTail = Promise.resolve();
+    deferredRootMessages.clear();
+    deferredRootWakePending = false;
+    rootLogicalRunActive = false;
+    lastFinalRootOutcome = undefined;
+    runtime.resetRootCompactionState();
     rootDeliveryStates.clear();
     runtime.setPendingRootDeliveriesCount(0);
     unregisterInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);
@@ -236,7 +347,6 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     description: "Inspect or stop the safe-agents fabric (status, tree, tasks, resources, messages, inbox, stop)",
     handler: async (args, ctx) => {
       try {
-        await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
         const mode = args.trim() || "status";
         if (mode === "stop" || mode.startsWith("stop ")) {
           const requestedMode = mode.slice("stop".length).trim();
@@ -244,10 +354,19 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
             throw new FabricError("INVALID_ARGUMENT", "usage: /agents stop [--budget|--now]");
           }
           const shutdownMode: DescendantShutdownMode = requestedMode === "--now" ? "now" : requestedMode === "--budget" ? "budget" : "graceful";
+          // Start the local emergency kill switch before any broker-backed
+          // root attach/status work. A frozen broker must not delay --now.
+          if (shutdownMode === "now") {
+            const snapshots = await runtime.abortDescendants({ reason: `agents-stop:${shutdownMode}`, mode: shutdownMode });
+            ctx.ui.notify(`safe-agents: stopped ${snapshots.length} descendant${snapshots.length === 1 ? "" : "s"} (${shutdownMode}); deterministic handoff captured`, "info");
+            return;
+          }
+          await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
           const snapshots = await runtime.abortDescendants({ reason: `agents-stop:${shutdownMode}`, mode: shutdownMode });
           ctx.ui.notify(`safe-agents: stopped ${snapshots.length} descendant${snapshots.length === 1 ? "" : "s"} (${shutdownMode}); deterministic handoff captured`, "info");
           return;
         }
+        await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
         if (mode === "inbox") {
           const messages = await runtime.request<AgentMessage[]>("message.inbox", { limit: 50 });
           ctx.ui.notify(messages.length ? messages.map(formatMessage).join("\n\n") : "safe-agents inbox is empty", "info");
@@ -281,22 +400,6 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   });
 }
 
-function rootSessionEndedWithAbort(ctx: ExtensionContext): boolean {
-  const manager = (ctx as ExtensionContext & { sessionManager?: { getEntries?: () => unknown[] } }).sessionManager;
-  try {
-    const entries = manager?.getEntries?.() ?? [];
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      const entry = entries[index] as { type?: string; message?: { role?: string; stopReason?: string } };
-      if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
-      return entry.message.stopReason === "aborted";
-    }
-  } catch {
-    // A lightweight test/RPC context may not expose session entries. In that
-    // case ordinary settlement remains unchanged.
-  }
-  return false;
-}
-
 function formatMessage(message: AgentMessage): string {
   return `[${message.type}] ${message.from} -> ${message.to}: ${message.body}`;
 }
@@ -317,6 +420,7 @@ function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricState
         `${indent}  spawn=${agent.capabilities?.maySpawn ? "yes" : "no"} peers=${agent.capabilities?.mayMessagePeers ? "yes" : "no"} escalate=${agent.capabilities?.mayEscalate ? "yes" : "no"}`,
         `${indent}  external-root-extensions=not-inherited`,
         `${indent}  context=${agent.contextMode ?? "native"}`,
+        agent.contextDiagnostic ? `${indent}  context-diagnostic=${agent.contextDiagnostic}` : undefined,
       ].filter(Boolean);
       return lines.join("\n");
     }).join("\n") || "safe-agents: no agents";
@@ -339,12 +443,13 @@ function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricState
     `mutable holds: ${mutableHolds}`,
     `pending root requests: ${pendingRequests}`,
     `pending root deliveries: ${pendingDeliveries}`,
+    `root context: ${snapshot?.rootCompactionInFlight ? "compacting" : snapshot?.rootContextHealth === "degraded" ? `degraded${snapshot.rootContextDiagnostic ? ` (${snapshot.rootContextDiagnostic})` : ""}` : "healthy"}`,
     `agents: ${status.agents.length} (running ${status.runningChildren})`,
     `tasks: ${status.tasks.length}`,
     `resources: ${status.resources.length}`,
     "",
     ...status.agents.map((agent) => `${agent.id} [${agent.status}] ${agent.role} context=${agent.contextMode ?? "native"}`),
-  ].join("\n");
+  ].filter((line): line is string => Boolean(line)).join("\n");
 
   return summary;
 }
