@@ -76,7 +76,8 @@ function diagnosticText(message: AssistantLike): string | undefined {
   if (direct) return direct;
   for (const diagnostic of message.diagnostics ?? []) {
     const candidate = text(diagnostic.error?.message) ?? text((diagnostic as { message?: unknown }).message);
-    if (candidate) return candidate;
+    const code = text(diagnostic.error?.code);
+    if (candidate || code) return [code, candidate].filter(Boolean).join(": ");
   }
   return undefined;
 }

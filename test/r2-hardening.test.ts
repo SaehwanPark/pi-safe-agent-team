@@ -35,6 +35,7 @@ function registerRoot(coordinator: Coordinator, route = localRoute): AgentRecord
 test("R2 outcome classifier separates logical overflow, prefill capacity, runtime pressure, and transient errors", () => {
   const base = { role: "assistant", usage: { input: 47_000, cacheRead: 0, output: 0 } };
   assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "omlx_code: prefill_memory_exceeded" }, 131_072).kind, "prefill_capacity");
+  assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", diagnostics: [{ error: { code: "prefill_memory_exceeded", message: "backend rejected prefill" } }] }, 131_072).kind, "prefill_capacity");
   assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "CUDA out of memory during decode" }, 131_072).kind, "runtime_memory_pressure");
   assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "prompt is too long: 140000 tokens" }, 131_072).kind, "context_overflow");
   assert.equal(classifyAssistantMessage({ ...base, stopReason: "error", errorMessage: "service unavailable (503)" }, 131_072).kind, "transient_error_exhausted");
