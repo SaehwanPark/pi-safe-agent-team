@@ -172,6 +172,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    registerInteropProvider("safe-agent-team.fabric-state.v1", interopProvider);
     const generation = lifecycleQueue.beginSession();
     try {
       await enqueueLifecycle(generation, async () => {

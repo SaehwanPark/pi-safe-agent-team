@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import safeAgentsTeam from "../index.ts";
 import { FabricRuntime } from "../src/pi/runtime.ts";
-import { unregisterInteropProvider } from "../src/pi/interop.ts";
+import { getInteropProvider, unregisterInteropProvider } from "../src/pi/interop.ts";
 
 type Handler = (event: unknown, context: unknown) => unknown;
 
@@ -122,3 +122,29 @@ test("shutdown waits for a settled handler before stopping the runtime", async (
 
   assert.equal(stopped, true);
 });
+
+test("re-registers fabric provider on session_start after session_shutdown", async () => {
+  await withRuntimeSpies(async () => {}, async () => {
+    const handlers = makeExtensionHarness();
+    const context = makeContext();
+
+    // Initial registration happened when extension was loaded
+    assert.ok(getInteropProvider("safe-agent-team.fabric-state.v1"));
+
+    // session_start (Session A)
+    await handlers.get("session_start")?.[0]?.({}, context);
+    assert.ok(getInteropProvider("safe-agent-team.fabric-state.v1"));
+
+    // session_shutdown (e.g. on resume/fork/reload)
+    await handlers.get("session_shutdown")?.[0]?.({}, context);
+    assert.equal(getInteropProvider("safe-agent-team.fabric-state.v1"), undefined);
+
+    // session_start (Session B)
+    await handlers.get("session_start")?.[0]?.({}, context);
+    assert.ok(getInteropProvider("safe-agent-team.fabric-state.v1"));
+
+    // Cleanup
+    await handlers.get("session_shutdown")?.[0]?.({}, context);
+  });
+});
+
