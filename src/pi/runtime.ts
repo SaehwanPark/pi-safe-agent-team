@@ -1523,7 +1523,7 @@ export class ManagedChild {
           await this.reconcileRecoveryGate(this.record);
           const inbox = await this.drainInbox();
           for (const message of inbox) void this.deliverMessage(message);
-          if (!this.blockedByOutcome && this.taskId && this.session && !this.session.isStreaming) {
+          if (!this.blockedByOutcome && !this.recoveryWakePending && this.taskId && this.session && !this.session.isStreaming) {
             this.enqueuePrompt(`Broker recovered. Resume assigned task ${this.taskId} from the durable task state.`);
           }
           return;
