@@ -129,6 +129,15 @@ export interface CoordinatorSnapshot {
 export class Coordinator {
   /** Bounded durable deduplication window; the oldest entries are evicted first. */
   static readonly maxIdempotencyEntries = 256;
+  /** Operations whose responses and effects are safe to replay after a lost response. */
+  static readonly idempotentOperations = new Set([
+    "agent.spawn",
+    "task.create",
+    "agent.begin_turn",
+    "agent.end_turn",
+    "agent.finish_turn",
+    "message.send",
+  ]);
 
   readonly rootId: string;
   readonly rootAgentId?: string;
@@ -175,6 +184,8 @@ export class Coordinator {
     assertCondition(this.config.messageRetention > 0, "INVALID_ARGUMENT", "messageRetention must be positive");
     assertCondition(this.config.leaseMs > 0, "INVALID_ARGUMENT", "leaseMs must be positive");
     assertCondition(this.config.heartbeatMs > 0, "INVALID_ARGUMENT", "heartbeatMs must be positive");
+    assertCondition((this.config.agentHeartbeatTimeoutMs ?? 0) > 0, "INVALID_ARGUMENT", "agentHeartbeatTimeoutMs must be positive");
+    assertCondition((this.config.reconnectGraceMs ?? 0) > 0, "INVALID_ARGUMENT", "reconnectGraceMs must be positive");
     this.validateRoutePolicies();
   }
 
@@ -315,7 +326,7 @@ export class Coordinator {
     if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
     const operationId = args.operationId;
     if (operationId === undefined) return undefined;
-    assertCondition(operation === "agent.spawn" || operation === "task.create", "INVALID_ARGUMENT", "operationId is only supported for agent.spawn and task.create");
+    assertCondition(Coordinator.idempotentOperations.has(operation), "INVALID_ARGUMENT", `operationId is not supported for ${operation}`);
     assertCondition(typeof operationId === "string" && operationId.length > 0 && operationId.length <= 128 && !operationId.includes("\u0000"), "INVALID_ARGUMENT", "operationId must be a bounded non-empty string without NUL");
     assertCondition(actorId !== undefined, "IDENTITY_CONFLICT", "operationId requires an authenticated actor");
     const prior = this.idempotency.get(idempotencyKey(String(actorId), operationId));
@@ -328,6 +339,11 @@ export class Coordinator {
   private rememberIdempotency(actorId: AgentId | undefined, operation: string, args: Record<string, unknown>, result: DispatchResult<any>): void {
     const operationId = args.operationId;
     if (typeof operationId !== "string" || operationId.length === 0) return;
+    if (!Coordinator.idempotentOperations.has(operation)) return;
+    // A capacity admission that did not start is only a probe. Do not pin the
+    // operationId to a transient false result; a retry with the same logical
+    // turn may succeed once another actor releases its slot.
+    if (operation === "agent.begin_turn" && result.value && typeof result.value === "object" && (result.value as { started?: unknown }).started === false) return;
     const key = idempotencyKey(String(actorId), operationId);
     const entry: IdempotencyStateEntry = { key, operation, requestHash: requestFingerprint(operation, args), response: normalizeClone(result.value) };
     this.rememberIdempotencyEntry(entry);
@@ -969,6 +985,15 @@ export class Coordinator {
       case "ready":
       case "reopen":
         assertCondition(!isTaskTerminal(task.status) || action === "reopen", "LIFECYCLE_CONFLICT", `Task ${task.id} cannot be reopened from ${task.status}`);
+        if (action === "reopen" && task.status === "completed") {
+          const dependents = this.taskDependents(task.id);
+          assertCondition(
+            dependents.length === 0,
+            "LIFECYCLE_CONFLICT",
+            `Task ${task.id} cannot be reopened while ${dependents.length} dependent task${dependents.length === 1 ? " is" : "s are"} still active`,
+            { taskId: task.id, dependentTaskIds: dependents.map((candidate) => candidate.id) },
+          );
+        }
         assertCondition(this.taskDependenciesCompleted(task), "TASK_BLOCKED", `Task ${task.id} dependencies are not complete`);
         task.status = task.owner ? "active" : "ready";
         task.blockedReason = undefined;
@@ -1002,6 +1027,7 @@ export class Coordinator {
   private completeTask(actorId: AgentId, task: TaskRecord, rawResult: unknown, events: CoordinatorEvent[]): TaskRecord {
     if (task.status === "completed") return cloneTask(task);
     assertCondition(!isTaskTerminal(task.status), "LIFECYCLE_CONFLICT", `Task ${task.id} is already ${task.status}`);
+    if (task.owner) this.assertNoLiveDescendants(task.owner);
     const resultObject = rawResult && typeof rawResult === "object" ? rawResult as Record<string, unknown> : {};
     const summary = parseString(resultObject.summary ?? "completed", "result.summary", this.config.maxTaskOutput);
     const output = resultObject.output === undefined ? undefined : parseString(resultObject.output, "result.output", this.config.maxTaskOutput);
@@ -1356,8 +1382,62 @@ export class Coordinator {
   /** Run the time-based maintenance transition without requiring an actor request. */
   maintenance(): DispatchResult<null> {
     const events: CoordinatorEvent[] = [];
-    this.reclaimExpired(this.clock(), events);
+    const now = this.clock();
+    this.reclaimExpired(now, events);
+    this.reclaimStaleAgents(now, events);
     return { value: null, events };
+  }
+
+  /**
+   * Bound broker-only liveness failures. A stale actor first becomes
+   * reconnectable and releases runtime claims while retaining its task link
+   * for a bounded reattach window. If it never reconnects, retire its subtree
+   * and return unfinished tasks to the ready pool so capacity cannot remain
+   * reserved forever.
+   */
+  private reclaimStaleAgents(now: number, events: CoordinatorEvent[]): void {
+    const heartbeatTimeout = this.config.agentHeartbeatTimeoutMs ?? this.config.heartbeatMs * 3;
+    const reconnectGrace = this.config.reconnectGraceMs ?? heartbeatTimeout * 2;
+    for (const agent of [...this.agents.values()]) {
+      if (isTerminal(agent.status) || agent.reconnectable === true) continue;
+      if (now - agent.lastActivity < heartbeatTimeout) continue;
+      const next = cloneAgent(agent);
+      next.status = "failed";
+      next.statusReason = "Agent heartbeat expired before the host reconnected";
+      next.reconnectable = true;
+      next.lastActivity = now;
+      this.agents.set(next.id, next);
+      events.push({ type: "agent_updated", agent: cloneAgent(next) });
+      // Preserve the durable task link for a reconnecting runtime, but release
+      // resources and make the task available if the grace window expires.
+      this.releaseAgentRuntime(next.id, "broker-recovery", events);
+      if (next.parentId && this.agents.has(next.parentId)) {
+        this.sendInternalMessage("broker", next.parentId, "agent_failed", next.statusReason, { failedAgentId: next.id }, events);
+      }
+    }
+
+    for (const agent of [...this.agents.values()]) {
+      if (agent.depth === 0 || agent.status !== "failed" || agent.reconnectable !== true) continue;
+      if (now - agent.lastActivity < reconnectGrace) continue;
+      this.retireReconnectableSubtree(agent, events);
+    }
+  }
+
+  private retireReconnectableSubtree(agent: AgentRecord, events: CoordinatorEvent[]): void {
+    for (const child of [...this.agents.values()]) {
+      if (child.parentId === agent.id && child.reconnectable === true) this.retireReconnectableSubtree(child, events);
+    }
+    const current = this.agents.get(agent.id);
+    if (!current || current.status !== "failed" || current.reconnectable !== true) return;
+    const next = cloneAgent(current);
+    next.status = "cancelled";
+    next.reconnectable = false;
+    next.statusReason = "Reconnect grace expired; unfinished work returned to the task pool";
+    next.lastActivity = this.clock();
+    this.agents.set(next.id, next);
+    events.push({ type: "agent_updated", agent: cloneAgent(next) });
+    this.cancelRequestsFor(next.id, "cancelled", "Agent reconnect grace expired", events);
+    this.releaseAgentRuntime(next.id, "reconnect-expired", events);
   }
 
   /** Mark non-terminal runtime actors stale after a broker restart and release their leases. */
@@ -1474,6 +1554,12 @@ export class Coordinator {
           if (event.request) this.requests.set(event.request.id, cloneRequest(event.request));
           break;
         }
+        case "message_updated": {
+          const message = cloneMessage(event.message);
+          this.messages.set(message.id, message);
+          if (message.clientDedupeKey) this.dedupe.set(`${message.from}\u0000${message.clientDedupeKey}`, message.id);
+          break;
+        }
         case "message_acknowledged":
           this.messages.set(event.message.id, cloneMessage(event.message));
           break;
@@ -1584,6 +1670,21 @@ export class Coordinator {
       if (existingId) {
         const existing = this.messages.get(existingId);
         if (existing && existing.acknowledgedAt === undefined) {
+          // Broker-generated control notices are state notifications, not an
+          // append-only log. Replace the unacknowledged payload so a delayed
+          // wake carries the newest lease/task/actor state rather than stale
+          // metadata from the first notification in the coalescing window.
+          if (options.clientDedupeKey?.startsWith("control:")) {
+            const updated: AgentMessage = {
+              ...cloneMessage(existing),
+              body,
+              priority: options.priority ?? existing.priority,
+              metadata: parseMetadata(options.metadata),
+            };
+            this.messages.set(existing.id, updated);
+            events.push({ type: "message_updated", message: cloneMessage(updated) });
+            return { message: cloneMessage(updated), request: existing.requestId ? this.requests.get(existing.requestId) && cloneRequest(this.requests.get(existing.requestId) as RequestRecord) : undefined };
+          }
           return { message: cloneMessage(existing), request: existing.requestId ? this.requests.get(existing.requestId) && cloneRequest(this.requests.get(existing.requestId) as RequestRecord) : undefined };
         }
         this.dedupe.delete(dedupeKey);
@@ -1659,7 +1760,7 @@ export class Coordinator {
     if (isTerminal(to.status)) return;
     const from = fromId === "broker" ? this.brokerActor() : this.requireAgent(fromId);
     try {
-      const entity = metadata.taskId ?? metadata.failedAgentId ?? metadata.resourceId ?? metadata.requestId ?? stableStringify(metadata);
+      const entity = metadata.requestId ?? metadata.taskId ?? metadata.failedAgentId ?? metadata.resourceId ?? stableStringify(metadata);
       this.recordMessage(from, to, type, body.slice(0, this.config.maxMessageBody), {
         priority: "urgent",
         metadata,
@@ -2043,6 +2144,23 @@ export class Coordinator {
 
   private taskDependenciesCompleted(task: TaskRecord): boolean {
     return task.dependencies.every((dependency) => this.tasks.get(dependency)?.status === "completed");
+  }
+
+  /** Return every non-cancelled downstream task, including transitive dependents. */
+  private taskDependents(taskId: TaskId): TaskRecord[] {
+    const dependents: TaskRecord[] = [];
+    const seen = new Set<TaskId>([taskId]);
+    const queue: TaskId[] = [taskId];
+    while (queue.length > 0) {
+      const prerequisite = queue.shift() as TaskId;
+      for (const candidate of this.tasks.values()) {
+        if (seen.has(candidate.id) || !candidate.dependencies.includes(prerequisite)) continue;
+        seen.add(candidate.id);
+        queue.push(candidate.id);
+        if (candidate.status !== "cancelled") dependents.push(candidate);
+      }
+    }
+    return dependents;
   }
 
   /**

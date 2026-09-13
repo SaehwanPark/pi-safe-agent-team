@@ -78,6 +78,8 @@ Current defaults:
 | `maxTaskOutput` | 32 KiB |
 | `leaseMs` | 30 minutes |
 | `heartbeatMs` | 1 minute |
+| `agentHeartbeatTimeoutMs` | 3 minutes | Time without an actor heartbeat before the broker marks it failed/reconnectable and releases runtime claims. |
+| `reconnectGraceMs` | 10 minutes | How long a stale reconnectable actor keeps its `maxTotalAgents` slot before retirement; unfinished tasks return to `ready`. |
 | `messageRetention` | 2048 recent records |
 | `fenceMs` (per `resource.begin_write`) | 30s, clamped 1s-120s | Lifetime of a guarded-write fence. Not a config field: passed per call by the guarded host. Fences are ephemeral and are never journaled. |
 | `caseInsensitivePaths` | auto | Fold policy keys so differently-cased spellings share one resource. Undefined = probe the broker volume at startup (always true on Windows). Set `false` to keep keys case-sensitive. |
@@ -112,7 +114,10 @@ Limits fail closed. There is no automatic unbounded retry or fallback provider.
 The broker periodically checkpoints `events.jsonl` (by transaction count or
 file size) and checkpoints again during clean shutdown. Heartbeats without
 leases update liveness in memory without creating a synchronous journal write;
-lease renewals remain durable.
+lease renewals remain durable. Lifecycle writes (`agent.begin_turn`,
+`agent.end_turn`, and `agent.finish_turn`) accept durable `operationId` values,
+so a lost response can be retried without applying the transition twice.
+`message.send` supports the same replay contract.
 
 ## Roles and capabilities
 

@@ -86,6 +86,30 @@ test("agent.spawn replay returns the original child identity and token without a
   assert.equal(status.agents.length, 2);
 });
 
+test("lifecycle operationIds replay committed begin/end/finish responses", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  const child = registerChild(coordinator, "lifecycle-child");
+  const started = coordinator.dispatch(child.id, "agent.begin_turn", { operationId: "turn-1-begin" });
+  assert.equal(started.value.started, true);
+  const startedReplay = coordinator.dispatch(child.id, "agent.begin_turn", { operationId: "turn-1-begin" });
+  assert.equal(startedReplay.value.started, true);
+  assert.equal(startedReplay.value.replayed, true);
+  const ended = coordinator.dispatch(child.id, "agent.end_turn", { status: "ready", operationId: "turn-1-end" });
+  assert.equal(ended.value.agent.status, "ready");
+  const endedReplay = coordinator.dispatch(child.id, "agent.end_turn", { status: "ready", operationId: "turn-1-end" });
+  assert.equal(endedReplay.value.agent.status, "ready");
+  assert.equal(endedReplay.value.replayed, true);
+
+  const finishedChild = registerChild(coordinator, "finish-child");
+  coordinator.dispatch(finishedChild.id, "agent.begin_turn", {});
+  const finished = coordinator.dispatch(finishedChild.id, "agent.finish_turn", { status: "ready", operationId: "turn-2-finish" });
+  assert.equal(finished.value.agent.status, "ready");
+  const finishedReplay = coordinator.dispatch(finishedChild.id, "agent.finish_turn", { status: "ready", operationId: "turn-2-finish" });
+  assert.equal(finishedReplay.value.agent.status, "ready");
+  assert.equal(finishedReplay.value.replayed, true);
+});
+
 test("operationId scope is per actor; one key addresses one logical request", () => {
   const coordinator = makeCoordinator();
   registerRoot(coordinator);

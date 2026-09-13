@@ -80,7 +80,24 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
       }),
       async execute(_toolCallId, params: any): Promise<AgentToolResult<unknown>> {
         const expectsReply = params.expectsReply ?? ["clarification", "decision_request", "escalation", "resource_request", "request"].includes(params.type);
-        const result = await client.request("message.send", { ...params, expectsReply });
+        const request = {
+          ...params,
+          expectsReply,
+          // Pi retries a tool call with the same toolCallId. Give the broker a
+          // stable default dedupe key even when the model omitted one.
+          clientDedupeKey: params.clientDedupeKey ?? `tool:${_toolCallId}`,
+        };
+        let result: any;
+        if (typeof client.requestIdempotent === "function") {
+          try {
+            result = await client.requestIdempotent("message.send", request, `tool:${_toolCallId}`);
+          } catch (error) {
+            if (!(error instanceof FabricError) || error.code !== "INVALID_ARGUMENT" || !/operationId.*supported/i.test(error.message)) throw error;
+            result = await client.request("message.send", request);
+          }
+        } else {
+          result = await client.request("message.send", request);
+        }
         const requestId = (result as { request?: { id?: string } }).request?.id;
         if (expectsReply && requestId) options.onClarification?.(requestId);
         return textResult(result, Boolean(expectsReply));

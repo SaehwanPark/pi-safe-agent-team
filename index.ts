@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { FabricError, asFabricError } from "./src/core/errors.ts";
@@ -73,11 +74,31 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   const deferredRootMessages = new Map<string, AgentMessage>();
   const deferredRootPersisted = new Set<string>();
   const deferredRootRunMessages = new Set<string>();
+  /** IDs accepted by Pi but not yet proven present in session history. */
+  const persistedRootMessageIds = new Set<string>();
+  const rootAckInFlight = new Map<string, Promise<void>>();
   let deferredRootWakePending = false;
   let rootContext: ExtensionContext | undefined;
   const lifecycleQueue = new LifecycleQueue();
   let rootLogicalRunActive = false;
+  let rootLogicalTurnId = "root-turn-0";
+  let rootTurnSequence = 0;
+  const rootOperationNonce = randomUUID();
   let lastFinalRootOutcome: ModelTurnOutcome | undefined;
+
+  const requestRootLifecycle = <T = unknown>(operation: string, args: Record<string, unknown>, operationId: string): Promise<T> => {
+    // Runtime test hosts may provide only the ordinary request surface. The
+    // real BrokerClient path uses the durable coordinator replay record.
+    if (runtime.client && typeof runtime.client.requestIdempotent === "function") {
+      return runtime.requestIdempotent<T>(operation, args, operationId, FabricRuntime.shutdownRpcTimeoutMs).catch((error) => {
+        if (error instanceof FabricError && error.code === "INVALID_ARGUMENT" && /operationId.*supported/i.test(error.message)) {
+          return runtime.request<T>(operation, args, FabricRuntime.shutdownRpcTimeoutMs);
+        }
+        throw error;
+      });
+    }
+    return runtime.request<T>(operation, args, FabricRuntime.shutdownRpcTimeoutMs);
+  };
 
   const enqueueLifecycle = (generation: number, operation: () => Promise<void>): Promise<void> =>
     lifecycleQueue.enqueue(generation, operation);
@@ -108,15 +129,13 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     if (state === "acknowledged" || state === "delivering") return;
     if (state === "accepted") {
       if (epoch !== rootDeliveryEpoch) return;
-      if (deferredRootMessages.has(message.id) && !deferredRootPersisted.has(message.id)) return;
-      void runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs).then(() => rememberRootMessage(message.id, "acknowledged")).catch(() => undefined);
+      void acknowledgePersistedRootMessage(message.id);
       return;
     }
     if (hasPersistedRootMessage(message.id)) {
       rootDeliveryStates.set(message.id, "accepted");
-      void runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs)
-        .then(() => rememberRootMessage(message.id, "acknowledged"))
-        .catch(() => rootDeliveryStates.delete(message.id));
+      persistedRootMessageIds.add(message.id);
+      void acknowledgePersistedRootMessage(message.id);
       return;
     }
     rootDeliveryStates.set(message.id, "delivering");
@@ -133,7 +152,15 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
           rootCompactionInFlight: runtime.isRootCompactionInFlight,
           rootContextHealth: runtime.rootHealth,
         });
-        await api.sendMessage({ customType: "safe-agents.message", content, display: decision.display, details: message }, {
+        await api.sendMessage({
+          customType: "safe-agents.message",
+          content,
+          display: decision.display,
+          // Keep a structured exact receipt alongside the legacy AgentMessage
+          // details object. Durable ACKs must never rely on text substring
+          // matching or an unrelated quoted message ID.
+          details: { ...message, fabricMessageId: message.id },
+        }, {
           triggerTurn: decision.triggerTurn,
           deliverAs: decision.deliverAs,
         });
@@ -146,8 +173,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
           deferredRootMessages.set(message.id, message);
           return;
         }
-        await runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs);
-        rememberRootMessage(message.id, "acknowledged");
+        await acknowledgePersistedRootMessage(message.id);
       } catch {
         rootDeliveryStates.delete(message.id);
       } finally {
@@ -171,33 +197,50 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     try {
       const manager = rootContext?.sessionManager as unknown as { getEntries?: () => readonly unknown[] } | undefined;
       const entries = typeof manager?.getEntries === "function" ? manager.getEntries() : [];
-      return entries.some((entry: any) => entry?.type === "custom_message" && entry?.customType === "safe-agents.message" && entry?.details?.id === messageId);
+      return entries.some((entry: any) => entry?.type === "custom_message" && entry?.customType === "safe-agents.message" && (
+        entry?.details?.fabricMessageId === messageId || entry?.details?.id === messageId
+      ));
     } catch {
       return false;
     }
   }
 
   async function acknowledgePersistedDeferredRootMessages(): Promise<void> {
-    for (const messageId of [...deferredRootRunMessages]) {
-      if (!deferredRootMessages.has(messageId)) {
-        deferredRootRunMessages.delete(messageId);
-        continue;
-      }
-      // The custom message is appended before agent_end. Mark it as persisted
-      // before the broker round trip so an ACK failure never causes a duplicate
-      // nextTurn injection on a later wake.
-      deferredRootPersisted.add(messageId);
-      try {
-        await runtime.request("message.ack", { messageId }, FabricRuntime.shutdownRpcTimeoutMs);
-        deferredRootMessages.delete(messageId);
-        deferredRootPersisted.delete(messageId);
-        deferredRootRunMessages.delete(messageId);
-        rememberRootMessage(messageId, "acknowledged");
-      } catch {
-        // Leave the durable broker message and the persisted marker in place;
-        // a later settled/reconnect pass can retry the acknowledgement.
-      }
+    await acknowledgePersistedRootMessages();
+  }
+
+  async function acknowledgePersistedRootMessages(): Promise<void> {
+    for (const [messageId, state] of rootDeliveryStates) {
+      if (state !== "accepted") continue;
+      await acknowledgePersistedRootMessage(messageId);
     }
+  }
+
+  async function acknowledgePersistedRootMessage(messageId: string): Promise<void> {
+    const message = deferredRootMessages.get(messageId);
+    if (message && !deferredRootRunMessages.has(messageId) && !deferredRootPersisted.has(messageId)) return;
+    if (!persistedRootMessageIds.has(messageId)) {
+      if (!hasPersistedRootMessage(messageId)) return;
+      persistedRootMessageIds.add(messageId);
+      if (message) deferredRootPersisted.add(messageId);
+    }
+    const inFlight = rootAckInFlight.get(messageId);
+    if (inFlight) return inFlight;
+    const operation = runtime.request("message.ack", { messageId }, FabricRuntime.shutdownRpcTimeoutMs)
+      .then(() => {
+        if (message) {
+          deferredRootMessages.delete(messageId);
+          deferredRootPersisted.delete(messageId);
+          deferredRootRunMessages.delete(messageId);
+        }
+        rememberRootMessage(messageId, "acknowledged");
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (rootAckInFlight.get(messageId) === operation) rootAckInFlight.delete(messageId);
+      });
+    rootAckInFlight.set(messageId, operation);
+    return operation;
   }
 
   function wakeDeferredRoot(api: ExtensionAPI): void {
@@ -291,6 +334,8 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     deferredRootMessages.clear();
     deferredRootPersisted.clear();
     deferredRootRunMessages.clear();
+    persistedRootMessageIds.clear();
+    rootAckInFlight.clear();
     deferredRootWakePending = false;
     rootContext = ctx;
     rootLogicalRunActive = false;
@@ -318,11 +363,12 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
         await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
         if (generation !== lifecycleQueue.currentGeneration) return;
         rootLogicalRunActive = true;
+        rootLogicalTurnId = `root-turn-${rootOperationNonce}-${++rootTurnSequence}`;
         lastFinalRootOutcome = undefined;
         runtime.resetRootContextHealth();
         let started = false;
         while (!started && generation === lifecycleQueue.currentGeneration) {
-          const result = await runtime.request<{ started?: boolean }>("agent.begin_turn", {});
+          const result = await requestRootLifecycle<{ started?: boolean }>("agent.begin_turn", {}, `${rootLogicalTurnId}:begin`);
           started = result?.started !== false;
           if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
         }
@@ -338,7 +384,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     } catch (error) {
       rootLogicalRunActive = false;
       await runtime.endRootModelTurnCapacity().catch(() => undefined);
-      await runtime.request("agent.end_turn", { status: "ready" }).catch(() => undefined);
+      await requestRootLifecycle("agent.end_turn", { status: "ready" }, `${rootLogicalTurnId}:end`).catch(() => undefined);
       notifyLifecycleFailure(ctx, error, "warning", generation);
       throw error;
     }
@@ -364,6 +410,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   pi.on("session_compact", async (_event, ctx) => {
     await runtime.endRootCompaction();
     runtime.markRootContextHealthy();
+    await acknowledgePersistedRootMessages();
     wakeDeferredRoot(pi);
   });
   pi.on("session_compact_failed", async (event, ctx) => {
@@ -389,10 +436,10 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       if (outcome && outcome.kind !== "success" && outcome.kind !== "aborted") runtime.markRootContextDegraded(outcome);
       else if (outcome?.kind === "success") runtime.markRootContextHealthy();
       try {
-        await runtime.request("agent.end_turn", { status: "ready" });
+        await requestRootLifecycle("agent.end_turn", { status: "ready" }, `${rootLogicalTurnId}:end`);
       } finally {
         await runtime.endRootModelTurnCapacity();
-        await acknowledgePersistedDeferredRootMessages();
+        await acknowledgePersistedRootMessages();
         rootLogicalRunActive = false;
         lastFinalRootOutcome = undefined;
       }
@@ -406,6 +453,8 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     deferredRootMessages.clear();
     deferredRootPersisted.clear();
     deferredRootRunMessages.clear();
+    persistedRootMessageIds.clear();
+    rootAckInFlight.clear();
     deferredRootWakePending = false;
     rootLogicalRunActive = false;
     lastFinalRootOutcome = undefined;
