@@ -519,18 +519,23 @@ export class FabricRuntime {
       if (status.config?.caseInsensitivePaths !== undefined) {
         this.caseInsensitivePaths = status.config.caseInsensitivePaths;
       }
-      const rootAgent = status.agents.find((a) => a.id === status.rootId);
+      // `FabricStatus.rootId` is the durable fabric identity, not necessarily
+      // the broker agent ID (the normal host uses `fabric-*` and `root-*`
+      // respectively). Prefer the attached binding and retain the historical
+      // status-root fallback for lightweight callers that use one ID for both.
+      const rootAgentId = this.root?.agentId ?? status.rootId;
+      const rootAgent = status.agents.find((a) => a.id === rootAgentId);
       const rootBusy = !rootAgent || rootAgent.status === "starting" || rootAgent.status === "running";
 
       const runningChildren = status.agents.filter(
         (a) => a.depth > 0 && (a.status === "starting" || a.status === "running" || a.status === "draining"),
       ).length;
       const unresolvedChildTasks = status.tasks.filter(
-        (t) => t.owner && t.owner !== status.rootId && ["pending", "ready", "active", "waiting", "blocked"].includes(t.status),
+        (t) => t.owner && t.owner !== rootAgentId && ["pending", "ready", "active", "waiting", "blocked"].includes(t.status),
       ).length;
       const mutableHolds = status.resources.filter((r) => r.mutableHold !== undefined).length;
       const pendingRootRequests = status.pendingRequests.filter(
-        (r) => r.to === status.rootId && r.status === "pending",
+        (r) => r.to === rootAgentId && r.status === "pending",
       ).length;
       const pendingRootDeliveries = this.pendingRootDeliveriesCount;
       const activeWriteFences = status.activeFences ?? 0;
