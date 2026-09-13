@@ -1070,6 +1070,8 @@ export class ManagedChild {
   private readonly pendingMessages: AgentMessage[] = [];
   private readonly pendingMessageIds = new Set<string>();
   private readonly deliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
+  /** Messages accepted by Pi but waiting for a durable session transcript boundary. */
+  private readonly pendingChildAcks = new Map<string, AgentMessage>();
   private eventUnsubscribe?: () => void;
   private sessionEventUnsubscribe?: () => void;
   private closeUnsubscribe?: () => void;
@@ -1354,7 +1356,7 @@ export class ManagedChild {
     });
     const pending = this.pendingMessages.splice(0);
     for (const message of pending) this.pendingMessageIds.delete(message.id);
-    const inbox = await this.client.request<AgentMessage[]>("message.inbox", { limit: 100 });
+    const inbox = await this.drainInbox();
     const seen = new Set(pending.map((message) => message.id));
     for (const message of [...pending, ...inbox.filter((message) => !seen.has(message.id))]) void this.deliverMessage(message);
     this.enqueuePrompt(this.bootstrapPrompt());
@@ -1452,7 +1454,7 @@ export class ManagedChild {
           this.record = registered.agent;
           this.taskId = registered.agent.taskId;
           await this.reconcileRecoveryGate(this.record);
-          const inbox = await this.client.request<AgentMessage[]>("message.inbox", { limit: 100 });
+          const inbox = await this.drainInbox();
           for (const message of inbox) void this.deliverMessage(message);
           if (!this.blockedByOutcome && this.taskId && this.session && !this.session.isStreaming) {
             this.enqueuePrompt(`Broker recovered. Resume assigned task ${this.taskId} from the durable task state.`);
@@ -1512,10 +1514,11 @@ export class ManagedChild {
     this.blockedByOutcome = undefined;
   }
 
-  private enqueuePrompt(prompt: string): void {
-    // Adding to the local prompt tail is the host's acceptance point. Do not
-    // make broker acknowledgement wait for the model turn to finish.
-    this.promptTail = this.promptTail.then(() => this.executePrompt(prompt)).catch(async (error) => {
+  private enqueuePrompt(prompt: string): Promise<void> {
+    // The returned promise resolves only after Pi has finished the queued
+    // prompt. Message callers additionally verify that the corresponding user
+    // entry is present in the durable SessionManager transcript before ACKing.
+    const operation = this.promptTail.then(() => this.executePrompt(prompt)).catch(async (error) => {
       const terminalized = await this.client.request("agent.end_turn", {
         status: "failed",
         statusReason: error instanceof Error ? error.message : String(error),
@@ -1525,6 +1528,8 @@ export class ManagedChild {
       // leave the live runtime reconnectable instead of manufacturing failure.
       if (terminalized) await this.stop();
     });
+    this.promptTail = operation;
+    return operation;
   }
 
   private async degradeToNativeContext(): Promise<void> {
@@ -1550,6 +1555,10 @@ export class ManagedChild {
         this.lastObservedOutcome = classified;
         if (event.willRetry !== true) this.turnOutcome = classified;
       }
+      return;
+    }
+    if (event.type === "agent_settled") {
+      void this.acknowledgePersistedChildMessages();
       return;
     }
     if (event.type === "compaction_end" && event.result === undefined && !event.aborted) {
@@ -1753,7 +1762,7 @@ export class ManagedChild {
     if (state === "acknowledged") return Promise.resolve();
     if (state === "delivering") return this.deliveryTail;
     if (state === "accepted") {
-      return this.client.request("message.ack", { messageId: message.id }).then(() => this.markMessageAcknowledged(message.id)).catch(() => undefined);
+      return this.acknowledgePersistedChildMessage(message);
     }
 
     // Serialize acceptance itself, including steer calls. The broker's
@@ -1777,15 +1786,33 @@ export class ManagedChild {
     let accepted = false;
     try {
       if (!this.session || this.stopping) throw new FabricError("CHILD_SESSION_FAILURE", "Child session is not ready to accept messages");
+      // A reconnect can observe an unacknowledged broker message whose Pi user
+      // entry was already flushed before the process died. Acknowledge that
+      // durable copy without injecting a duplicate prompt.
+      if (this.hasPersistedChildMessage(message.id)) {
+        accepted = true;
+        this.deliveryStates.set(message.id, "accepted");
+        this.pendingChildAcks.set(message.id, message);
+        await this.acknowledgePersistedChildMessage(message);
+        return;
+      }
       if (this.session.isStreaming) {
         await this.session.steer(text);
       } else {
-        this.enqueuePrompt(text);
+        const promptCompletion = this.enqueuePrompt(text);
+        accepted = true;
+        if (message.type === "response" && message.requestId) this.pendingReplyIds.delete(message.requestId);
+        this.deliveryStates.set(message.id, "accepted");
+        this.pendingChildAcks.set(message.id, message);
+        void this.acknowledgePersistedChildMessage(message);
+        void promptCompletion.then(() => this.acknowledgePersistedChildMessage(message));
+        return;
       }
       accepted = true;
       if (message.type === "response" && message.requestId) this.pendingReplyIds.delete(message.requestId);
-      await this.client.request("message.ack", { messageId: message.id });
-      this.markMessageAcknowledged(message.id);
+      this.deliveryStates.set(message.id, "accepted");
+      this.pendingChildAcks.set(message.id, message);
+      await this.acknowledgePersistedChildMessage(message);
     } catch {
       if (accepted) this.deliveryStates.set(message.id, "accepted");
       else this.deliveryStates.delete(message.id);
@@ -1794,12 +1821,76 @@ export class ManagedChild {
   }
 
   private markMessageAcknowledged(messageId: string): void {
+    this.pendingChildAcks.delete(messageId);
     this.deliveryStates.set(messageId, "acknowledged");
     while (this.deliveryStates.size > 2048) {
       const removable = [...this.deliveryStates.entries()].find(([, current]) => current === "acknowledged")?.[0];
       if (!removable) break;
       this.deliveryStates.delete(removable);
     }
+  }
+
+  private hasPersistedChildMessage(messageId: string): boolean {
+    try {
+      const manager = (this.session as any)?.sessionManager as { getEntries?: () => readonly any[] } | undefined;
+      const entries = typeof manager?.getEntries === "function" ? manager.getEntries() : [];
+      return entries.some((entry: any) => {
+        if (entry?.type !== "message" || entry.message?.role !== "user") return false;
+        const content = entry.message.content;
+        const text = typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n")
+            : "";
+        return typeof text === "string" && text.includes(messageId);
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  private async acknowledgePersistedChildMessage(message: AgentMessage): Promise<void> {
+    // Lightweight test/embedding sessions may not expose SessionManager. The
+    // host's queue admission is the only boundary available to such callers;
+    // managed children always expose a persistent SessionManager and take the
+    // stricter transcript check below.
+    const manager = (this.session as any)?.sessionManager as { getEntries?: () => readonly any[] } | undefined;
+    if (typeof manager?.getEntries === "function") {
+      if (!this.hasPersistedChildMessage(message.id)) return;
+    }
+    try {
+      await this.client.request("message.ack", { messageId: message.id });
+      this.markMessageAcknowledged(message.id);
+    } catch {
+      // Keep the accepted marker and broker copy for a later settlement or
+      // reconnect retry. A lost ACK must never turn into message loss.
+    }
+  }
+
+  private async acknowledgePersistedChildMessages(): Promise<void> {
+    for (const message of [...this.pendingChildAcks.values()]) {
+      await this.acknowledgePersistedChildMessage(message);
+    }
+  }
+
+  private async drainInbox(): Promise<AgentMessage[]> {
+    const messages: AgentMessage[] = [];
+    let afterBrokerSequence = 0;
+    const limit = 100;
+    while (!this.stopping) {
+      const batch = await this.client.request<AgentMessage[]>("message.inbox", { limit, afterBrokerSequence });
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      messages.push(...batch);
+      const sequences = batch
+        .map((message) => message.brokerSequence)
+        .filter((sequence): sequence is number => typeof sequence === "number" && sequence > afterBrokerSequence);
+      if (sequences.length === 0 || batch.length < limit) break;
+      afterBrokerSequence = Math.max(...sequences);
+      // Yield between batches so a large offline inbox cannot starve live
+      // broker events or the session event loop.
+      await Promise.resolve();
+    }
+    return messages;
   }
 
   private drainPendingMessages(): void {

@@ -250,7 +250,7 @@ export class Coordinator {
       case "message.ack":
         return this.withEvents(events, this.ackMessage(this.requireActor(actorId).id, parseString(args.messageId, "messageId"), events));
       case "message.inbox":
-        return this.withEvents(events, this.inbox(this.requireActor(actorId).id, args.limit), events);
+        return this.withEvents(events, this.inbox(this.requireActor(actorId).id, args.limit, args.afterBrokerSequence), events);
       case "message.list":
         return this.withEvents(events, this.listMessages(this.requireActor(actorId).id, args), events);
       case "task.create":
@@ -547,6 +547,7 @@ export class Coordinator {
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
+    if (requestedStatus === "blocked") this.releaseAgentResourceClaims(actorId, "blocked", events);
     return publicAgent(next);
   }
 
@@ -596,6 +597,11 @@ export class Coordinator {
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
+
+    // A blocked context/provider turn is deliberately recoverable, but it is
+    // not making progress. Release mutable claims immediately so another actor
+    // can proceed while the task remains assigned for explicit recovery.
+    if (effectiveStatus === "blocked") this.releaseAgentResourceClaims(actorId, "blocked", events);
 
     let task = agent.taskId ? cloneTask(this.requireTask(agent.taskId)) : undefined;
     if (isTerminal(effectiveStatus)) {
@@ -676,7 +682,6 @@ export class Coordinator {
     const next = cloneAgent(agent);
     next.lastActivity = now;
     this.agents.set(actorId, next);
-    events.push({ type: "agent_updated", agent: cloneAgent(next) });
     let leases = 0;
     for (const resource of this.resources.values()) {
       let changed = false;
@@ -699,6 +704,10 @@ export class Coordinator {
         events.push({ type: "resource_changed", resource: cloneResource(resource) });
       }
     }
+    // Heartbeats without leases still refresh the in-memory liveness marker,
+    // but do not force a synchronous journal transaction every minute. Lease
+    // holders retain the durable agent update alongside their lease renewals.
+    if (leases > 0) events.push({ type: "agent_updated", agent: cloneAgent(next) });
     return { agent: publicAgent(next), leases };
   }
 
@@ -844,10 +853,19 @@ export class Coordinator {
     return cloneMessage(message);
   }
 
-  private inbox(actorId: AgentId, limit: unknown): AgentMessage[] {
+  private inbox(actorId: AgentId, limit: unknown, afterBrokerSequence?: unknown): AgentMessage[] {
     const max = Math.max(1, Math.min(100, Math.floor(parseNumber(limit, "limit", 50))));
-    return [...this.messages.values()]
+    const after = afterBrokerSequence === undefined ? undefined : parseNumber(afterBrokerSequence, "afterBrokerSequence", 0);
+    const pending = [...this.messages.values()]
       .filter((message) => message.to === actorId && message.acknowledgedAt === undefined)
+      .filter((message) => after === undefined || (message.brokerSequence ?? 0) > after);
+    if (after !== undefined) {
+      return pending
+        .sort((left, right) => (left.brokerSequence ?? 0) - (right.brokerSequence ?? 0) || left.id.localeCompare(right.id))
+        .slice(0, max)
+        .map(cloneMessage);
+    }
+    return pending
       .sort((left, right) => left.senderSequence - right.senderSequence || (left.brokerSequence ?? 0) - (right.brokerSequence ?? 0) || left.id.localeCompare(right.id))
       .slice(0, max)
       .map(cloneMessage);
@@ -944,6 +962,7 @@ export class Coordinator {
         task.blockedReason = parseString(args.reason, "reason", 4096);
         task.updatedAt = this.clock();
         events.push({ type: "task_changed", task: cloneTask(task) });
+        if (task.owner) this.releaseAgentResourceClaims(task.owner, "blocked", events);
         return cloneTask(task);
       case "ready":
       case "reopen":
@@ -1669,7 +1688,8 @@ export class Coordinator {
     }
   }
 
-  private releaseAgentRuntime(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
+  /** Release leases, waiters, and in-flight write fences without changing task ownership. */
+  private releaseAgentResourceClaims(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
     for (const resource of this.resources.values()) {
       let changed = false;
       const beforeShared = resource.sharedHolds.length;
@@ -1691,6 +1711,11 @@ export class Coordinator {
         events.push({ type: "resource_changed", resource: cloneResource(resource) });
       }
     }
+    this.drainWaiters(events);
+  }
+
+  private releaseAgentRuntime(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
+    this.releaseAgentResourceClaims(agentId, reason, events);
     let ownerTaskCleared = false;
     const owner = this.agents.get(agentId);
     for (const task of this.tasks.values()) {
@@ -1709,7 +1734,6 @@ export class Coordinator {
       events.push({ type: "task_changed", task: cloneTask(task) });
     }
     if (ownerTaskCleared && owner) events.push({ type: "agent_updated", agent: cloneAgent(owner) });
-    this.drainWaiters(events);
   }
 
   private drainWaiters(events: CoordinatorEvent[]): void {
