@@ -561,7 +561,7 @@ export class Coordinator {
     if (this.runningAgentCount() >= this.config.maxConcurrentAgents) {
       return { started: false, reason: "maxConcurrentAgents reached" };
     }
-    const routeLimit = modelRouteCapacity(this.config, agent.route);
+    const routeLimit = this.routeCapacityLimit(agent.route);
     if (routeLimit !== undefined && this.runningRouteCount(agent.route, agent.id) >= routeLimit) {
       return { started: false, reason: `model route capacity reached for ${modelRouteKey(agent.route)}` };
     }
@@ -2076,8 +2076,25 @@ export class Coordinator {
     return [...this.agents.values()].filter((agent) => agent.status === "running" && agent.id !== excludeAgentId && modelRouteCapacityKey(this.config, agent.route) === capacityKey).length;
   }
 
+  private routeCapacityLimit(route: ModelRoute): number | undefined {
+    const capacityKey = modelRouteCapacityKey(this.config, route);
+    const limits: number[] = [];
+    const requested = modelRouteCapacity(this.config, route);
+    if (requested !== undefined) limits.push(requested);
+    for (const agent of this.agents.values()) {
+      if (modelRouteCapacityKey(this.config, agent.route) !== capacityKey) continue;
+      const limit = modelRouteCapacity(this.config, agent.route);
+      if (limit !== undefined) limits.push(limit);
+    }
+    for (const policy of Object.values(this.config.modelRoutePolicies ?? {})) {
+      if (policy.capacityGroup !== capacityKey || policy.maxConcurrent === undefined) continue;
+      limits.push(policy.maxConcurrent);
+    }
+    return limits.length > 0 ? Math.min(...limits) : undefined;
+  }
+
   private assertRouteCapacity(route: ModelRoute, excludeAgentId?: string): void {
-    const limit = modelRouteCapacity(this.config, route);
+    const limit = this.routeCapacityLimit(route);
     if (limit !== undefined) {
       assertCondition(this.runningRouteCount(route, excludeAgentId) < limit, "AGENT_LIMIT_REACHED", `model route capacity reached for ${modelRouteKey(route)}`);
     }

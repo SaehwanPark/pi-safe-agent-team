@@ -243,13 +243,14 @@ test("capacity groups serialize semantic route aliases", () => {
     rootId: "fabric",
     config: {
       modelRoutePolicies: {
-        "alias-a/model": { maxConcurrent: 1, capacityGroup: "gpu-0" },
+        "alias-a/model": { maxConcurrent: 2, capacityGroup: "gpu-0" },
         "alias-b/model": { maxConcurrent: 1, capacityGroup: "gpu-0" },
       },
     },
   });
   registerRoot(coordinator, {}, routeA);
   const child = registerChild(coordinator, "alias-child", "root", {}, routeB);
+  const secondAliasChild = registerChild(coordinator, "alias-child-2", "root", {}, routeA);
   assert.equal(coordinator.dispatch("root", "agent.begin_turn", {}).value.started, true);
   assert.deepEqual(coordinator.dispatch(child.id, "agent.begin_turn", {}).value, {
     started: false,
@@ -257,6 +258,7 @@ test("capacity groups serialize semantic route aliases", () => {
   });
   coordinator.dispatch("root", "agent.end_turn", { status: "ready" });
   assert.equal(coordinator.dispatch(child.id, "agent.begin_turn", {}).value.started, true);
+  assert.equal(coordinator.dispatch(secondAliasChild.id, "agent.begin_turn", {}).value.started, false);
 });
 
 test("message dedupe returns the original message", () => {
