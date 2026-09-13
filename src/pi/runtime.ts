@@ -151,6 +151,8 @@ export class FabricRuntime {
   private caseInsensitivePaths?: boolean;
   private sessionId?: string;
   private draining = false;
+  /** Invalidates in-flight spawns when a shutdown begins, even after draining ends. */
+  private lifecycleEpoch = 0;
   private lastHandoffSnapshots: HandoffSnapshot[] = [];
 
   static readonly shutdownRpcTimeoutMs = 1_500;
@@ -517,12 +519,12 @@ export class FabricRuntime {
   async spawnFromRoot(input: SpawnToolInput, parentModel?: Model<any>, parentThinking?: string): Promise<SpawnedAgentSummary> {
     if (!this.root || !this.modelRegistry) throw new FabricError("BROKER_UNAVAILABLE", "Fabric root is not attached");
     if (this.draining) throw new FabricError("LIFECYCLE_CONFLICT", "The fabric is draining; new children are not admitted");
-    return this.spawnChild(this.root.agentId, this.root.client, input, parentModel ?? this.root.ctx.model, parentThinking ?? this.root.ctx.thinkingLevel ?? "medium", this.root.ctx.cwd);
+    return this.spawnChild(this.root.agentId, this.root.client, input, parentModel ?? this.root.ctx.model, parentThinking ?? this.root.ctx.thinkingLevel ?? "medium", this.root.ctx.cwd, this.lifecycleEpoch);
   }
 
   async spawnChildFrom(parent: ManagedChild, input: SpawnToolInput): Promise<SpawnedAgentSummary> {
     if (this.draining) throw new FabricError("LIFECYCLE_CONFLICT", "The fabric is draining; new children are not admitted");
-    return this.spawnChild(parent.agentId, parent.client, input, parent.session?.model, parent.session?.thinkingLevel ?? "medium", parent.workspacePath);
+    return this.spawnChild(parent.agentId, parent.client, input, parent.session?.model, parent.session?.thinkingLevel ?? "medium", parent.workspacePath, this.lifecycleEpoch);
   }
 
   /**
@@ -534,6 +536,7 @@ export class FabricRuntime {
     const reason = options.reason ?? "descendants-aborted";
     const mode = options.mode ?? "graceful";
     if (this.draining) return this.handoffSnapshots;
+    this.lifecycleEpoch += 1;
     this.draining = true;
     const root = this.root;
     const children = [...this.children.values()];
@@ -616,6 +619,7 @@ export class FabricRuntime {
 
   async stop(): Promise<void> {
     if (this.stopped) return;
+    this.lifecycleEpoch += 1;
     this.stopped = true;
     this.draining = true;
     if (this.rootHeartbeatTimer) clearInterval(this.rootHeartbeatTimer);
@@ -698,6 +702,7 @@ export class FabricRuntime {
     parentModel: Model<any> | undefined,
     parentThinking: string,
     cwd: string,
+    spawnEpoch: number,
   ): Promise<SpawnedAgentSummary> {
     if (!this.modelRegistry) throw new FabricError("MODEL_ROUTE_INVALID", "Model registry is unavailable");
     const role = input.role ? this.roles[input.role] : undefined;
@@ -716,6 +721,7 @@ export class FabricRuntime {
     });
     let workspace: AgentRecord["workspace"] | undefined;
     try {
+      this.assertSpawnEpoch(spawnEpoch);
       workspace = await this.workspaceStrategy.create({
         mode: input.workspace ?? "shared",
         cwd,
@@ -723,7 +729,9 @@ export class FabricRuntime {
         agentId: spawned.agent.id,
         baseRef: input.baseRef,
       });
+      this.assertSpawnEpoch(spawnEpoch);
       await parentClient.request("agent.configure_child", { agentId: spawned.agent.id, workspace });
+      this.assertSpawnEpoch(spawnEpoch);
     } catch (error) {
       await parentClient.request("agent.cancel", { agentId: spawned.agent.id }).catch(() => undefined);
       if (workspace?.mode === "worktree") {
@@ -749,7 +757,9 @@ export class FabricRuntime {
     });
     this.children.set(child.agentId, child);
     try {
+      this.assertSpawnEpoch(spawnEpoch);
       await child.start();
+      this.assertSpawnEpoch(spawnEpoch);
     } catch (error) {
       await parentClient.request("agent.cancel", { agentId: child.agentId }).catch(() => undefined);
       await child.stop().catch(() => undefined);
@@ -765,6 +775,12 @@ export class FabricRuntime {
       contextMode: child.contextMode,
       summaryText,
     };
+  }
+
+  private assertSpawnEpoch(spawnEpoch: number): void {
+    if (this.draining || spawnEpoch !== this.lifecycleEpoch) {
+      throw new FabricError("LIFECYCLE_CONFLICT", "The fabric shutdown invalidated this child spawn");
+    }
   }
 
   private async reconnectRoot(): Promise<void> {
