@@ -66,24 +66,68 @@ export class BrokerClient {
     }
   }
 
-  async request<T = unknown>(op: string, args: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
+  async request<T = unknown>(
+    op: string,
+    args: Record<string, unknown> = {},
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (signal?.aborted) {
+      throw new FabricError("BROKER_UNAVAILABLE", `Broker request ${op} aborted`);
+    }
     await this.connect();
+    if (signal?.aborted) {
+      throw new FabricError("BROKER_UNAVAILABLE", `Broker request ${op} aborted`);
+    }
     const socket = this.socket;
     if (!socket || socket.destroyed) throw new FabricError("BROKER_UNAVAILABLE", "Broker connection is not available");
     const id = `request-${randomUUID()}`;
     const frame: RequestFrame = { id, version: PROTOCOL_VERSION, op, args };
     const effectiveTimeoutMs = timeoutMs ?? this.requestTimeoutMs;
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      let onAbort: (() => void) | undefined;
+      const cleanup = () => {
+        clearTimeout(timer);
         this.pending.delete(id);
+        if (signal && onAbort) {
+          signal.removeEventListener("abort", onAbort);
+        }
+      };
+
+      const timer = setTimeout(() => {
+        cleanup();
         reject(new FabricError("BROKER_UNAVAILABLE", `Broker request ${op} timed out`));
       }, effectiveTimeoutMs);
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
+
+      if (signal) {
+        if (signal.aborted) {
+          cleanup();
+          reject(new FabricError("BROKER_UNAVAILABLE", `Broker request ${op} aborted`));
+          return;
+        }
+        onAbort = () => {
+          cleanup();
+          reject(new FabricError("BROKER_UNAVAILABLE", `Broker request ${op} aborted`));
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      this.pending.set(id, {
+        resolve: (value: unknown) => {
+          cleanup();
+          (resolve as (value: unknown) => void)(value);
+        },
+        reject: (error: unknown) => {
+          cleanup();
+          reject(error);
+        },
+        timer,
+      });
+
       try {
         socket.write(`${JSON.stringify(frame)}\n`);
       } catch (error) {
-        clearTimeout(timer);
-        this.pending.delete(id);
+        cleanup();
         reject(new FabricError("BROKER_UNAVAILABLE", error instanceof Error ? error.message : String(error)));
       }
     });
@@ -96,14 +140,20 @@ export class BrokerClient {
    * the retry replays the original response instead of duplicating the child
    * or task. Deterministic business errors are never retried.
    */
-  async requestIdempotent<T = unknown>(op: string, args: Record<string, unknown> = {}, operationId?: string, timeoutMs?: number): Promise<T> {
+  async requestIdempotent<T = unknown>(
+    op: string,
+    args: Record<string, unknown> = {},
+    operationId?: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const id = operationId ?? `op-${randomUUID()}`;
     for (let attempt = 0; ; attempt += 1) {
       try {
         const timeout = attempt === 0 ? timeoutMs : Math.max(timeoutMs ?? this.requestTimeoutMs, this.requestTimeoutMs);
-        return await this.request<T>(op, { ...args, operationId: id }, timeout);
+        return await this.request<T>(op, { ...args, operationId: id }, timeout, signal);
       } catch (error) {
-        if (attempt >= 1 || !isAmbiguousBrokerFailure(error)) throw error;
+        if (attempt >= 1 || signal?.aborted || !isAmbiguousBrokerFailure(error)) throw error;
       }
     }
   }

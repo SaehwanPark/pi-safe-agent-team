@@ -222,3 +222,49 @@ test("broker client request timeout can be updated on client instance", () => {
   assert.equal(client.requestTimeoutMs, 2_000);
 });
 
+test("broker client request aborts with AbortSignal and cleans up pending request", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-broker-abort-"));
+  const server = new BrokerServer({ directory, rootId: "fabric", rootAgentId: "root", maintenanceMs: 60_000 });
+  await server.start();
+  const client = new BrokerClient({ endpoint: server.endpoint, agentId: "root" });
+  try {
+    await client.connect();
+    await client.request("agent.register", { rootId: "fabric", role: "root", route });
+
+    const controller = new AbortController();
+    const requestPromise = client.request("fabric.status", {}, 10_000, controller.signal);
+    controller.abort();
+
+    await assert.rejects(
+      requestPromise,
+      (error: any) => {
+        assert.equal(error.code, "BROKER_UNAVAILABLE");
+        assert.match(error.message, /aborted/);
+        return true;
+      },
+    );
+
+    // Ensure pending request map is clean
+    assert.equal((client as any).pending.size, 0);
+
+    // Pre-aborted signal should reject immediately
+    const preAborted = new AbortController();
+    preAborted.abort();
+    await assert.rejects(
+      async () => {
+        await client.request("fabric.status", {}, 10_000, preAborted.signal);
+      },
+      (error: any) => {
+        assert.equal(error.code, "BROKER_UNAVAILABLE");
+        assert.match(error.message, /aborted/);
+        return true;
+      },
+    );
+    assert.equal((client as any).pending.size, 0);
+  } finally {
+    client.close();
+    await server.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+

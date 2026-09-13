@@ -47,6 +47,7 @@ export function getInteropProvider<T = unknown>(name: string): T | undefined {
 export interface FabricSnapshotRequest {
   cwd: string;
   sessionId?: string;
+  signal?: AbortSignal;
 }
 
 export interface FabricTaskSnapshot {

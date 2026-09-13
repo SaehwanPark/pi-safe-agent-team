@@ -460,3 +460,32 @@ test("fabric-state: case-sensitivity check is cached and does not repeatedly pro
   assert.equal((runtime as any).caseInsensitivePaths, true);
 });
 
+test("fabric-state: aborted signal passes to status and yields uncertain snapshot", async () => {
+  const runtime = new FabricRuntime({ cwd: "/test/repo", startBroker: false });
+  (runtime as any).root = {
+    agentId: "root-1",
+    ctx: { cwd: "/test/repo", sessionId: "sess-1" },
+  };
+  let receivedSignal: AbortSignal | undefined;
+  (runtime as any).status = async (signal?: AbortSignal) => {
+    receivedSignal = signal;
+    if (signal?.aborted) {
+      throw new Error("aborted");
+    }
+    return makeMockStatus();
+  };
+
+  const controller = new AbortController();
+  controller.abort();
+  const snapshot = await runtime.getFabricStateSnapshot({
+    cwd: "/test/repo",
+    sessionId: "sess-1",
+    signal: controller.signal,
+  });
+  assert.ok(snapshot);
+  assert.equal(receivedSignal, controller.signal);
+  assert.equal(snapshot.state, "uncertain");
+  assert.equal(snapshot.quiescent, false);
+  assert.deepEqual(snapshot.quiescenceReasons, ["broker_status_query_failed"]);
+});
+
