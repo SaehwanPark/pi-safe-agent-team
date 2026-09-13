@@ -93,6 +93,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     const state = rootDeliveryStates.get(message.id);
     if (state === "acknowledged" || state === "delivering") return;
     if (state === "accepted") {
+      if (epoch !== rootDeliveryEpoch) return;
       void runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs).then(() => rememberRootMessage(message.id, "acknowledged")).catch(() => undefined);
       return;
     }

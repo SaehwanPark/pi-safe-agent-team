@@ -339,6 +339,7 @@ export class FabricRuntime {
   /** Coordinate a root-session file mutation against live borrowing state. */
   async guardRootMutation(toolName: string, input: unknown, workspacePath: string): Promise<RootWriteGuardOutcome | undefined> {
     if (!this.root) return undefined;
+    if (this.draining) return { block: true, reason: "safe-agents blocked root writes while the fabric is draining descendants" };
     return evaluateRootWriteGuard({ client: this.root.client, workspacePath }, toolName, input);
   }
 
@@ -351,6 +352,7 @@ export class FabricRuntime {
   /** Coordinate a root-session shell command against live child holds. */
   async guardRootShell(input: unknown, workspacePath: string): Promise<RootWriteGuardOutcome | undefined> {
     if (!this.root) return undefined;
+    if (this.draining) return { block: true, reason: "safe-agents blocked root shell commands while the fabric is draining descendants" };
     return evaluateRootShellGuard({ client: this.root.client, workspacePath }, input);
   }
 
@@ -428,6 +430,7 @@ export class FabricRuntime {
       const activeWriteFences = status.activeFences ?? 0;
 
       const quiescenceReasons: string[] = [];
+      if (this.draining) quiescenceReasons.push("fabric_draining");
       if (rootBusy) quiescenceReasons.push("root_agent_active_or_running");
       if (runningChildren > 0) quiescenceReasons.push("running_children_active");
       if (unresolvedChildTasks > 0) quiescenceReasons.push("unresolved_child_tasks");
