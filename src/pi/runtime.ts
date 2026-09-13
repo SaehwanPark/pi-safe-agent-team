@@ -1170,7 +1170,7 @@ export class FabricRuntime {
   }
 
   private handleRootEvent(event: { event: string; data: unknown }): void {
-    if (event.event !== "message_sent") return;
+    if (event.event !== "message_sent" && event.event !== "message_updated") return;
     const data = event.data as { message?: AgentMessage };
     const message = data.message;
     if (!message || message.to !== this.root?.agentId) return;
@@ -1673,7 +1673,14 @@ export class ManagedChild {
 
   private requestLifecycle<T = unknown>(operation: string, args: Record<string, unknown>, operationId: string): Promise<T> {
     const retry = (this.client as unknown as { requestIdempotent?: (...input: any[]) => Promise<unknown> }).requestIdempotent;
-    if (typeof retry === "function") return retry.call(this.client, operation, args, operationId) as Promise<T>;
+    if (typeof retry === "function") {
+      return (retry.call(this.client, operation, args, operationId) as Promise<T>).catch((error) => {
+        if (error instanceof FabricError && error.code === "INVALID_ARGUMENT" && /operationId.*supported/i.test(error.message)) {
+          return this.client.request<T>(operation, args);
+        }
+        throw error;
+      });
+    }
     // Lightweight lifecycle fakes used by hosts/tests may expose only request;
     // retain compatibility while production BrokerClient gets durable replay.
     return this.client.request<T>(operation, args);
@@ -1936,7 +1943,7 @@ export class ManagedChild {
       }
       return;
     }
-    if (event.event !== "message_sent") return;
+    if (event.event !== "message_sent" && event.event !== "message_updated") return;
     const message = (event.data as { message?: AgentMessage }).message;
     if (!message || message.to !== this.agentId) return;
     if (!this.session) {
