@@ -540,6 +540,14 @@ export class Coordinator {
     // terminal; an uncompleted task can only leave the worker ready.
     const effectiveStatus = this.statusAfterTask(agent, requested);
     if (effectiveStatus === "completed") this.assertNoLiveDescendants(agent.id);
+
+    // Tear down a failed or cancelled subtree before the parent terminal
+    // update becomes observable. This preserves the no-orphan invariant for
+    // readers that process the emitted events in order.
+    if (effectiveStatus === "failed" || effectiveStatus === "cancelled") {
+      this.cancelDescendants(agent.id, effectiveStatus === "cancelled" ? "Parent was cancelled" : "Parent failed", events);
+    }
+
     const next = cloneAgent(agent);
     this.transitionStatus(next, effectiveStatus, parseOptionalString(args.statusReason, "statusReason", 2048));
     if (isTerminal(effectiveStatus)) next.reconnectable = false;
@@ -549,12 +557,6 @@ export class Coordinator {
 
     let task = agent.taskId ? cloneTask(this.requireTask(agent.taskId)) : undefined;
     if (isTerminal(effectiveStatus)) {
-      // A terminal parent may not orphan a live subtree. Cancellation and
-      // failure cascade child-first so descendants release requests, tasks,
-      // leases, and fences before the parent becomes observable as terminal.
-      if (effectiveStatus === "failed" || effectiveStatus === "cancelled") {
-        this.cancelDescendants(agent.id, effectiveStatus === "cancelled" ? "Parent was cancelled" : "Parent failed", events);
-      }
       this.cancelRequestsFor(actorId, effectiveStatus === "cancelled" ? "cancelled" : "failed", `Agent ${actorId} became ${effectiveStatus}`, events);
       // Every terminal state releases runtime claims. Successful task facts
       // remain durable, but a completed worker must not keep a lease alive.

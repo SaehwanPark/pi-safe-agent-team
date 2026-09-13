@@ -73,7 +73,11 @@ test("failed parents cascade cancellation to every descendant", () => {
   registerRoot(coordinator);
   const child = coordinator.dispatch("root", "agent.spawn", { route, capabilities: { maySpawn: true } }).value.agent as AgentRecord;
   const grandchild = coordinator.dispatch(child.id, "agent.spawn", { route }).value.agent as AgentRecord;
-  coordinator.dispatch(child.id, "agent.end_turn", { status: "failed", statusReason: "provider failed" });
+  const failed = coordinator.dispatch(child.id, "agent.end_turn", { status: "failed", statusReason: "provider failed" });
+  assert.deepEqual(
+    failed.events.filter((event) => event.type === "agent_updated").map((event) => [event.agent.id, event.agent.status]),
+    [[grandchild.id, "cancelled"], [child.id, "failed"]],
+  );
   assert.equal(coordinator.dispatch("root", "agent.status", { agentId: child.id }).value.status, "failed");
   assert.equal(coordinator.dispatch("root", "agent.status", { agentId: grandchild.id }).value.status, "cancelled");
 });

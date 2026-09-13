@@ -498,8 +498,8 @@ export class FabricRuntime {
     }
   }
 
-  async status(signal?: AbortSignal): Promise<unknown> {
-    return this.request("fabric.status", {}, undefined, signal);
+  async status(signal?: AbortSignal, timeoutMs?: number): Promise<unknown> {
+    return this.request("fabric.status", {}, timeoutMs, signal);
   }
 
   async modelRuntimeForChildren(): Promise<ModelRuntime> {
@@ -560,6 +560,7 @@ export class FabricRuntime {
       // A child abort is cooperative. Ensure disposal still happens if a
       // provider ignored the abort promise or the grace deadline elapsed.
       for (const child of children) child.disposeNow();
+      this.children.clear();
       void all;
       return this.handoffSnapshots;
     } finally {
@@ -567,8 +568,8 @@ export class FabricRuntime {
     }
   }
 
-  private async captureHandoffSnapshots(reason: string): Promise<HandoffSnapshot[]> {
-    const status = (await this.status()) as FabricStatus;
+  private async captureHandoffSnapshots(reason: string, timeoutMs = FabricRuntime.shutdownRpcTimeoutMs): Promise<HandoffSnapshot[]> {
+    const status = (await this.status(undefined, timeoutMs)) as FabricStatus;
     const tasksById = new Map(status.tasks.map((task) => [task.id, task]));
     const requestsByAgent = new Map<string, string[]>();
     for (const request of status.pendingRequests) {
