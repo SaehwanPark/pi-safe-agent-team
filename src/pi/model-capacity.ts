@@ -1,5 +1,5 @@
 import type { ModelRoute, FabricConfig } from "../core/types.ts";
-import { modelRouteCapacity, modelRouteKey } from "../core/coordinator-wire.ts";
+import { modelRouteCapacity, modelRouteCapacityKey } from "../core/coordinator-wire.ts";
 
 interface Waiter {
   resolve: (release: () => void) => void;
@@ -17,6 +17,7 @@ export class ModelRouteCapacityArbiter {
   private readonly config: FabricConfig;
   private readonly active = new Map<string, number>();
   private readonly waiters = new Map<string, Waiter[]>();
+  private readonly limits = new Map<string, number | undefined>();
   private closed = false;
 
   constructor(config: FabricConfig) {
@@ -28,12 +29,13 @@ export class ModelRouteCapacityArbiter {
   }
 
   activeCount(route: ModelRoute): number {
-    return this.active.get(modelRouteKey(route)) ?? 0;
+    return this.active.get(modelRouteCapacityKey(this.config, route)) ?? 0;
   }
 
   async acquire(route: ModelRoute, signal?: AbortSignal): Promise<() => void> {
-    const key = modelRouteKey(route);
+    const key = modelRouteCapacityKey(this.config, route);
     const limit = this.capacity(route);
+    this.limits.set(key, limit);
     if (limit === undefined) return () => undefined;
     if (this.closed) throw new Error("model route capacity arbiter is closed");
     if ((this.active.get(key) ?? 0) < limit) return this.grant(key);
@@ -117,7 +119,6 @@ export class ModelRouteCapacityArbiter {
   }
 
   private capacityFromKey(key: string): number | undefined {
-    const [provider, ...model] = key.split("/");
-    return this.capacity({ provider, model: model.join("/"), thinking: "off" });
+    return this.limits.get(key);
   }
 }

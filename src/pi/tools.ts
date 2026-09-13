@@ -15,6 +15,7 @@ export interface SpawnToolInput {
   model?: string;
   provider?: string;
   thinking?: string;
+  capacityGroup?: string;
   taskDescription?: string;
   taskId?: string;
   workspace?: "shared" | "worktree";
@@ -98,7 +99,10 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
       name: "agent_inbox",
       label: "Agent inbox",
       description: "Read pending durable messages. Reading does not acknowledge them; acknowledge after the session has accepted them.",
-      parameters: Type.Object({ limit: Type.Optional(Type.Number()) }),
+      parameters: Type.Object({
+        limit: Type.Optional(Type.Number()),
+        afterBrokerSequence: Type.Optional(Type.Number({ description: "Only return messages after this broker sequence when draining a recovered inbox" })),
+      }),
       async execute(_toolCallId, params: any): Promise<AgentToolResult<unknown>> {
         return textResult(await client.request("message.inbox", params));
       },
@@ -192,6 +196,7 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
         provider: Type.Optional(Type.String()),
         model: Type.Optional(Type.String()),
         thinking: Type.Optional(Type.String()),
+        capacityGroup: Type.Optional(Type.String({ description: "Physical backend capacity identity shared by route aliases" })),
         taskDescription: Type.Optional(Type.String()),
         taskId: Type.Optional(Type.String()),
         workspace: Type.Optional(Type.Union([Type.Literal("shared"), Type.Literal("worktree")])),
@@ -213,9 +218,10 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
 
 export function routeFromSpawnInput(input: SpawnToolInput, fallback: ModelRoute): { route: ModelRoute; capabilities: Record<string, boolean> } {
   const route: ModelRoute = {
-    provider: input.provider ?? fallback.provider,
-    model: input.model ?? fallback.model,
-    thinking: (input.thinking as ModelRoute["thinking"] | undefined) ?? fallback.thinking,
+      provider: input.provider ?? fallback.provider,
+      model: input.model ?? fallback.model,
+      thinking: (input.thinking as ModelRoute["thinking"] | undefined) ?? fallback.thinking,
+      ...(input.capacityGroup ? { capacityGroup: input.capacityGroup } : {}),
   };
   const capabilities: Record<string, boolean> = {};
   for (const key of ["maySpawn", "mayMessagePeers", "mayEscalate", "mayTransferOwnership", "mayWriteRepo", "mayUseShell"] as const) {

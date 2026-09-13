@@ -26,6 +26,7 @@ export interface RoleConfig {
   model?: string;
   provider?: string;
   thinking?: ThinkingLevel;
+  capacityGroup?: string;
   capabilities?: Partial<AgentRecord["capabilities"]>;
 }
 
@@ -163,6 +164,8 @@ export class FabricRuntime {
   private rootCompactionReleases: Array<(() => void) | undefined> = [];
   private rootCompactionBrokerReservations: boolean[] = [];
   private rootCompactionEpoch = 0;
+  private rootModelCapacityRelease?: () => void;
+  private rootModelCapacityController?: AbortController;
   private rootContextHealth: "healthy" | "degraded" = "healthy";
   private rootContextDiagnostic?: string;
   private drainPromise?: Promise<readonly HandoffSnapshot[]>;
@@ -219,6 +222,9 @@ export class FabricRuntime {
     this.cwd = canonicalWorkspacePath(options.cwd ?? process.cwd());
     this.agentDir = options.agentDir ?? getAgentDir();
     const loadedConfig = loadFabricConfig({ cwd: this.cwd, agentDir: this.agentDir });
+    if (loadedConfig.errors.length > 0) {
+      throw new FabricError("INVALID_ARGUMENT", `Safe-agents configuration could not be loaded: ${loadedConfig.errors.join("; ")}`);
+    }
     this.config = { ...loadedConfig.config, ...(options.config ?? {}) };
     this.caseInsensitivePaths = options.config?.caseInsensitivePaths;
     this.workspaceStrategy = options.workspaceStrategy ?? new GitWorkspaceStrategy();
@@ -328,6 +334,31 @@ export class FabricRuntime {
 
   async withModelRouteCapacity<T>(route: ModelRoute, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     return this.modelCapacity.withCapacity(route, operation, signal);
+  }
+
+  /** Hold the process-local route permit for one normal root provider run. */
+  async beginRootModelTurnCapacity(signal?: AbortSignal): Promise<void> {
+    if (!this.root?.ctx.model || this.rootModelCapacityRelease) return;
+    const route = routeFromModel(this.root.ctx.model, this.root.ctx.thinkingLevel ?? "medium");
+    const controller = new AbortController();
+    this.rootModelCapacityController = controller;
+    const onAbort = () => controller.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      this.rootModelCapacityRelease = await this.modelCapacity.acquire(route, controller.signal);
+    } catch (error) {
+      this.rootModelCapacityController = undefined;
+      throw error;
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  async endRootModelTurnCapacity(): Promise<void> {
+    this.rootModelCapacityController?.abort();
+    this.rootModelCapacityController = undefined;
+    this.rootModelCapacityRelease?.();
+    this.rootModelCapacityRelease = undefined;
   }
 
   getEffectivePrefillBudget(route: ModelRoute, logicalContextWindow?: number): number | undefined {
@@ -828,6 +859,7 @@ export class FabricRuntime {
     this.stopped = true;
     this.draining = true;
     this.resetRootCompactionState();
+    await this.endRootModelTurnCapacity();
     if (this.rootHeartbeatTimer) clearInterval(this.rootHeartbeatTimer);
     this.rootEventUnsubscribe?.();
     this.rootCloseUnsubscribe?.();
@@ -916,6 +948,7 @@ export class FabricRuntime {
       provider: input.provider,
       model: input.model,
       thinking: input.thinking as ThinkingLevel | undefined,
+      capacityGroup: input.capacityGroup,
     }, role, this.options.defaults, parentModel, parentThinking as ThinkingLevel);
     // Idempotent: an ambiguous transport failure here must not create a second child.
     const spawned = await parentClient.requestIdempotent<{ agent: AgentRecord; token: string; taskId?: string }>("agent.spawn", {
@@ -1012,7 +1045,7 @@ export class FabricRuntime {
           });
           this.rootToken = refreshed.token;
           this.root.client.setIdentity(this.root.agentId, refreshed.token);
-          const inbox = await this.root.client.request<AgentMessage[]>("message.inbox", { limit: 100 });
+          const inbox = await this.drainRootInbox();
           for (const message of inbox) this.rootDelivery?.(message);
           return;
         } catch (error) {
@@ -1024,10 +1057,29 @@ export class FabricRuntime {
           delay = Math.min(5_000, delay * 2);
         }
       }
-    })().finally(() => {
+  })().finally(() => {
       this.rootReconnectPromise = undefined;
     });
     return this.rootReconnectPromise;
+  }
+
+  private async drainRootInbox(): Promise<AgentMessage[]> {
+    if (!this.root) return [];
+    const messages: AgentMessage[] = [];
+    let afterBrokerSequence = 0;
+    const limit = 100;
+    while (!this.stopped && this.root) {
+      const batch = await this.root.client.request<AgentMessage[]>("message.inbox", { limit, afterBrokerSequence });
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      messages.push(...batch);
+      const sequences = batch
+        .map((message) => message.brokerSequence)
+        .filter((sequence): sequence is number => typeof sequence === "number" && sequence > afterBrokerSequence);
+      if (sequences.length === 0 || batch.length < limit) break;
+      afterBrokerSequence = Math.max(...sequences);
+      await Promise.resolve();
+    }
+    return messages;
   }
 
   private booleanCapabilities(input: SpawnToolInput): Record<string, boolean> {

@@ -192,7 +192,7 @@ export function modelRouteKey(route: Pick<ModelRoute, "provider" | "model">): st
   return `${route.provider}/${route.model}`;
 }
 
-function configuredRouteValue(config: FabricConfig, key: string): { maxConcurrent?: number; effectivePrefillBudget?: number } | undefined {
+function configuredRouteValue(config: FabricConfig, key: string): { maxConcurrent?: number; effectivePrefillBudget?: number; capacityGroup?: string } | undefined {
   const direct = config.modelRoutePolicies?.[key];
   if (direct) return direct;
   const aliases = [config.modelRouteCapacity?.[key], config.modelRouteCapacities?.[key]];
@@ -208,7 +208,7 @@ function localProvider(provider: string): boolean {
 }
 
 /** Resolve route policy, including a conservative one-turn default for local runtimes. */
-export function modelRoutePolicy(config: FabricConfig, route: Pick<ModelRoute, "provider" | "model">): { maxConcurrent?: number; effectivePrefillBudget?: number } {
+export function modelRoutePolicy(config: FabricConfig, route: Pick<ModelRoute, "provider" | "model" | "capacityGroup">): { maxConcurrent?: number; effectivePrefillBudget?: number; capacityGroup?: string } {
   const key = modelRouteKey(route);
   const providerKey = route.provider;
   const wildcard = "*";
@@ -220,17 +220,25 @@ export function modelRoutePolicy(config: FabricConfig, route: Pick<ModelRoute, "
     return {
       maxConcurrent: configured.maxConcurrent ?? (localProvider(route.provider) ? 1 : undefined),
       effectivePrefillBudget: configured.effectivePrefillBudget,
+      ...((configured.capacityGroup ?? route.capacityGroup) ? { capacityGroup: configured.capacityGroup ?? route.capacityGroup } : {}),
     };
   }
-  return localProvider(route.provider) ? { maxConcurrent: 1 } : {};
+  return localProvider(route.provider)
+    ? { maxConcurrent: 1, ... (route.capacityGroup ? { capacityGroup: route.capacityGroup } : {}) }
+    : route.capacityGroup ? { capacityGroup: route.capacityGroup } : {};
 }
 
-export function modelRouteCapacity(config: FabricConfig, route: Pick<ModelRoute, "provider" | "model">): number | undefined {
+/** Physical capacity identity used by the broker/local arbiter. */
+export function modelRouteCapacityKey(config: FabricConfig, route: Pick<ModelRoute, "provider" | "model" | "capacityGroup">): string {
+  return modelRoutePolicy(config, route).capacityGroup ?? modelRouteKey(route);
+}
+
+export function modelRouteCapacity(config: FabricConfig, route: Pick<ModelRoute, "provider" | "model" | "capacityGroup">): number | undefined {
   const value = modelRoutePolicy(config, route).maxConcurrent;
   return value !== undefined && value > 0 ? Math.floor(value) : undefined;
 }
 
-export function effectivePrefillBudget(config: FabricConfig, route: Pick<ModelRoute, "provider" | "model">, logicalContextWindow: number | undefined): number | undefined {
+export function effectivePrefillBudget(config: FabricConfig, route: Pick<ModelRoute, "provider" | "model" | "capacityGroup">, logicalContextWindow: number | undefined): number | undefined {
   const configured = modelRoutePolicy(config, route).effectivePrefillBudget;
   if (configured === undefined || !Number.isFinite(configured) || configured <= 0) return logicalContextWindow;
   if (logicalContextWindow === undefined || !Number.isFinite(logicalContextWindow) || logicalContextWindow <= 0) return Math.floor(configured);

@@ -5,6 +5,7 @@ export interface RouteSource {
   model?: string;
   provider?: string;
   thinking?: ThinkingLevel;
+  capacityGroup?: string;
 }
 
 export interface RouteResolutionInput {
@@ -53,6 +54,7 @@ export function resolveRoute(input: RouteResolutionInput): ResolvedRoute {
       provider: selected.value.provider ?? embeddedProvider ?? parentOrGlobal?.provider ?? "",
       model,
       thinking,
+      ...(selected.value.capacityGroup ?? parentOrGlobal?.capacityGroup ? { capacityGroup: selected.value.capacityGroup ?? parentOrGlobal?.capacityGroup } : {}),
       source: selected.source,
     };
   }
