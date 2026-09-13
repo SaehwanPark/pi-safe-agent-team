@@ -131,6 +131,8 @@ export interface EmbeddedContextUsage {
   logicalContextWindow?: number | null;
   /** Hardware-safe operational prefill budget, if known. */
   effectiveContextBudget?: number | null;
+  /** Compatibility alias used by newer local-context-manager hosts. */
+  effectivePrefillBudget?: number | null;
   /** Provider integrations may use their own bounded provenance labels. */
   source: string;
 }

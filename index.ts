@@ -284,6 +284,8 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     rootDeliveryEpoch += 1;
     rootDeliveryTail = Promise.resolve();
+    rootDeliveryStates.clear();
+    runtime.setPendingRootDeliveriesCount(0);
     deferredRootMessages.clear();
     deferredRootPersisted.clear();
     deferredRootRunMessages.clear();
