@@ -90,7 +90,12 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     // Runtime test hosts may provide only the ordinary request surface. The
     // real BrokerClient path uses the durable coordinator replay record.
     if (runtime.client && typeof runtime.client.requestIdempotent === "function") {
-      return runtime.requestIdempotent<T>(operation, args, operationId, FabricRuntime.shutdownRpcTimeoutMs);
+      return runtime.requestIdempotent<T>(operation, args, operationId, FabricRuntime.shutdownRpcTimeoutMs).catch((error) => {
+        if (error instanceof FabricError && error.code === "INVALID_ARGUMENT" && /operationId.*supported/i.test(error.message)) {
+          return runtime.request<T>(operation, args, FabricRuntime.shutdownRpcTimeoutMs);
+        }
+        throw error;
+      });
     }
     return runtime.request<T>(operation, args, FabricRuntime.shutdownRpcTimeoutMs);
   };

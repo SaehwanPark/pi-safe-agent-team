@@ -986,9 +986,7 @@ export class Coordinator {
       case "reopen":
         assertCondition(!isTaskTerminal(task.status) || action === "reopen", "LIFECYCLE_CONFLICT", `Task ${task.id} cannot be reopened from ${task.status}`);
         if (action === "reopen" && task.status === "completed") {
-          const dependents = [...this.tasks.values()].filter((candidate) =>
-            candidate.id !== task.id && candidate.dependencies.includes(task.id) && !isTaskTerminal(candidate.status),
-          );
+          const dependents = this.taskDependents(task.id);
           assertCondition(
             dependents.length === 0,
             "LIFECYCLE_CONFLICT",
@@ -2146,6 +2144,23 @@ export class Coordinator {
 
   private taskDependenciesCompleted(task: TaskRecord): boolean {
     return task.dependencies.every((dependency) => this.tasks.get(dependency)?.status === "completed");
+  }
+
+  /** Return every non-cancelled downstream task, including transitive dependents. */
+  private taskDependents(taskId: TaskId): TaskRecord[] {
+    const dependents: TaskRecord[] = [];
+    const seen = new Set<TaskId>([taskId]);
+    const queue: TaskId[] = [taskId];
+    while (queue.length > 0) {
+      const prerequisite = queue.shift() as TaskId;
+      for (const candidate of this.tasks.values()) {
+        if (seen.has(candidate.id) || !candidate.dependencies.includes(prerequisite)) continue;
+        seen.add(candidate.id);
+        queue.push(candidate.id);
+        if (candidate.status !== "cancelled") dependents.push(candidate);
+      }
+    }
+    return dependents;
   }
 
   /**

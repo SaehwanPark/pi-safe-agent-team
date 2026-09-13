@@ -87,9 +87,17 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
           // stable default dedupe key even when the model omitted one.
           clientDedupeKey: params.clientDedupeKey ?? `tool:${_toolCallId}`,
         };
-        const result = typeof client.requestIdempotent === "function"
-          ? await client.requestIdempotent("message.send", request, `tool:${_toolCallId}`)
-          : await client.request("message.send", request);
+        let result: any;
+        if (typeof client.requestIdempotent === "function") {
+          try {
+            result = await client.requestIdempotent("message.send", request, `tool:${_toolCallId}`);
+          } catch (error) {
+            if (!(error instanceof FabricError) || error.code !== "INVALID_ARGUMENT" || !/operationId.*supported/i.test(error.message)) throw error;
+            result = await client.request("message.send", request);
+          }
+        } else {
+          result = await client.request("message.send", request);
+        }
         const requestId = (result as { request?: { id?: string } }).request?.id;
         if (expectsReply && requestId) options.onClarification?.(requestId);
         return textResult(result, Boolean(expectsReply));

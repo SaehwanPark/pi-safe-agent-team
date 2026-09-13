@@ -566,7 +566,16 @@ export class FabricRuntime {
     timeoutMs?: number,
     signal?: AbortSignal,
   ): Promise<T> {
-    return client.requestIdempotent<T>(operation, args, operationId, timeoutMs, signal);
+    return client.requestIdempotent<T>(operation, args, operationId, timeoutMs, signal).catch((error) => {
+      // A host may briefly talk to a pre-R5 broker that understands the
+      // lifecycle operation but not durable operation IDs. Retry only that
+      // explicit capability error without an operationId; other INVALID_ARGUMENT
+      // failures remain deterministic and must not be replayed blindly.
+      if (error instanceof FabricError && error.code === "INVALID_ARGUMENT" && /operationId.*supported/i.test(error.message)) {
+        return client.request<T>(operation, args, timeoutMs, signal);
+      }
+      throw error;
+    });
   }
 
   /** Coordinate a root-session file mutation against live borrowing state. */
@@ -1675,11 +1684,19 @@ export class ManagedChild {
     // prompt. Message callers additionally verify that the corresponding user
     // entry is present in the durable SessionManager transcript before ACKing.
     const operation = this.promptTail.then(() => this.executePrompt(prompt)).catch(async (error) => {
-      const ended = await this.requestLifecycle<{ agent?: AgentRecord }>("agent.end_turn", {
-        status: "failed",
-        statusReason: error instanceof Error ? error.message : String(error),
-      }, `recovery-${this.operationNonce}-${this.turnSequence++}-end`).catch(() => undefined);
-      const terminalized = Boolean(ended?.agent && ["completed", "failed", "cancelled"].includes(ended.agent.status));
+      // An exception can mean the prior lifecycle response was lost after a
+      // commit. Reconcile durable status first; never blindly apply a second
+      // failure transition to an operation that may already have ended ready,
+      // blocked, or terminal.
+      const current = await this.client.request<AgentRecord>("agent.status", {}).catch(() => undefined);
+      let terminalized = false;
+      if (current && ["starting", "running", "waiting"].includes(current.status)) {
+        const ended = await this.requestLifecycle<{ agent?: AgentRecord }>("agent.end_turn", {
+          status: "failed",
+          statusReason: error instanceof Error ? error.message : String(error),
+        }, `recovery-${this.operationNonce}-${this.turnSequence++}-end`).catch(() => undefined);
+        terminalized = Boolean(ended?.agent && ["completed", "failed", "cancelled"].includes(ended.agent.status));
+      }
       // Once the coordinator has committed failure, no later queued message
       // may be delivered into a terminal session. If transport is unavailable,
       // leave the live runtime reconnectable instead of manufacturing failure.
