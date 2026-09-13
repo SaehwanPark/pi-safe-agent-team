@@ -159,7 +159,7 @@ export class FabricRuntime {
   private lastHandoffSnapshots: HandoffSnapshot[] = [];
   private readonly modelCapacity: ModelRouteCapacityArbiter;
   private rootCompactionInFlight = 0;
-  private rootCompactionReleases: Array<() => void> = [];
+  private rootCompactionReleases: Array<(() => void) | undefined> = [];
   private rootCompactionBrokerReservations: boolean[] = [];
   private rootCompactionEpoch = 0;
   private rootContextHealth: "healthy" | "degraded" = "healthy";
@@ -232,8 +232,11 @@ export class FabricRuntime {
   /** Begin observing a root manual/automatic compaction before Pi mutates context. */
   async beginRootCompaction(): Promise<void> {
     const epoch = this.rootCompactionEpoch;
+    const reservationIndex = this.rootCompactionBrokerReservations.length;
     this.rootCompactionInFlight += 1;
     this.rootCompactionBrokerReservations.push(false);
+    const releaseIndex = this.rootCompactionReleases.length;
+    this.rootCompactionReleases.push(undefined);
     const route = this.root?.ctx.model ? routeFromModel(this.root.ctx.model, this.root.ctx.thinkingLevel ?? "medium") : undefined;
     if (!route) return;
     try {
@@ -242,7 +245,7 @@ export class FabricRuntime {
         release();
         return;
       }
-      this.rootCompactionReleases.push(release);
+      this.rootCompactionReleases[releaseIndex] = release;
     } catch {
       // The quiescence flag remains conservative when a local arbiter is unavailable.
     }
@@ -253,7 +256,7 @@ export class FabricRuntime {
           if (epoch !== this.rootCompactionEpoch || this.stopped) {
             await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
           } else {
-            this.rootCompactionBrokerReservations[this.rootCompactionBrokerReservations.length - 1] = true;
+            this.rootCompactionBrokerReservations[reservationIndex] = true;
           }
         }
       } catch {
@@ -276,7 +279,7 @@ export class FabricRuntime {
     this.rootCompactionEpoch += 1;
     this.rootCompactionInFlight = 0;
     this.rootCompactionBrokerReservations = [];
-    for (const release of this.rootCompactionReleases.splice(0)) release();
+    for (const release of this.rootCompactionReleases.splice(0)) release?.();
   }
 
   markRootContextDegraded(outcome: ModelTurnOutcome): void {
@@ -673,8 +676,15 @@ export class FabricRuntime {
     const targets = topLevel.length > 0 ? topLevel : children;
     const handoff = this.captureHandoffSnapshots(reason)
       .then((snapshots) => {
-        this.lastHandoffSnapshots = snapshots;
-        return snapshots;
+        // Broker status may observe the subtree after drain/cancel has already
+        // committed. Preserve the synchronous local snapshot in that case,
+        // while enriching each entry whenever durable metadata is available.
+        const enriched = new Map(snapshots.map((snapshot) => [snapshot.agentId, snapshot]));
+        const merged = this.lastHandoffSnapshots.map((snapshot) => enriched.get(snapshot.agentId) ?? snapshot);
+        const seen = new Set(merged.map((snapshot) => snapshot.agentId));
+        for (const snapshot of snapshots) if (!seen.has(snapshot.agentId)) merged.push(snapshot);
+        this.lastHandoffSnapshots = merged;
+        return merged;
       })
       .catch(() => this.lastHandoffSnapshots);
     const brokerDrains = root
