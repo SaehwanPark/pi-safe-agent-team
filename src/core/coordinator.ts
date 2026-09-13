@@ -1401,7 +1401,7 @@ export class Coordinator {
     const heartbeatTimeout = this.config.agentHeartbeatTimeoutMs ?? this.config.heartbeatMs * 3;
     const reconnectGrace = this.config.reconnectGraceMs ?? heartbeatTimeout * 2;
     for (const agent of [...this.agents.values()]) {
-      if (agent.depth === 0 || isTerminal(agent.status) || agent.reconnectable === true) continue;
+      if (isTerminal(agent.status) || agent.reconnectable === true) continue;
       if (now - agent.lastActivity < heartbeatTimeout) continue;
       const next = cloneAgent(agent);
       next.status = "failed";

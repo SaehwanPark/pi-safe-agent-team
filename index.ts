@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { FabricError, asFabricError } from "./src/core/errors.ts";
@@ -82,6 +83,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   let rootLogicalRunActive = false;
   let rootLogicalTurnId = "root-turn-0";
   let rootTurnSequence = 0;
+  const rootOperationNonce = randomUUID();
   let lastFinalRootOutcome: ModelTurnOutcome | undefined;
 
   const requestRootLifecycle = <T = unknown>(operation: string, args: Record<string, unknown>, operationId: string): Promise<T> => {
@@ -356,7 +358,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
         await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
         if (generation !== lifecycleQueue.currentGeneration) return;
         rootLogicalRunActive = true;
-        rootLogicalTurnId = `root-turn-${++rootTurnSequence}`;
+        rootLogicalTurnId = `root-turn-${rootOperationNonce}-${++rootTurnSequence}`;
         lastFinalRootOutcome = undefined;
         runtime.resetRootContextHealth();
         let started = false;

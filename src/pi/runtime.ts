@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
@@ -197,6 +197,7 @@ export class FabricRuntime {
   private rootCompactionBrokerReservations: boolean[] = [];
   private rootCompactionOperationIds: Array<string | undefined> = [];
   private rootCompactionSequence = 0;
+  private readonly operationNonce = randomUUID();
   private rootCompactionEpoch = 0;
   private rootModelCapacityRelease?: () => void;
   private rootModelCapacityController?: AbortController;
@@ -277,7 +278,7 @@ export class FabricRuntime {
     const reservationIndex = this.rootCompactionBrokerReservations.length;
     this.rootCompactionInFlight += 1;
     this.rootCompactionBrokerReservations.push(false);
-    const operationBase = `root-compaction-${++this.rootCompactionSequence}`;
+    const operationBase = `root-compaction-${this.operationNonce}-${++this.rootCompactionSequence}`;
     this.rootCompactionOperationIds.push(undefined);
     const releaseIndex = this.rootCompactionReleases.length;
     this.rootCompactionReleases.push(undefined);
@@ -347,7 +348,7 @@ export class FabricRuntime {
     const brokerReservation = this.rootCompactionBrokerReservations.pop() ?? false;
     const operationBase = this.rootCompactionOperationIds.pop();
     if (brokerReservation && this.root) {
-      await this.requestLifecycleOnClient(this.root.client, "agent.end_turn", { status: "ready" }, `${operationBase ?? `root-compaction-${this.rootCompactionSequence}`}:end`, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+      await this.requestLifecycleOnClient(this.root.client, "agent.end_turn", { status: "ready" }, `${operationBase ?? `root-compaction-${this.operationNonce}-${this.rootCompactionSequence}`}:end`, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
     }
   }
 
@@ -360,7 +361,7 @@ export class FabricRuntime {
     if (this.root) {
       for (let index = 0; index < reservations.length; index += 1) {
         if (reservations[index]) {
-          const operationBase = operationIds[index] ?? `root-compaction-${this.rootCompactionSequence}`;
+          const operationBase = operationIds[index] ?? `root-compaction-${this.operationNonce}-${this.rootCompactionSequence}`;
           void this.requestLifecycleOnClient(this.root.client, "agent.end_turn", { status: "ready" }, `${operationBase}:end`, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
         }
       }
@@ -945,7 +946,7 @@ export class FabricRuntime {
     const targets = topLevel.length > 0 ? topLevel : children;
     const rootOperations = root
       ? [
-          this.requestLifecycleOnClient(root.client, "agent.end_turn", { status: "ready" }, `root-stop-${this.lifecycleEpoch}:end`, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined),
+          this.requestLifecycleOnClient(root.client, "agent.end_turn", { status: "ready" }, `root-stop-${this.operationNonce}-${this.lifecycleEpoch}:end`, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined),
           ...targets.map((child) => root.client.request("agent.drain", { agentId: child.agentId, reason: "session-shutdown" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined)),
           ...targets.map((child) => root.client.request("agent.cancel", { agentId: child.agentId }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined)),
         ]
@@ -1227,6 +1228,8 @@ export class ManagedChild {
   private recoveryWakeEpoch = 0;
   /** Monotonic logical-turn counter used to derive stable lifecycle operation IDs. */
   private turnSequence = 0;
+  /** Prevent operationId reuse after a child host process is restarted. */
+  private readonly operationNonce = randomUUID();
 
   constructor(runtime: FabricRuntime, options: {
     agentId: string;
@@ -1675,7 +1678,7 @@ export class ManagedChild {
       const ended = await this.requestLifecycle<{ agent?: AgentRecord }>("agent.end_turn", {
         status: "failed",
         statusReason: error instanceof Error ? error.message : String(error),
-      }, `recovery-${this.turnSequence++}-end`).catch(() => undefined);
+      }, `recovery-${this.operationNonce}-${this.turnSequence++}-end`).catch(() => undefined);
       const terminalized = Boolean(ended?.agent && ["completed", "failed", "cancelled"].includes(ended.agent.status));
       // Once the coordinator has committed failure, no later queued message
       // may be delivered into a terminal session. If transport is unavailable,
@@ -1795,7 +1798,7 @@ export class ManagedChild {
 
   private async executePrompt(prompt: string): Promise<boolean> {
     if (!this.session || this.stopping || this.blockedByOutcome) return false;
-    const turnId = `turn-${++this.turnSequence}`;
+    const turnId = `turn-${this.operationNonce}-${++this.turnSequence}`;
     this.turnOutcome = undefined;
     this.lastObservedOutcome = undefined;
     this.compactionFailure = undefined;
