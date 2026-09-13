@@ -7,7 +7,6 @@ interface Waiter {
   signal?: AbortSignal;
   onAbort?: () => void;
 }
-
 /**
  * Process-local arbiter for expensive provider operations (including
  * compaction). The coordinator remains authoritative across processes; this
@@ -122,4 +121,3 @@ export class ModelRouteCapacityArbiter {
     return this.capacity({ provider, model: model.join("/"), thinking: "off" });
   }
 }
-

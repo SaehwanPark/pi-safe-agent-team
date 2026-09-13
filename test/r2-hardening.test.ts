@@ -41,7 +41,6 @@ test("R2 outcome classifier separates logical overflow, prefill capacity, runtim
   assert.equal(classifyCompactionFailure("summary backend failed").kind, "compaction_failed");
   assert.equal(isBlockingOutcome(classifyCompactionFailure()), true);
 });
-
 test("R2 route policy coordinates broker turns and derives an effective prefill budget", () => {
   const config: FabricConfig = {
     ...DEFAULT_FABRIC_CONFIG,
@@ -224,4 +223,3 @@ test("R2 child capacity failure retries once before a successful turn", async ()
   assert.equal(calls.some((call) => call.operation === "agent.end_turn" && call.args.status === "ready"), true);
   assert.equal(calls.some((call) => call.operation === "task.update"), false);
 });
-
