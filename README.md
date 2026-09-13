@@ -1,4 +1,4 @@
-# pi-safe-agents-team
+# pi-safe-agent-team
 
 [![CI](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml/badge.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue.svg)](https://saehwanpark.github.io/pi-safe-agent-team/)
@@ -13,7 +13,7 @@
 
 ---
 
-## Why pi-safe-agents-team?
+## Why pi-safe-agent-team?
 
 Prompt instructions like *"please coordinate with other agents"* or *"do not edit file X while agent B is working on it"* inevitably break down under real coding workloads. Without mechanical enforcement, multi-agent systems suffer from:
 
@@ -46,7 +46,7 @@ An LLM should never be asked to act as a mutex, a distributed lock manager, a me
 
 ## Comparison at a Glance
 
-| Capability | Standard Pi Subagents | `nicobailon/pi-subagents` | `tmustier/pi-agent-teams` | `pi-safe-agents-team` (v0.1) |
+| Capability | Standard Pi Subagents | `nicobailon/pi-subagents` | `tmustier/pi-agent-teams` | `pi-safe-agent-team` (v0.1) |
 | :--- | :--- | :--- | :--- | :--- |
 | **Concurrency Enforcement** | None (advisory) | None (advisory) | Git branch/worktree only | **Authoritative Borrow Checker + Leases** |
 | **Filesystem Write Guard** | None | None | None | **Write boundary hook with Write Fences** |
