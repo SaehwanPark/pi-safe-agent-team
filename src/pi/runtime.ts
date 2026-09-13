@@ -19,7 +19,7 @@ import { createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootShellG
 import { createEmbeddedContextController, type EmbeddedCompactionRequest, type EmbeddedContextHost, type EmbeddedContextManager, type FabricSnapshotRequest, type FabricStateSnapshotV1 } from "./interop.ts";
 import { effectivePrefillBudget } from "../core/coordinator-wire.ts";
 import { ModelRouteCapacityArbiter } from "./model-capacity.ts";
-import { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isBlockingOutcome, type ModelTurnOutcome } from "./turn-outcome.ts";
+import { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isAbortLikeMessage, isBlockingOutcome, type ModelTurnOutcome } from "./turn-outcome.ts";
 import { loadFabricConfig } from "./config.ts";
 
 export interface RoleConfig {
@@ -1095,6 +1095,9 @@ export class ManagedChild {
   private lastDiagnostic?: string;
   /** A blocked context/provider turn must not be retried by ordinary inbox wakes. */
   private blockedByOutcome?: ModelTurnOutcome;
+  /** Guards the one-shot wake scheduled for an explicit blocked-task reopen. */
+  private recoveryWakePending = false;
+  private recoveryWakeEpoch = 0;
 
   constructor(runtime: FabricRuntime, options: {
     agentId: string;
@@ -1512,6 +1515,19 @@ export class ManagedChild {
       return;
     }
     this.blockedByOutcome = undefined;
+    if (previousGate && task) this.scheduleRecoveryWake(task.id);
+  }
+
+  private scheduleRecoveryWake(taskId: string | undefined): void {
+    if (!taskId || this.recoveryWakePending || !this.session || this.stopping) return;
+    this.recoveryWakePending = true;
+    const epoch = ++this.recoveryWakeEpoch;
+    const operation = this.enqueuePrompt(
+      `Task ${taskId} was explicitly reopened. Resume from durable task state. Reacquire any required mutable resources before writing.`,
+    );
+    void operation.finally(() => {
+      if (epoch === this.recoveryWakeEpoch) this.recoveryWakePending = false;
+    });
   }
 
   private enqueuePrompt(prompt: string): Promise<void> {
@@ -1668,7 +1684,7 @@ export class ManagedChild {
         role: "assistant",
         provider: this.route.provider,
         model: this.route.model,
-        stopReason: /\b(?:abort|aborted|cancel|cancelled|canceled)\b/i.test(message) ? "aborted" : "error",
+        stopReason: isAbortLikeMessage(undefined, message) ? "aborted" : "error",
         errorMessage: message,
         usage: { input: 0, cacheRead: 0, output: 0 },
       }, typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined);
@@ -1740,6 +1756,7 @@ export class ManagedChild {
       }
       if (task?.owner === this.agentId && task.status !== "blocked" && !["completed", "failed", "cancelled"].includes(task.status) && this.blockedByOutcome) {
         this.blockedByOutcome = undefined;
+        this.scheduleRecoveryWake(task.id);
         this.drainPendingMessages();
       }
       return;

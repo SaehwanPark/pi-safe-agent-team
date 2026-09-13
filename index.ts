@@ -23,7 +23,7 @@ export { classifyRootShellCommand, type RootShellRisk } from "./src/pi/shell-cla
 export { classifyRootDelivery, type RootDeliveryDecision, type RootDeliveryContext } from "./src/pi/delivery.ts";
 export { ModelRouteCapacityArbiter } from "./src/pi/model-capacity.ts";
 export { loadFabricConfig, type FabricConfigLoadOptions, type FabricConfigLoadResult } from "./src/pi/config.ts";
-export { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isBlockingOutcome, type ModelTurnOutcome, type ModelTurnOutcomeKind } from "./src/pi/turn-outcome.ts";
+export { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isAbortLikeMessage, isBlockingOutcome, type ModelTurnOutcome, type ModelTurnOutcomeKind } from "./src/pi/turn-outcome.ts";
 export { getInteropRegistry, getInteropProvider, registerInteropProvider, unregisterInteropProvider, PI_EXTENSION_INTEROP } from "./src/pi/interop.ts";
 export type { FabricSnapshotRequest, FabricStateSnapshotV1, FabricStateProviderV1, EmbeddedContextHost, EmbeddedContextManager, EmbeddedToolResult } from "./src/pi/interop.ts";
 export { GitWorkspaceStrategy, SharedWorkspaceStrategy } from "./src/workspace.ts";
@@ -83,7 +83,9 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     lifecycleQueue.enqueue(generation, operation);
 
   const updatePendingDeliveries = (): void => {
-    const count = [...rootDeliveryStates.values()].filter((s) => s === "delivering").length;
+    // Accepted/deferred messages remain broker-unacknowledged until Pi has
+    // crossed the session boundary, so they must keep root quiescence closed.
+    const count = [...rootDeliveryStates.values()].filter((s) => s !== "acknowledged").length;
     runtime.setPendingRootDeliveriesCount(count);
   };
 
