@@ -274,9 +274,14 @@ export class FabricRuntime {
     return this.root?.client;
   }
 
-  async request<T = unknown>(operation: string, args: Record<string, unknown> = {}): Promise<T> {
+  async request<T = unknown>(
+    operation: string,
+    args: Record<string, unknown> = {},
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<T> {
     if (!this.root) throw new FabricError("BROKER_UNAVAILABLE", "Fabric root is not attached");
-    return this.root.client.request<T>(operation, args);
+    return this.root.client.request<T>(operation, args, timeoutMs, signal);
   }
 
   async requestIdempotent<T = unknown>(
@@ -360,7 +365,7 @@ export class FabricRuntime {
     }
 
     try {
-      const status = (await this.status()) as FabricStatus;
+      const status = (await this.status(request.signal)) as FabricStatus;
       if (status.config?.caseInsensitivePaths !== undefined) {
         this.caseInsensitivePaths = status.config.caseInsensitivePaths;
       }
@@ -453,8 +458,8 @@ export class FabricRuntime {
     }
   }
 
-  async status(): Promise<unknown> {
-    return this.request("fabric.status", {});
+  async status(signal?: AbortSignal): Promise<unknown> {
+    return this.request("fabric.status", {}, undefined, signal);
   }
 
   async modelRuntimeForChildren(): Promise<ModelRuntime> {
