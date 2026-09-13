@@ -148,12 +148,13 @@ test("child reconnect rebuilds the blocked gate from durable task state", async 
     capabilities: { maySpawn: false, mayMessagePeers: true, mayEscalate: false, mayTransferOwnership: false, mayWriteRepo: false, mayUseShell: false, peerIds: [], resourceGrants: {} },
   });
   const operations: string[] = [];
+  let taskStatus = "blocked";
   (child as any).started = true;
   (child.client as any).connect = async () => {};
   (child.client as any).request = async (operation: string) => {
     operations.push(operation);
     if (operation === "agent.register") return { agent: { id: "child-blocked", status: "ready", taskId: "task-blocked" } };
-    if (operation === "task.show") return { id: "task-blocked", status: "blocked", blockedReason: "prefill capacity requires recovery" };
+    if (operation === "task.show") return { id: "task-blocked", status: taskStatus, blockedReason: "prefill capacity requires recovery" };
     if (operation === "message.inbox") return [];
     return {};
   };
@@ -163,5 +164,15 @@ test("child reconnect rebuilds the blocked gate from durable task state", async 
   assert.ok((child as any).blockedByOutcome);
   assert.equal((child as any).blockedByOutcome.lifecycle, "blocked");
   assert.deepEqual(operations.slice(0, 3), ["agent.register", "task.show", "message.inbox"]);
+
+  operations.length = 0;
+  (child as any).handleEvent({ event: "agent_updated", data: { agent: { id: "child-blocked", status: "ready", taskId: "task-blocked" } } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok((child as any).blockedByOutcome, "a ready agent event must not override a blocked task");
+  assert.deepEqual(operations, ["task.show"]);
+
+  taskStatus = "active";
+  (child as any).handleEvent({ event: "task_changed", data: { task: { id: "task-blocked", owner: "child-blocked", status: "active" } } });
+  assert.equal((child as any).blockedByOutcome, undefined);
   await child.stop();
 });

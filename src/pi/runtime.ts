@@ -1476,7 +1476,7 @@ export class ManagedChild {
    * in-memory gate before inbox delivery resumes.
    */
   private async reconcileRecoveryGate(agent: AgentRecord): Promise<void> {
-    this.blockedByOutcome = undefined;
+    const previousGate = this.blockedByOutcome;
     let task: TaskRecord | undefined;
     if (agent.taskId) {
       try {
@@ -1485,7 +1485,7 @@ export class ManagedChild {
         // A successful re-register followed by an uncertain task read must
         // not resume provider work with an unknown semantic state. Keep the
         // child gated until a later task event/reconnect can reconcile it.
-        this.blockedByOutcome = classifyCompactionFailure(
+        this.blockedByOutcome = previousGate ?? classifyCompactionFailure(
           agent.contextDiagnostic ?? "Unable to reconcile assigned task state after broker reconnect",
         );
         return;
@@ -1493,12 +1493,17 @@ export class ManagedChild {
     }
     // A durable terminal task is stronger than a stale agent status. Do not
     // re-arm a recovery gate (or resume work) from an older blocked event.
-    if (task && ["completed", "failed", "cancelled"].includes(task.status)) return;
+    if (task && ["completed", "failed", "cancelled"].includes(task.status)) {
+      this.blockedByOutcome = undefined;
+      return;
+    }
     if (agent.status === "blocked" || task?.status === "blocked") {
       this.blockedByOutcome = classifyCompactionFailure(
         task?.blockedReason ?? agent.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery",
       );
+      return;
     }
+    this.blockedByOutcome = undefined;
   }
 
   private enqueuePrompt(prompt: string): void {
@@ -1697,8 +1702,13 @@ export class ManagedChild {
       if (agent?.id === this.agentId) {
         this.record = agent;
         if (agent.status === "ready" && this.blockedByOutcome) {
-          this.blockedByOutcome = undefined;
-          this.drainPendingMessages();
+          // A ready agent event alone does not prove that its assigned task
+          // was reopened. Reconcile the task before releasing the local gate;
+          // otherwise a stale heartbeat/register event can race a blocked
+          // task and resume provider work prematurely.
+          void this.reconcileRecoveryGate(agent).then(() => {
+            if (!this.blockedByOutcome) this.drainPendingMessages();
+          }).catch(() => undefined);
         }
         if (agent.status === "completed" || agent.status === "cancelled" || agent.status === "failed" && agent.reconnectable !== true) void this.stop();
       }
