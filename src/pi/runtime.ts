@@ -1080,17 +1080,22 @@ export class ManagedChild {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.eventUnsubscribe?.();
     this.closeUnsubscribe?.();
+    let abortCompleted = true;
     try {
       const abort = this.session?.abort();
       if (abort) {
         const timeoutMs = Math.max(0, options.abortTimeoutMs ?? FabricRuntime.shutdownAbortTimeoutMs);
-        await Promise.race([abort, new Promise<void>((resolve) => setTimeout(resolve, timeoutMs))]);
+        abortCompleted = await Promise.race([
+          abort.then(() => true, () => false),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
+        ]);
       }
     } catch {
       // Cancellation is best effort; the coordinator still releases on the explicit request.
+      abortCompleted = false;
     }
     this.disposeNow();
-    await this.cleanupWorkspace();
+    if (abortCompleted) await this.cleanupWorkspace();
   }
 
   /** Synchronous best-effort disposal used after an emergency deadline. */

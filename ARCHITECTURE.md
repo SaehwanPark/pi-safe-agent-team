@@ -135,7 +135,7 @@ Guarded Pi writes participate in borrowing and fencing. Root shell remains a tru
 
 ### Workspaces
 
-`src/workspace.ts` is a small pluggable strategy boundary. `shared` uses the caller's cwd. Explicit `worktree` mode requires a clean Git checkout and creates a detached managed worktree from a safe base ref. Worktree paths and branches are recorded in agent metadata. v1 does not auto-delete dirty worktrees: terminal artifacts remain inspectable, and cleanup is intentionally explicit.
+`src/workspace.ts` is a small pluggable strategy boundary. `shared` uses the caller's cwd. Explicit `worktree` mode requires a clean Git checkout and creates a detached managed worktree from a safe base ref. Worktree paths and branches are recorded in agent metadata. Child shutdown reclaims a worktree only when it is clean and the session abort completes; dirty or uncertain artifacts remain inspectable and require explicit cleanup.
 
 ## State and data flow
 

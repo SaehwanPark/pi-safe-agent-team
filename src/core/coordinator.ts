@@ -652,7 +652,7 @@ export class Coordinator {
   }
 
   private assertNoLiveDescendants(agentId: AgentId): void {
-    const live = [...this.agents.values()].filter((candidate) => candidate.parentId === agentId && !isTerminal(candidate.status));
+    const live = [...this.agents.values()].filter((candidate) => !isTerminal(candidate.status) && this.isAncestorAgent(agentId, candidate.id));
     assertCondition(live.length === 0, "LIFECYCLE_CONFLICT", `Agent ${agentId} cannot complete with ${live.length} live descendant${live.length === 1 ? "" : "s"}; drain or cancel them first`);
   }
 

@@ -71,7 +71,7 @@ The authority fields are coordinator state. Role prompt text is guidance only.
 
 ## Workspace policy
 
-Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Cleanup is explicit; a dirty artifact requires user confirmation/force through a future cleanup command.
+Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Clean worktrees are reclaimed after a completed child shutdown; dirty or uncertain artifacts are retained for inspection and require user confirmation/force through a future cleanup command.
 
 ## Broker startup
 

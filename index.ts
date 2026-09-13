@@ -93,7 +93,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     const state = rootDeliveryStates.get(message.id);
     if (state === "acknowledged" || state === "delivering") return;
     if (state === "accepted") {
-      void runtime.request("message.ack", { messageId: message.id }).then(() => rememberRootMessage(message.id, "acknowledged")).catch(() => undefined);
+      void runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs).then(() => rememberRootMessage(message.id, "acknowledged")).catch(() => undefined);
       return;
     }
     rootDeliveryStates.set(message.id, "delivering");
@@ -113,11 +113,12 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
         });
         if (epoch !== rootDeliveryEpoch) return;
         rememberRootMessage(message.id, "accepted");
-        await runtime.request("message.ack", { messageId: message.id });
+        await runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs);
         rememberRootMessage(message.id, "acknowledged");
       } catch {
         rootDeliveryStates.delete(message.id);
       } finally {
+        if (epoch !== rootDeliveryEpoch) rootDeliveryStates.delete(message.id);
         updatePendingDeliveries();
       }
     }).catch(() => undefined);
@@ -160,7 +161,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     if (fenceId === undefined) return undefined;
     pendingRootFences.delete(event.toolCallId);
     runtime.setPendingRootFencesCount(pendingRootFences.size);
-    void runtime.releaseRootFence(fenceId);
+    void runtime.releaseRootFence(fenceId, FabricRuntime.shutdownRpcTimeoutMs);
     return undefined;
   });
 
@@ -238,6 +239,9 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
         const mode = args.trim() || "status";
         if (mode === "stop" || mode.startsWith("stop ")) {
           const requestedMode = mode.slice("stop".length).trim();
+          if (requestedMode !== "" && requestedMode !== "--now" && requestedMode !== "--budget") {
+            throw new FabricError("INVALID_ARGUMENT", "usage: /agents stop [--budget|--now]");
+          }
           const shutdownMode: DescendantShutdownMode = requestedMode === "--now" ? "now" : requestedMode === "--budget" ? "budget" : "graceful";
           const snapshots = await runtime.abortDescendants({ reason: `agents-stop:${shutdownMode}`, mode: shutdownMode });
           ctx.ui.notify(`safe-agents: stopped ${snapshots.length} descendant${snapshots.length === 1 ? "" : "s"} (${shutdownMode}); deterministic handoff captured`, "info");
