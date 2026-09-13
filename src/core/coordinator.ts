@@ -477,6 +477,7 @@ export class Coordinator {
 
   private configureChild(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): AgentRecord {
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot configure children`);
     const target = this.requireAgent(parseString(args.agentId, "agentId"));
     assertCondition(actor.capabilities.maySpawn, "CAPABILITY_DENIED", `Agent ${actorId} cannot configure children`);
     assertCondition(this.canControl(actor, target) && target.parentId === actorId, "CAPABILITY_DENIED", `Agent ${actorId} cannot configure child ${target.id}`);
@@ -937,6 +938,7 @@ export class Coordinator {
 
   private defineResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot define resources`);
     assertCondition(actor.capabilities.mayWriteRepo || actor.capabilities.mayTransferOwnership, "CAPABILITY_DENIED", `Agent ${actorId} cannot define resources`);
     const id = parseString(args.resourceId, "resourceId", 1024);
     const kind = parseString(args.kind ?? "resource", "kind", 128);
@@ -991,6 +993,7 @@ export class Coordinator {
   private grantResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const resource = this.requireResource(parseString(args.resourceId, "resourceId"));
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot grant resources`);
     assertCondition(this.canManageResource(actor, resource), "CAPABILITY_DENIED", `Agent ${actorId} cannot grant ${resource.id}`);
     const targetId = parseString(args.agentId, "agentId");
     const target = this.requireAgent(targetId);
@@ -1006,6 +1009,7 @@ export class Coordinator {
   private claimResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const resource = this.requireResource(parseString(args.resourceId, "resourceId"));
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot claim resources`);
     assertCondition(this.hasPermission(resource, actorId, "write") || actor.capabilities.mayTransferOwnership, "CAPABILITY_DENIED", `Agent ${actorId} cannot claim ${resource.id}`);
     if (resource.owner && resource.owner !== actorId) {
       const owner = this.requireAgent(resource.owner);
@@ -1067,6 +1071,7 @@ export class Coordinator {
   private transferResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const resource = this.requireResource(parseString(args.resourceId, "resourceId"));
     const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot transfer resources`);
     const targetId = parseString(args.agentId, "agentId");
     const target = this.requireAgent(targetId);
     assertCondition(!isTerminal(target.status), "AGENT_NOT_FOUND", `Agent ${targetId} is not active`);

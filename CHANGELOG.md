@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Tree-wide abort and bounded shutdown**: root run aborts now drain and cancel managed descendants without starting new model calls; child sessions abort concurrently with short deadlines, deterministic handoff snapshots are captured, and clean worktrees are reclaimed while dirty artifacts are retained.
+- **Terminal lifecycle invariant**: failed or cancelled parents cascade to descendants, completed parents reject live children, and the restrictive `draining` state blocks new turns, children, tasks, and resource claims.
+- **Live child limits and shell fail-closed behavior**: `maxChildrenPerAgent` counts live direct children (with optional `maxChildrenCreatedPerAgent` for explicit lifetime ceilings), and unknown root shell commands are blocked while child mutable holds or write fences are active.
+
 ## 0.2.3 - 2026-09-08
 
 This patch completes the joint hardening pass with `local-context-manager`, isolating concurrent Pi roots and preserving embedded recovery across native fallback.

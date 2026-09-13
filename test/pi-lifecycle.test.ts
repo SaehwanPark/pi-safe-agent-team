@@ -39,15 +39,17 @@ interface RuntimeMethods {
   ensureRoot: FabricRuntime["ensureRoot"];
   request: FabricRuntime["request"];
   stop: FabricRuntime["stop"];
+  abortDescendants: FabricRuntime["abortDescendants"];
 }
 
 async function withRuntimeSpies(
   request: (operation: string, args?: Record<string, unknown>) => Promise<unknown>,
   run: () => Promise<void>,
   onStop: () => void = () => {},
+  onAbort: () => void = () => {},
 ): Promise<number> {
   const prototype = FabricRuntime.prototype as unknown as RuntimeMethods;
-  const originals = { ensureRoot: prototype.ensureRoot, request: prototype.request, stop: prototype.stop };
+  const originals = { ensureRoot: prototype.ensureRoot, request: prototype.request, stop: prototype.stop, abortDescendants: prototype.abortDescendants };
   const rootDescriptor = Object.getOwnPropertyDescriptor(FabricRuntime.prototype, "rootAgentId");
   let stopCalls = 0;
   prototype.ensureRoot = async () => {};
@@ -55,6 +57,10 @@ async function withRuntimeSpies(
   prototype.stop = async () => {
     stopCalls += 1;
     onStop();
+  };
+  prototype.abortDescendants = async () => {
+    onAbort();
+    return [];
   };
   Object.defineProperty(FabricRuntime.prototype, "rootAgentId", { configurable: true, get: () => "root" });
   try {
@@ -64,6 +70,7 @@ async function withRuntimeSpies(
     prototype.ensureRoot = originals.ensureRoot;
     prototype.request = originals.request;
     prototype.stop = originals.stop;
+    prototype.abortDescendants = originals.abortDescendants;
     if (rootDescriptor) Object.defineProperty(FabricRuntime.prototype, "rootAgentId", rootDescriptor);
     else delete (FabricRuntime.prototype as unknown as Record<string, unknown>).rootAgentId;
   }
@@ -85,6 +92,26 @@ test("finalizes the root turn once after Pi settles instead of on agent_end", as
     assert.deepEqual(operations, ["agent.end_turn"]);
   });
   assert.equal(stopCalls, 1);
+});
+
+test("an aborted root run drains descendants after settlement", async () => {
+  let abortCalls = 0;
+  const context = {
+    ...makeContext(),
+    sessionManager: {
+      getEntries: () => [{ type: "message", message: { role: "assistant", stopReason: "aborted" } }],
+    },
+  } as unknown as ExtensionContext;
+  await withRuntimeSpies(async () => {}, async () => {
+    const handlers = makeExtensionHarness();
+    await handlers.get("session_start")?.[0]?.({}, context);
+    handlers.get("agent_settled")?.[0]?.({}, context);
+    await flushLifecycle();
+    await handlers.get("session_shutdown")?.[0]?.({}, context);
+  }, () => {}, () => {
+    abortCalls += 1;
+  });
+  assert.equal(abortCalls, 1);
 });
 
 test("shutdown waits for a settled handler before stopping the runtime", async () => {
@@ -147,4 +174,3 @@ test("re-registers fabric provider on session_start after session_shutdown", asy
     await handlers.get("session_shutdown")?.[0]?.({}, context);
   });
 });
-

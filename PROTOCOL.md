@@ -70,7 +70,7 @@ A reconnecting actor may re-register only with the matching token/session identi
 
 The public tool/command layer maps to these operation families:
 
-- `agent.register`, `agent.update`, `agent.configure_child`, `agent.begin_turn`, `agent.end_turn`, `agent.heartbeat`, `agent.cancel`, `agent.status`;
+- `agent.register`, `agent.update`, `agent.configure_child`, `agent.begin_turn`, `agent.drain`, `agent.end_turn`, `agent.heartbeat`, `agent.cancel`, `agent.status`;
 - `agent.spawn`;
 - `message.send`, `message.reply`, `message.ack`, `message.inbox`, `message.list`;
 - `discover.agents`;
@@ -208,7 +208,7 @@ starting -> ready -> running -> ready
                     +-> completed | failed | cancelled
 ```
 
-Terminal states are idempotent and permanently terminal. Only the explicit broker-recovery window is reconnectable: a broker restart marks live actors as reconnectable liveness failures, and a matching token may reattach them once. A cancelled/completed/non-recoverable failed actor cannot be revived by registration. Cancelling a parent cancels its descendants. Cancellation releases task/resource runtime claims and is safe to repeat.
+Terminal states are idempotent and permanently terminal. Only the explicit broker-recovery window is reconnectable: a broker restart marks live actors as reconnectable liveness failures, and a matching token may reattach them once. A cancelled/completed/non-recoverable failed actor cannot be revived by registration. `agent.drain` enters a restrictive shutdown phase without releasing claims; `agent.cancel` then terminalizes the target subtree child-first. Failed and cancelled parents cascade to all descendants, and completion is rejected while any live descendant remains. Cancellation releases task/resource runtime claims and is safe to repeat.
 
 ## Persistence and recovery
 

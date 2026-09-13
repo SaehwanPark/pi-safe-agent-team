@@ -11,7 +11,7 @@ starting -> ready -> running -> ready
                     +-> completed | failed | cancelled
 ```
 
-Terminal states are idempotent and permanent. A broker restart creates one explicit reconnectable liveness window for previously live actors; a matching token can reattach that actor once, but a completed, cancelled, or non-recoverable failed actor cannot be revived. The root can cancel a descendant subtree. Cancellation and crash recovery release runtime claims; they do not silently delete worktree artifacts.
+Terminal states are idempotent and permanent. A broker restart creates one explicit reconnectable liveness window for previously live actors; a matching token can reattach that actor once, but a completed, cancelled, or non-recoverable failed actor cannot be revived. The root can drain or cancel a descendant subtree. `draining` is a restrictive, non-terminal phase: no new turns, children, tasks, resource claims, or borrows are admitted, while final handoff messages and releases remain possible. A failed or cancelled parent always cascades to its descendants, and a parent cannot complete while a live descendant remains. Cancellation and crash recovery release runtime claims; clean worktrees are reclaimed on child shutdown, while dirty artifacts remain inspectable.
 
 ## Recursion
 
