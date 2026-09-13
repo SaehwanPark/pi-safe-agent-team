@@ -233,6 +233,8 @@ export class Coordinator {
         return this.withEvents(events, this.drainAgent(this.requireActor(actorId).id, parseString(args.agentId ?? actorId, "agentId"), parseOptionalString(args.reason, "reason", 2048), events));
       case "agent.end_turn":
         return this.withEvents(events, this.endTurn(this.requireBoundAgent(actorId).id, args, events));
+      case "agent.finish_turn":
+        return this.withEvents(events, this.finishTurn(this.requireBoundAgent(actorId).id, args, events));
       case "agent.heartbeat":
         return this.withEvents(events, this.heartbeat(this.requireActor(actorId).id, events));
       case "agent.cancel":
@@ -611,6 +613,46 @@ export class Coordinator {
     return { agent: publicAgent(this.requireAgent(actorId)), task };
   }
 
+  /**
+   * Commit a model-turn outcome as one coordinator transition. Runtime hosts
+   * use this instead of separate task.update/agent.end_turn/message.send calls
+   * so a broker disconnect cannot expose a half-finished recovery state.
+   */
+  private finishTurn(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): { agent: AgentRecord; task?: TaskRecord } {
+    const taskId = parseOptionalString(args.taskId, "taskId");
+    const taskBefore = taskId ? cloneTask(this.requireTask(taskId)) : undefined;
+    const taskAction = parseOptionalString(args.taskAction, "taskAction", 32);
+    if (taskAction !== undefined) {
+      assertCondition(taskId !== undefined, "INVALID_ARGUMENT", "taskAction requires taskId");
+      assertCondition(taskAction === "block" || taskAction === "fail", "INVALID_ARGUMENT", "taskAction must be block or fail");
+      this.updateTask(actorId, {
+        taskId,
+        action: taskAction,
+        reason: parseString(args.reason, "reason", 4096),
+      }, events);
+    }
+
+    const requested = (args.status as AgentStatus | undefined) ?? "ready";
+    assertCondition(requested === "ready" || requested === "blocked" || requested === "failed", "INVALID_ARGUMENT", "finish status must be ready, blocked, or failed");
+    const reason = parseOptionalString(args.statusReason ?? args.reason, "statusReason", 2048);
+    const result = this.endTurn(actorId, { status: requested, statusReason: reason }, events);
+    const task = result.agent.taskId ? cloneTask(this.requireTask(result.agent.taskId)) : taskId ? cloneTask(this.requireTask(taskId)) : undefined;
+
+    // A late context failure may still be useful to the parent, but only when
+    // the task was not already terminal. Completed/failed/cancelled facts are
+    // durable semantic outcomes and must not acquire a contradictory notice.
+    if (
+      requested === "blocked" &&
+      result.agent.parentId &&
+      !isTaskTerminal(taskBefore?.status ?? "pending") &&
+      result.agent.status === "blocked"
+    ) {
+      const metadata = parseMetadata(args.metadata) ?? {};
+      this.sendInternalMessage(actorId, result.agent.parentId, "blocked", reason ?? "Agent is blocked pending recovery", metadata, events);
+    }
+    return { agent: result.agent, task };
+  }
+
   private statusAfterTask(agent: AgentRecord, requested: AgentStatus): AgentStatus {
     if (!agent.taskId) return requested;
     const task = this.requireTask(agent.taskId);
@@ -897,6 +939,7 @@ export class Coordinator {
       case "complete":
         return this.completeTask(actorId, task, args.result, events);
       case "block":
+        if (isTaskTerminal(task.status)) return cloneTask(task);
         task.status = "blocked";
         task.blockedReason = parseString(args.reason, "reason", 4096);
         task.updatedAt = this.clock();
@@ -912,6 +955,7 @@ export class Coordinator {
         events.push({ type: "task_changed", task: cloneTask(task) });
         return cloneTask(task);
       case "cancel":
+        if (isTaskTerminal(task.status)) return cloneTask(task);
         if (task.owner) {
           const owner = this.agents.get(task.owner);
           if (owner?.taskId === task.id) owner.taskId = undefined;
@@ -923,6 +967,7 @@ export class Coordinator {
         events.push({ type: "task_changed", task: cloneTask(task) });
         return cloneTask(task);
       case "fail":
+        if (isTaskTerminal(task.status)) return cloneTask(task);
         task.status = "failed";
         task.blockedReason = parseOptionalString(args.reason, "reason", 4096);
         task.updatedAt = this.clock();

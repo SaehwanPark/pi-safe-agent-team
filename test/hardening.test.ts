@@ -153,6 +153,36 @@ test("task facts, not a stopped model turn, determine terminal lifecycle", () =>
   assert.equal(taskAwareTurnStatus({ status: "active" }, false), "ready");
 });
 
+test("terminal task facts reject late block/fail/cancel outcomes", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  const spawned = coordinator.dispatch("root", "agent.spawn", { route, taskDescription: "must stay complete" }).value as { agent: AgentRecord; taskId: string };
+  coordinator.dispatch(spawned.agent.id, "agent.begin_turn", {});
+  coordinator.dispatch(spawned.agent.id, "task.update", { taskId: spawned.taskId, action: "complete", result: { summary: "done" } });
+
+  for (const action of ["block", "fail", "cancel"]) {
+    const result = coordinator.dispatch("root", "task.update", {
+      taskId: spawned.taskId,
+      action,
+      reason: `late ${action}`,
+    }).value as { status: string };
+    assert.equal(result.status, "completed");
+  }
+
+  const lateOutcome = coordinator.dispatch(spawned.agent.id, "agent.finish_turn", {
+    taskId: spawned.taskId,
+    taskAction: "block",
+    status: "blocked",
+    reason: "context failed after completion",
+    statusReason: "late context failure",
+    metadata: { cause: "compaction_failed" },
+  });
+  const finished = lateOutcome.value as { agent: AgentRecord; task?: { status: string } };
+  assert.equal(finished.agent.status, "completed");
+  assert.equal(finished.task?.status, "completed");
+  assert.equal(lateOutcome.events.some((event) => event.type === "message_sent" && event.message.type === "blocked"), false);
+});
+
 test("all terminal transitions resolve pending requests instead of leaving dead waiters", () => {
   const coordinator = makeCoordinator();
   registerRoot(coordinator);

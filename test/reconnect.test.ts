@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BrokerClient } from "../src/broker/client.ts";
 import { BrokerServer } from "../src/broker/server.ts";
-import { FabricRuntime } from "../src/pi/runtime.ts";
+import { FabricRuntime, ManagedChild } from "../src/pi/runtime.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRecord, ModelRoute } from "../src/core/types.ts";
 
@@ -130,4 +130,38 @@ test("broker recovery reattaches a previously assigned task", async () => {
     if (server1.isStarted()) await server1.stop();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("child reconnect rebuilds the blocked gate from durable task state", async () => {
+  const child = new ManagedChild({ fabricId: "fabric" } as FabricRuntime, {
+    agentId: "child-blocked",
+    token: "token-child-blocked",
+    parentId: "root",
+    role: "worker",
+    route,
+    taskId: "task-blocked",
+    cwd: process.cwd(),
+    stateDirectory: process.cwd(),
+    agentDir: process.cwd(),
+    endpoint: "unused",
+    model: {} as never,
+    capabilities: { maySpawn: false, mayMessagePeers: true, mayEscalate: false, mayTransferOwnership: false, mayWriteRepo: false, mayUseShell: false, peerIds: [], resourceGrants: {} },
+  });
+  const operations: string[] = [];
+  (child as any).started = true;
+  (child.client as any).connect = async () => {};
+  (child.client as any).request = async (operation: string) => {
+    operations.push(operation);
+    if (operation === "agent.register") return { agent: { id: "child-blocked", status: "ready", taskId: "task-blocked" } };
+    if (operation === "task.show") return { id: "task-blocked", status: "blocked", blockedReason: "prefill capacity requires recovery" };
+    if (operation === "message.inbox") return [];
+    return {};
+  };
+
+  await (child as any).reconnect();
+
+  assert.ok((child as any).blockedByOutcome);
+  assert.equal((child as any).blockedByOutcome.lifecycle, "blocked");
+  assert.deepEqual(operations.slice(0, 3), ["agent.register", "task.show", "message.inbox"]);
+  await child.stop();
 });

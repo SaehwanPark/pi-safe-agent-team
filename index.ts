@@ -22,6 +22,7 @@ export { assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadO
 export { classifyRootShellCommand, type RootShellRisk } from "./src/pi/shell-classifier.ts";
 export { classifyRootDelivery, type RootDeliveryDecision, type RootDeliveryContext } from "./src/pi/delivery.ts";
 export { ModelRouteCapacityArbiter } from "./src/pi/model-capacity.ts";
+export { loadFabricConfig, type FabricConfigLoadOptions, type FabricConfigLoadResult } from "./src/pi/config.ts";
 export { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isBlockingOutcome, type ModelTurnOutcome, type ModelTurnOutcomeKind } from "./src/pi/turn-outcome.ts";
 export { getInteropRegistry, getInteropProvider, registerInteropProvider, unregisterInteropProvider, PI_EXTENSION_INTEROP } from "./src/pi/interop.ts";
 export type { FabricSnapshotRequest, FabricStateSnapshotV1, FabricStateProviderV1, EmbeddedContextHost, EmbeddedContextManager, EmbeddedToolResult } from "./src/pi/interop.ts";
@@ -70,7 +71,10 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   let rootDeliveryTail: Promise<void> = Promise.resolve();
   let rootDeliveryEpoch = 0;
   const deferredRootMessages = new Map<string, AgentMessage>();
+  const deferredRootPersisted = new Set<string>();
+  const deferredRootRunMessages = new Set<string>();
   let deferredRootWakePending = false;
+  let rootContext: ExtensionContext | undefined;
   const lifecycleQueue = new LifecycleQueue();
   let rootLogicalRunActive = false;
   let lastFinalRootOutcome: ModelTurnOutcome | undefined;
@@ -102,7 +106,15 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     if (state === "acknowledged" || state === "delivering") return;
     if (state === "accepted") {
       if (epoch !== rootDeliveryEpoch) return;
+      if (deferredRootMessages.has(message.id) && !deferredRootPersisted.has(message.id)) return;
       void runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs).then(() => rememberRootMessage(message.id, "acknowledged")).catch(() => undefined);
+      return;
+    }
+    if (hasPersistedRootMessage(message.id)) {
+      rootDeliveryStates.set(message.id, "accepted");
+      void runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs)
+        .then(() => rememberRootMessage(message.id, "acknowledged"))
+        .catch(() => rootDeliveryStates.delete(message.id));
       return;
     }
     rootDeliveryStates.set(message.id, "delivering");
@@ -125,7 +137,13 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
         });
         if (epoch !== rootDeliveryEpoch) return;
         rememberRootMessage(message.id, "accepted");
-        if (decision.deliverAs === "nextTurn") deferredRootMessages.set(message.id, message);
+        if (decision.deliverAs === "nextTurn") {
+          // Pi only persists nextTurn messages when a real prompt starts. Keep
+          // the broker copy unacknowledged until the resulting agent_end has
+          // crossed that session-history boundary.
+          deferredRootMessages.set(message.id, message);
+          return;
+        }
         await runtime.request("message.ack", { messageId: message.id }, FabricRuntime.shutdownRpcTimeoutMs);
         rememberRootMessage(message.id, "acknowledged");
       } catch {
@@ -147,6 +165,39 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     }
   }
 
+  function hasPersistedRootMessage(messageId: string): boolean {
+    try {
+      const manager = rootContext?.sessionManager as unknown as { getEntries?: () => readonly unknown[] } | undefined;
+      const entries = typeof manager?.getEntries === "function" ? manager.getEntries() : [];
+      return entries.some((entry: any) => entry?.type === "custom_message" && entry?.customType === "safe-agents.message" && entry?.details?.id === messageId);
+    } catch {
+      return false;
+    }
+  }
+
+  async function acknowledgePersistedDeferredRootMessages(): Promise<void> {
+    for (const messageId of [...deferredRootRunMessages]) {
+      if (!deferredRootMessages.has(messageId)) {
+        deferredRootRunMessages.delete(messageId);
+        continue;
+      }
+      // The custom message is appended before agent_end. Mark it as persisted
+      // before the broker round trip so an ACK failure never causes a duplicate
+      // nextTurn injection on a later wake.
+      deferredRootPersisted.add(messageId);
+      try {
+        await runtime.request("message.ack", { messageId }, FabricRuntime.shutdownRpcTimeoutMs);
+        deferredRootMessages.delete(messageId);
+        deferredRootPersisted.delete(messageId);
+        deferredRootRunMessages.delete(messageId);
+        rememberRootMessage(messageId, "acknowledged");
+      } catch {
+        // Leave the durable broker message and the persisted marker in place;
+        // a later settled/reconnect pass can retry the acknowledgement.
+      }
+    }
+  }
+
   function wakeDeferredRoot(api: ExtensionAPI): void {
     if (deferredRootMessages.size === 0 || runtime.isRootCompactionInFlight || runtime.rootHealth === "degraded") return;
     // A retry/continuation is already running in Pi. The messages were
@@ -158,15 +209,22 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       deferredRootWakePending = true;
       return;
     }
-    deferredRootMessages.clear();
+    const pendingDelivery = [...deferredRootMessages.keys()].some((messageId) => !deferredRootPersisted.has(messageId));
+    if (!pendingDelivery) return;
     deferredRootWakePending = false;
     const sendUserMessage = (api as ExtensionAPI & { sendUserMessage?: (content: string, options?: { expandPromptTemplates?: boolean }) => void }).sendUserMessage;
     if (typeof sendUserMessage === "function") {
       // This starts a normal prompt, which flushes Pi's pending `nextTurn`
       // messages into the model context before generation begins.
-      sendUserMessage("Review the deferred safe-agents messages that were waiting for root context recovery.", {
-        expandPromptTemplates: false,
-      });
+      try {
+        void Promise.resolve(sendUserMessage("Review the deferred safe-agents messages that were waiting for root context recovery.", {
+          expandPromptTemplates: false,
+        })).catch(() => undefined);
+      } catch {
+        // Some lightweight hosts expose a synchronous sendUserMessage shim;
+        // a throw there must not break the lifecycle callback or lose the
+        // still-unacknowledged broker message.
+      }
       return;
     }
     // Lightweight hosts predating sendUserMessage still get a visible wake;
@@ -226,8 +284,13 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     rootDeliveryEpoch += 1;
     rootDeliveryTail = Promise.resolve();
+    rootDeliveryStates.clear();
+    runtime.setPendingRootDeliveriesCount(0);
     deferredRootMessages.clear();
+    deferredRootPersisted.clear();
+    deferredRootRunMessages.clear();
     deferredRootWakePending = false;
+    rootContext = ctx;
     rootLogicalRunActive = false;
     lastFinalRootOutcome = undefined;
     runtime.resetRootCompactionState();
@@ -245,39 +308,44 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("agent_start", (_event, ctx) => {
+  pi.on("agent_start", async (_event, ctx) => {
     const generation = lifecycleQueue.currentGeneration;
-    void enqueueLifecycle(generation, async () => {
-      if (rootLogicalRunActive) return;
-      await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
-      if (generation !== lifecycleQueue.currentGeneration) return;
-      rootLogicalRunActive = true;
-      lastFinalRootOutcome = undefined;
-      runtime.resetRootContextHealth();
-      // A user-led run consumes any messages queued as `nextTurn`. Automatic
-      // compaction/retry continuations set deferredRootWakePending instead and
-      // must keep the queue until the logical run finally settles.
-      if (!deferredRootWakePending) deferredRootMessages.clear();
-      let started = false;
-      while (!started && generation === lifecycleQueue.currentGeneration) {
-        const result = await runtime.request<{ started?: boolean }>("agent.begin_turn", {});
-        started = result?.started !== false;
-        if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-    }).catch((error) => {
+    try {
+      await enqueueLifecycle(generation, async () => {
+        if (rootLogicalRunActive) return;
+        await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
+        if (generation !== lifecycleQueue.currentGeneration) return;
+        rootLogicalRunActive = true;
+        lastFinalRootOutcome = undefined;
+        runtime.resetRootContextHealth();
+        let started = false;
+        while (!started && generation === lifecycleQueue.currentGeneration) {
+          const result = await runtime.request<{ started?: boolean }>("agent.begin_turn", {});
+          started = result?.started !== false;
+          if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (started) {
+          // The nextTurn queue is now part of this Pi prompt's immutable input;
+          // ACK only after a later agent_end confirms its message_end entries.
+          for (const messageId of deferredRootMessages.keys()) deferredRootRunMessages.add(messageId);
+        }
+      });
+    } catch (error) {
       rootLogicalRunActive = false;
       notifyLifecycleFailure(ctx, error, "warning", generation);
-    });
+      throw error;
+    }
   });
 
   // Observe the actual low-level terminal response. Pi may emit multiple
   // agent_end events while retrying/compacting; the latest one before
   // agent_settled is the logical run outcome, without transcript inference.
-  pi.on("agent_end", (event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     const assistant = findFinalAssistantMessage(event.messages ?? []);
     if (assistant !== undefined) {
       lastFinalRootOutcome = classifyAssistantMessage(assistant, ctx.model?.contextWindow);
     }
+    await acknowledgePersistedDeferredRootMessages();
   });
 
   // Manual, threshold, and overflow compaction all mutate root context outside
@@ -316,6 +384,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
       try {
         await runtime.request("agent.end_turn", { status: "ready" });
       } finally {
+        await acknowledgePersistedDeferredRootMessages();
         rootLogicalRunActive = false;
         lastFinalRootOutcome = undefined;
       }
@@ -327,6 +396,8 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     rootDeliveryEpoch += 1;
     rootDeliveryTail = Promise.resolve();
     deferredRootMessages.clear();
+    deferredRootPersisted.clear();
+    deferredRootRunMessages.clear();
     deferredRootWakePending = false;
     rootLogicalRunActive = false;
     lastFinalRootOutcome = undefined;
@@ -341,6 +412,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     runtime.setPendingRootFencesCount(0);
     await Promise.allSettled(pendingFences.map((fenceId) => runtime.releaseRootFence(fenceId, FabricRuntime.shutdownRpcTimeoutMs)));
     await runtime.stop().catch((error) => notifyLifecycleFailure(ctx, error, "warning"));
+    rootContext = undefined;
   });
 
   pi.registerCommand("agents", {

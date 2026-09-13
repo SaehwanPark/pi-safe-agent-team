@@ -115,6 +115,34 @@ test("automatic retry/compaction agent_start events share one logical root broke
   assert.deepEqual(operations, ["agent.begin_turn", "agent.end_turn"]);
 });
 
+test("root agent_start waits for broker admission before Pi can enter the provider loop", async () => {
+  let admitted = false;
+  let beginCalls = 0;
+  await withRuntimeSpies(async (operation) => {
+    if (operation === "agent.begin_turn") {
+      beginCalls += 1;
+      return { started: admitted };
+    }
+    return {};
+  }, async () => {
+    const handlers = makeExtensionHarness();
+    const context = makeContext();
+    await handlers.get("session_start")?.[0]?.({}, context);
+    const start = handlers.get("agent_start")?.[0];
+    assert.ok(start);
+    const pending = start({}, context) as Promise<void>;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.ok(beginCalls > 0);
+    let settled = false;
+    void pending.then(() => { settled = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    admitted = true;
+    await pending;
+    await handlers.get("session_shutdown")?.[0]?.({}, context);
+  });
+});
+
 test("an aborted root run drains descendants after settlement", async () => {
   let abortCalls = 0;
   const context = {

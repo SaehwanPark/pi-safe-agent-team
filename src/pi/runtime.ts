@@ -20,6 +20,7 @@ import { createEmbeddedContextController, type EmbeddedCompactionRequest, type E
 import { effectivePrefillBudget } from "../core/coordinator-wire.ts";
 import { ModelRouteCapacityArbiter } from "./model-capacity.ts";
 import { classifyAssistantMessage, classifyCompactionFailure, describeTurnOutcome, findFinalAssistantMessage, isBlockingOutcome, type ModelTurnOutcome } from "./turn-outcome.ts";
+import { loadFabricConfig } from "./config.ts";
 
 export interface RoleConfig {
   model?: string;
@@ -134,7 +135,7 @@ export class FabricRuntime {
   private _stateDirectory: string;
   readonly agentDir: string;
   private _endpoint: string;
-  readonly config?: Partial<FabricConfig>;
+  readonly config: Partial<FabricConfig>;
   readonly workspaceStrategy: WorkspaceStrategy;
 
   private readonly options: FabricRuntimeOptions;
@@ -217,7 +218,8 @@ export class FabricRuntime {
     this.options = options;
     this.cwd = canonicalWorkspacePath(options.cwd ?? process.cwd());
     this.agentDir = options.agentDir ?? getAgentDir();
-    this.config = options.config;
+    const loadedConfig = loadFabricConfig({ cwd: this.cwd, agentDir: this.agentDir });
+    this.config = { ...loadedConfig.config, ...(options.config ?? {}) };
     this.caseInsensitivePaths = options.config?.caseInsensitivePaths;
     this.workspaceStrategy = options.workspaceStrategy ?? new GitWorkspaceStrategy();
     this.roles = options.roles ?? {};
@@ -226,7 +228,7 @@ export class FabricRuntime {
     this._fabricId = options.fabricId ?? `fabric-${hashIdentity(identityKey)}`;
     this._stateDirectory = options.stateDirectory ?? join(this.agentDir, "safe-agents", hashIdentity(identityKey));
     this._endpoint = options.endpoint ?? defaultEndpoint(this._stateDirectory);
-    this.modelCapacity = new ModelRouteCapacityArbiter({ ...DEFAULT_FABRIC_CONFIG, ...(options.config ?? {}) });
+    this.modelCapacity = new ModelRouteCapacityArbiter({ ...DEFAULT_FABRIC_CONFIG, ...this.config });
   }
 
   /** Begin observing a root manual/automatic compaction before Pi mutates context. */
@@ -238,31 +240,52 @@ export class FabricRuntime {
     const releaseIndex = this.rootCompactionReleases.length;
     this.rootCompactionReleases.push(undefined);
     const route = this.root?.ctx.model ? routeFromModel(this.root.ctx.model, this.root.ctx.thinkingLevel ?? "medium") : undefined;
-    if (!route) return;
+    if (!route) {
+      this.rootCompactionReleases.pop();
+      this.rootCompactionBrokerReservations.pop();
+      this.rootCompactionInFlight = Math.max(0, this.rootCompactionInFlight - 1);
+      return;
+    }
+    let brokerReservation = false;
     try {
+      // The broker is authoritative across processes. Acquire it before the
+      // process-local gate so every model operation uses the same lock order
+      // (broker -> local) and a local waiter cannot deadlock a remote holder.
+      if (this.root) {
+        try {
+          while (true) {
+            if (signal?.aborted) throw new FabricError("BROKER_UNAVAILABLE", "Root compaction admission was aborted");
+            const result = await this.root.client.request<{ started?: boolean }>("agent.begin_turn", {}, FabricRuntime.shutdownRpcTimeoutMs, signal);
+            if (result?.started === true) {
+              brokerReservation = true;
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+        } catch (error) {
+          // Automatic compaction runs inside an already-admitted root turn, so
+          // the coordinator correctly reports a lifecycle conflict. Any other
+          // error means admission is unknown and compaction must fail closed.
+          if (!(error instanceof FabricError) || error.code !== "LIFECYCLE_CONFLICT") throw error;
+        }
+      }
+
       const release = await this.modelCapacity.acquire(route, signal);
       if (epoch !== this.rootCompactionEpoch || this.stopped) {
         release();
+        if (brokerReservation && this.root) await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
         return;
       }
       this.rootCompactionReleases[releaseIndex] = release;
-    } catch {
-      // The quiescence flag remains conservative when a local arbiter is unavailable.
-    }
-    if (this.root) {
-      try {
-        const result = await this.root.client.request<{ started?: boolean }>("agent.begin_turn", {}, FabricRuntime.shutdownRpcTimeoutMs, signal);
-        if (result?.started === true) {
-          if (epoch !== this.rootCompactionEpoch || this.stopped) {
-            await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
-          } else {
-            this.rootCompactionBrokerReservations[reservationIndex] = true;
-          }
-        }
-      } catch {
-        // An already-running root (automatic compaction) or unavailable broker
-        // is still covered by the local compaction flag.
-      }
+      this.rootCompactionBrokerReservations[reservationIndex] = brokerReservation;
+    } catch (error) {
+      if (brokerReservation && this.root) await this.root.client.request("agent.end_turn", { status: "ready" }, FabricRuntime.shutdownRpcTimeoutMs).catch(() => undefined);
+      // Keep direct callers from leaking a compaction slot when admission or
+      // the local gate is aborted before Pi can emit its failure hook.
+      if (releaseIndex === this.rootCompactionReleases.length - 1) this.rootCompactionReleases.pop();
+      if (reservationIndex === this.rootCompactionBrokerReservations.length - 1) this.rootCompactionBrokerReservations.pop();
+      if (this.rootCompactionInFlight > 0) this.rootCompactionInFlight -= 1;
+      throw error;
     }
   }
 
@@ -1314,9 +1337,7 @@ export class ManagedChild {
       contextDiagnostic: this.lastDiagnostic,
     })).agent;
     this.taskId = this.record.taskId;
-    if (this.record.status === "blocked") {
-      this.blockedByOutcome = classifyCompactionFailure(this.record.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery");
-    }
+    await this.reconcileRecoveryGate(this.record);
     this.started = true;
     this.heartbeatTimer = setInterval(() => {
       void this.client.request("agent.heartbeat", {}).catch(() => undefined);
@@ -1424,9 +1445,12 @@ export class ManagedChild {
           });
           this.record = registered.agent;
           this.taskId = registered.agent.taskId;
+          await this.reconcileRecoveryGate(this.record);
           const inbox = await this.client.request<AgentMessage[]>("message.inbox", { limit: 100 });
           for (const message of inbox) void this.deliverMessage(message);
-          if (this.taskId && this.session && !this.session.isStreaming) this.enqueuePrompt(`Broker recovered. Resume assigned task ${this.taskId} from the durable task state.`);
+          if (!this.blockedByOutcome && this.taskId && this.session && !this.session.isStreaming) {
+            this.enqueuePrompt(`Broker recovered. Resume assigned task ${this.taskId} from the durable task state.`);
+          }
           return;
         } catch (error) {
           if (isTerminalReconnectFailure(error)) {
@@ -1441,6 +1465,29 @@ export class ManagedChild {
       this.reconnectPromise = undefined;
     });
     return this.reconnectPromise;
+  }
+
+  /**
+   * Rebuild the local recovery gate from durable broker state after startup or
+   * reconnect. Task updates and agent updates are separate event streams, so a
+   * transport gap can leave either one newer than the other; querying both
+   * makes a blocked fact authoritative even when its companion event was
+   * missed. Clearing first also lets an explicit task reopen release a stale
+   * in-memory gate before inbox delivery resumes.
+   */
+  private async reconcileRecoveryGate(agent: AgentRecord): Promise<void> {
+    this.blockedByOutcome = undefined;
+    const task = agent.taskId
+      ? await this.client.request<TaskRecord>("task.show", { taskId: agent.taskId }).catch(() => undefined)
+      : undefined;
+    // A durable terminal task is stronger than a stale agent status. Do not
+    // re-arm a recovery gate (or resume work) from an older blocked event.
+    if (task && ["completed", "failed", "cancelled"].includes(task.status)) return;
+    if (agent.status === "blocked" || task?.status === "blocked") {
+      this.blockedByOutcome = classifyCompactionFailure(
+        task?.blockedReason ?? agent.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery",
+      );
+    }
   }
 
   private enqueuePrompt(prompt: string): void {
@@ -1490,35 +1537,60 @@ export class ManagedChild {
 
   private async finishTurnWithOutcome(outcomeValue: ModelTurnOutcome, taskId: string | undefined): Promise<void> {
     const reason = describeTurnOutcome(outcomeValue);
-    if (outcomeValue.lifecycle === "blocked") this.blockedByOutcome = outcomeValue;
-    if (taskId && outcomeValue.lifecycle === "blocked") {
-      await this.client.request("task.update", { taskId, action: "block", reason }).catch(() => undefined);
-    } else if (taskId && outcomeValue.lifecycle === "failed") {
-      await this.client.request("task.update", { taskId, action: "fail", reason }).catch(() => undefined);
-    }
-    const ended = await this.client.request<{ agent: AgentRecord }>("agent.end_turn", {
-      status: outcomeValue.lifecycle === "blocked" ? "blocked" : outcomeValue.lifecycle === "failed" ? "failed" : "ready",
+    const task = taskId
+      ? await this.client.request<TaskRecord>("task.show", { taskId }).catch(() => undefined)
+      : undefined;
+    const taskIsTerminal = Boolean(task && ["completed", "failed", "cancelled"].includes(task.status));
+    // A semantic task completion wins over a late provider/compaction outcome.
+    // Keep the diagnostic for observability, but never arm the blocked gate or
+    // emit a contradictory parent notification for an already-terminal task.
+    if (outcomeValue.lifecycle === "blocked" && !taskIsTerminal) this.blockedByOutcome = outcomeValue;
+
+    const finishArgs: Record<string, unknown> = {
+      status: taskIsTerminal ? "ready" : outcomeValue.lifecycle === "blocked" ? "blocked" : outcomeValue.lifecycle === "failed" ? "failed" : "ready",
       statusReason: reason,
-    });
+      ...(taskId && !taskIsTerminal && outcomeValue.lifecycle === "blocked" ? { taskId, taskAction: "block", reason } : {}),
+      ...(taskId && !taskIsTerminal && outcomeValue.lifecycle === "failed" ? { taskId, taskAction: "fail", reason } : {}),
+      metadata: {
+        cause: outcomeValue.kind,
+        provider: outcomeValue.provider,
+        model: outcomeValue.model,
+        contextTokens: outcomeValue.contextTokens,
+        contextWindow: outcomeValue.contextWindow,
+      },
+    };
+    let ended: { agent: AgentRecord; task?: TaskRecord };
+    try {
+      ended = await this.client.request<{ agent: AgentRecord; task?: TaskRecord }>("agent.finish_turn", finishArgs);
+      if (!ended?.agent) throw new FabricError("INVALID_ARGUMENT", "broker returned no finished agent");
+    } catch (error) {
+      // A broker process from an older safe-agent build may not know the
+      // compound operation. Preserve compatibility, while current brokers use
+      // the atomic path above to avoid task/agent/notice split-brain states.
+      if (!(error instanceof FabricError) || error.code !== "INVALID_ARGUMENT") throw error;
+      if (taskId && !taskIsTerminal && outcomeValue.lifecycle === "blocked") await this.client.request("task.update", { taskId, action: "block", reason }).catch(() => undefined);
+      if (taskId && !taskIsTerminal && outcomeValue.lifecycle === "failed") await this.client.request("task.update", { taskId, action: "fail", reason }).catch(() => undefined);
+      const legacy = await this.client.request<{ agent: AgentRecord }>("agent.end_turn", {
+        status: finishArgs.status,
+        statusReason: reason,
+      });
+      if (outcomeValue.lifecycle === "blocked" && !taskIsTerminal) {
+        await this.client.request("message.send", {
+          to: this.parentId,
+          type: "blocked",
+          body: reason,
+          metadata: finishArgs.metadata,
+        }).catch(() => undefined);
+      }
+      ended = legacy;
+    }
     this.record = ended.agent;
     this.taskId = ended.agent.taskId;
     if (outcomeValue.lifecycle === "blocked") {
       this.lastDiagnostic = reason;
       void this.client.request("agent.update", { contextDiagnostic: reason }).catch(() => undefined);
-      await this.client.request("message.send", {
-        to: this.parentId,
-        type: "blocked",
-        body: reason,
-        metadata: {
-          cause: outcomeValue.kind,
-          provider: outcomeValue.provider,
-          model: outcomeValue.model,
-          contextTokens: outcomeValue.contextTokens,
-          contextWindow: outcomeValue.contextWindow,
-        },
-      }).catch(() => undefined);
     }
-    if (outcomeValue.lifecycle === "failed") await this.stop();
+    if (outcomeValue.lifecycle === "failed" || ["completed", "failed", "cancelled"].includes(ended.agent.status)) await this.stop();
   }
 
   private async executePrompt(prompt: string): Promise<void> {
@@ -1541,13 +1613,13 @@ export class ManagedChild {
       }
     }
     const runPrompt = () => this.session!.prompt(prompt, { expandPromptTemplates: false });
-    // A structured prefill/KV failure is capacity pressure, not proof that the
-    // logical context is too large. The route token is released by the first
-    // attempt; retry the same context once after competing work has drained,
-    // then block rather than entering an unbounded compact/retry loop.
+    // Public AgentSession.prompt() creates a new user message on every call.
+    // Never emulate a same-context retry by calling it twice: Pi's native retry
+    // machinery is the only safe generation-level retry seam. If a structured
+    // prefill/KV failure is not natively retryable, finish this turn as blocked
+    // after the single prompt so the conversation is not silently duplicated.
     let promptThrownOutcome: ModelTurnOutcome | undefined;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      promptThrownOutcome = undefined;
+    try {
       const runPromptWithDepth = async (): Promise<void> => {
         this.modelCapacityDepth += 1;
         try {
@@ -1556,29 +1628,19 @@ export class ManagedChild {
           this.modelCapacityDepth -= 1;
         }
       };
-      try {
-        if (typeof (this.runtime as any).withModelRouteCapacity === "function") await this.runtime.withModelRouteCapacity(this.route, runPromptWithDepth, this.stopController.signal);
-        else await runPromptWithDepth();
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (this.stopping) return;
-        promptThrownOutcome = classifyAssistantMessage({
-          role: "assistant",
-          provider: this.route.provider,
-          model: this.route.model,
-          stopReason: /\b(?:abort|aborted|cancel|cancelled|canceled)\b/i.test(message) ? "aborted" : "error",
-          errorMessage: message,
-          usage: { input: 0, cacheRead: 0, output: 0 },
-        }, typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined);
-      }
-      const observed = this.compactionFailure ?? this.turnOutcome ?? this.lastObservedOutcome ?? promptThrownOutcome;
-      if (observed?.kind === "prefill_capacity" && attempt === 0) {
-        this.turnOutcome = undefined;
-        this.lastObservedOutcome = undefined;
-        this.compactionFailure = undefined;
-        continue;
-      }
-      break;
+      if (typeof (this.runtime as any).withModelRouteCapacity === "function") await this.runtime.withModelRouteCapacity(this.route, runPromptWithDepth, this.stopController.signal);
+      else await runPromptWithDepth();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (this.stopping) return;
+      promptThrownOutcome = classifyAssistantMessage({
+        role: "assistant",
+        provider: this.route.provider,
+        model: this.route.model,
+        stopReason: /\b(?:abort|aborted|cancel|cancelled|canceled)\b/i.test(message) ? "aborted" : "error",
+        errorMessage: message,
+        usage: { input: 0, cacheRead: 0, output: 0 },
+      }, typeof (this.model as any)?.contextWindow === "number" ? (this.model as any).contextWindow : undefined);
     }
     if (promptThrownOutcome) {
       const agent = await this.client.request<AgentRecord>("agent.status", {});
