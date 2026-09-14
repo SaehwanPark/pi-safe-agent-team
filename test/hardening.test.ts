@@ -139,16 +139,19 @@ test("coordination shell keeps explicit external paths on a separate policy axis
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(outside, "outside\n", "utf8");
+    // The managed shell uses Git Bash on Windows, which expects POSIX-style
+    // separators even though Node's filesystem APIs return native paths.
+    const outsideShellPath = process.platform === "win32" ? outside.replaceAll(/\\/g, "/") : outside;
     const context = { cwd: workspace, sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined } };
     const client = { request: async <T>(operation: string): Promise<T> => (operation === "shell.begin_barrier" ? { allowed: true, barrierId: "barrier-1" } : { released: true }) as T };
     const deny = createGuardedChildTools({ client, workspacePath: workspace, mayWriteRepo: false, mayUseShell: true, shellPolicy: "coordination", externalPathAccess: "deny" }).find((tool) => tool.name === "bash");
     assert.ok(deny);
-    await assert.rejects(() => deny.execute("bash-deny", { command: `cat ${outside}` }, undefined, undefined, context as never), /escapes the managed workspace/);
+    await assert.rejects(() => deny.execute("bash-deny", { command: `cat ${outsideShellPath}` }, undefined, undefined, context as never), /escapes the managed workspace/);
     await assert.rejects(() => deny.execute("bash-expansion", { command: "cat \"$HOME/.ssh/id_rsa\"" }, undefined, undefined, context as never), /substitution/);
 
     const read = createGuardedChildTools({ client, workspacePath: workspace, mayWriteRepo: false, mayUseShell: true, shellPolicy: "coordination", externalPathAccess: "read" }).find((tool) => tool.name === "bash");
     assert.ok(read);
-    const result = await read.execute("bash-read", { command: `cat ${outside}` }, undefined, undefined, context as never);
+    const result = await read.execute("bash-read", { command: `cat ${outsideShellPath}` }, undefined, undefined, context as never);
     assert.match((result.content?.[0] as { text?: string })?.text ?? "", /outside/);
   } finally {
     await rm(parent, { recursive: true, force: true });
