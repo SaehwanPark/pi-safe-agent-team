@@ -199,6 +199,29 @@ test("a real v0.2.3 checkpoint and journal tail migrate to v2 before recovery", 
   }
 });
 
+test("legacy resource fallback keeps one incarnation across lifecycle events", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  const legacyResource = {
+    id: "legacy",
+    kind: "file",
+    path: "legacy.ts",
+    owner: "root",
+    status: "active",
+    version: 1,
+    grants: { root: ["read", "comment", "write", "test"] },
+    sharedHolds: [],
+    waiters: [],
+    createdAt: 1_000,
+    updatedAt: 1_000,
+  };
+  coordinator.applyEvents([{ type: "resource_changed", resource: legacyResource } as any]);
+  const active = coordinator.dispatch("root", "resource.snapshot", { resourceId: "legacy" }).value as { incarnation: string };
+  coordinator.applyEvents([{ type: "resource_changed", resource: { ...legacyResource, status: "retired", retiredAt: 2_000, updatedAt: 2_000 } } as any]);
+  const retired = coordinator.dispatch("root", "resource.snapshot", { resourceId: "legacy" }).value as { incarnation: string };
+  assert.equal(retired.incarnation, active.incarnation);
+});
+
 test("new coordinator checkpoints use state version 2 and migrate legacy resources", () => {
   const coordinator = makeCoordinator();
   registerRoot(coordinator);
