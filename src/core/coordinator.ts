@@ -2925,12 +2925,15 @@ export class Coordinator {
   }
 
   /** Return the durable resource identity, deriving one only for legacy input. */
-  private resourceIncarnation(resource: { id: string; kind: string; parentId?: string; path?: string; createdAt: number; retiredAt?: number; incarnation?: string }): string {
+  private resourceIncarnation(resource: { id: string; kind: string; parentId?: string; path?: string; createdAt: number; incarnation?: string }): string {
     return resource.incarnation ?? this.legacyResourceIncarnation(resource);
   }
 
-  private legacyResourceIncarnation(resource: { id: string; kind: string; parentId?: string; path?: string; createdAt: number; retiredAt?: number }): string {
-    const seed = [this.rootId, resource.id, resource.kind, resource.parentId ?? "", resource.path ?? "", resource.createdAt, resource.retiredAt ?? ""].join("\u0000");
+  private legacyResourceIncarnation(resource: { id: string; kind: string; parentId?: string; path?: string; createdAt: number }): string {
+    // Retired-at and other lifecycle fields are deliberately excluded: a
+    // legacy resource must keep one identity while its status changes during
+    // journal replay, even before v2 has persisted an explicit incarnation.
+    const seed = [this.rootId, resource.id, resource.kind, resource.parentId ?? "", resource.path ?? "", resource.createdAt].join("\u0000");
     return `legacy-${createHash("sha256").update(seed).digest("hex").slice(0, 32)}`;
   }
 
