@@ -368,7 +368,7 @@ export class Coordinator {
       case "resource.define":
         return this.withEvents(events, this.defineResource(this.requireActor(actorId).id, args, events));
       case "resource.inspect":
-        return this.withEvents(events, this.inspectResource(this.requireActor(actorId).id, parseString(args.resourceId, "resourceId"), args.version), events);
+        return this.withEvents(events, this.inspectResource(this.requireActor(actorId).id, parseString(args.resourceId, "resourceId"), args.version, args.incarnation), events);
       case "resource.snapshot":
         return this.withEvents(events, this.resourceSnapshot(this.requireActor(actorId).id, parseString(args.resourceId, "resourceId")), events);
       case "resource.list":
@@ -1656,11 +1656,15 @@ export class Coordinator {
     return cloneResource(resource);
   }
 
-  private inspectResource(actorId: AgentId, resourceId: ResourceId, version: unknown): ResourceRecord & { stale?: boolean } {
+  private inspectResource(actorId: AgentId, resourceId: ResourceId, version: unknown, incarnation: unknown): ResourceRecord & { stale?: boolean } {
     const resource = this.requireResource(resourceId);
     assertCondition(this.canInspectResource(actorId, resource), "CAPABILITY_DENIED", `Agent ${actorId} cannot inspect ${resourceId}`);
     const requestedVersion = version === undefined ? undefined : parseNumber(version, "version", resource.version);
-    return { ...cloneResource(resource), stale: requestedVersion !== undefined && requestedVersion !== resource.version };
+    const requestedIncarnation = parseOptionalString(incarnation, "incarnation", 512);
+    const currentIncarnation = this.resourceIncarnation(resource);
+    const stale = (requestedIncarnation !== undefined && requestedIncarnation !== currentIncarnation)
+      || (requestedVersion !== undefined && requestedVersion !== resource.version);
+    return { ...cloneResource(resource), incarnation: currentIncarnation, stale };
   }
 
   private resourceSnapshot(actorId: AgentId, resourceId: ResourceId): { resourceId: ResourceId; incarnation: string; version: number; token: string } {

@@ -136,6 +136,22 @@ test("resource snapshot identity changes when a pruned retired ID is reused", ()
   assert.equal(replacement.version, 1);
   assert.notEqual(newSnapshot.incarnation, oldSnapshot.incarnation);
   assert.notEqual(newSnapshot.token, oldSnapshot.token);
+
+  const inspectedWithOldIdentity = coordinator.dispatch("root", "resource.inspect", {
+    resourceId: "parser",
+    incarnation: oldSnapshot.incarnation,
+    version: oldSnapshot.version,
+  }).value as { incarnation: string; version: number; stale: boolean };
+  assert.equal(inspectedWithOldIdentity.incarnation, newSnapshot.incarnation);
+  assert.equal(inspectedWithOldIdentity.version, newSnapshot.version);
+  assert.equal(inspectedWithOldIdentity.stale, true);
+
+  const inspectedWithCurrentIdentity = coordinator.dispatch("root", "resource.inspect", {
+    resourceId: "parser",
+    incarnation: newSnapshot.incarnation,
+    version: newSnapshot.version,
+  }).value as { stale: boolean };
+  assert.equal(inspectedWithCurrentIdentity.stale, false);
 });
 
 test("retained artifact admission frees a resolved slot at the exact limit", () => {

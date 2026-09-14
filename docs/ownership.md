@@ -15,7 +15,7 @@ Two resources overlap when they are equal or one is an ancestor of the other; de
 - **Owner**: logical authority to transfer/grant the resource. Ownership is not a runtime mutex; even the owner must acquire a mutable borrow before a guarded filesystem write.
 - **Shared borrow**: read/comment/test access. Multiple agents may hold it concurrently.
 - **Mutable borrow**: write access. Only one overlapping mutable holder may exist, and no other agent may hold an overlapping shared borrow.
-- **Version and incarnation**: `version` increments when mutable content authority is released or transferred; a same-owner re-claim is idempotent and does not bump it. Each definition also receives a durable incarnation identity, so `resource_snapshot` returns `resourceId@incarnation@version` and remains unambiguous after retired tombstone pruning and ID reuse. Retain the opaque token in task results.
+- **Version and incarnation**: `version` increments when mutable content authority is released or transferred; a same-owner re-claim is idempotent and does not bump it. Each definition also receives a durable incarnation identity, so `resource_snapshot` returns `resourceId@incarnation@version` and remains unambiguous after retired tombstone pruning and ID reuse. Retain the opaque token in task results. `resource.inspect` accepts the optional `incarnation` together with `version`; when supplied, `stale` is true if either identity differs. A version-only inspection remains supported for compatibility but checks freshness only within the current incarnation.
 
 A parent grant applies to descendants. A child may inspect a resource only with a read grant, ownership, or a current hold.
 
