@@ -46,6 +46,7 @@ By default:
 ```text
 <agentDir>/safe-agents/<sha256(canonicalWorkspace + "\0" + rootPiSessionId)[0:24]>/
   events.jsonl       # broker transaction journal
+  ack-proofs.jsonl   # append-only exact ACK proofs, compacted independently
   broker.lock        # local ownership lock
   broker.sock        # POSIX endpoint; named pipe on Windows
   root.token         # mode 0600 reconnect credential for the stable root identity
@@ -118,7 +119,12 @@ waiter and emits a targeted wake when admitted; hosts do not poll at 100 ms.
 Limits fail closed. There is no automatic unbounded retry or fallback provider.
 
 The broker periodically checkpoints `events.jsonl` (by transaction count or
-file size) and checkpoints again during clean shutdown. Heartbeats without
+file size) and checkpoints again during clean shutdown. Persisted coordinator
+state is version 2; a v0.3 broker migrates version-1 checkpoints once and
+rejects unsupported newer versions. Back up a state directory before its first
+v2 checkpoint because the upgrade is intentionally one-way. Exact ACK proofs
+are stored separately in `ack-proofs.jsonl` and compacted without entering
+coordinator rollback images. Heartbeats without
 leases update liveness in memory without creating a synchronous journal write;
 lease renewals remain durable. Lifecycle writes (`agent.begin_turn`,
 `agent.end_turn`, and `agent.finish_turn`) accept durable `operationId` values,

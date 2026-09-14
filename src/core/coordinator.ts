@@ -1367,7 +1367,8 @@ export class Coordinator {
     });
     if (message.acknowledgedAt !== undefined) {
       const key = this.ackTombstoneKey(message.to, message.id, currentRevision);
-      const hadTombstone = this.acknowledgedMessages.has(key);
+      const hadTombstone = this.ackProofs?.findExact(message.to, message.id, currentRevision) !== undefined
+        || this.acknowledgedMessages.has(key);
       this.rememberAckTombstone(message);
       if (!hadTombstone) events.push({ type: "message_acknowledged", message: cloneMessage(message) });
       return cloneMessage(message);
