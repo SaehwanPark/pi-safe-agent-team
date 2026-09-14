@@ -9,7 +9,7 @@ import { Coordinator } from "../src/core/coordinator.ts";
 import { FabricError } from "../src/core/errors.ts";
 import { BrokerClient } from "../src/broker/client.ts";
 import { BrokerServer } from "../src/broker/server.ts";
-import { assertNoDetachedShellCommand, assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootWriteGuard, workspaceRelativePath } from "../src/pi/guards.ts";
+import { assertCoordinationShellCommand, assertNoDetachedShellCommand, assertReadOnlyShellCommand, createGuardedChildTools, createGuardedReadOnlyTools, evaluateRootWriteGuard, workspaceRelativePath } from "../src/pi/guards.ts";
 import { ManagedChild, taskAwareTurnStatus } from "../src/pi/runtime.ts";
 import type { AgentRecord, AgentMessage, ModelRoute, ResourceRecord } from "../src/core/types.ts";
 
@@ -86,6 +86,111 @@ test("shared shell rejects mutation syntax and dangerous read-command options", 
   expectCode(() => assertReadOnlyShellCommand("du --files0-from=names.bin"), "CAPABILITY_DENIED");
   expectCode(() => assertReadOnlyShellCommand("sort --files0-from=names.bin"), "CAPABILITY_DENIED");
   expectCode(() => assertReadOnlyShellCommand("find . -files0-from names.bin"), "CAPABILITY_DENIED");
+});
+
+test("coordination shell allows opaque foreground commands and keeps strict mode opt-in", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "safe-agents-coordination-shell-"));
+  try {
+    const calls: Array<{ operation: string; args: Record<string, unknown> }> = [];
+    const client = {
+      request: async <T>(operation: string, args: Record<string, unknown> = {}): Promise<T> => {
+        calls.push({ operation, args });
+        return (operation === "shell.begin_barrier" ? { allowed: true, barrierId: "barrier-1" } : { released: true }) as T;
+      },
+    };
+    const context = { cwd: directory, sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined } };
+    const coordination = createGuardedChildTools({ client, workspacePath: directory, mayWriteRepo: false, mayUseShell: true, shellPolicy: "coordination" }).find((tool) => tool.name === "bash");
+    assert.ok(coordination);
+    await coordination.execute("bash-coordination", { command: "node -e 'console.log(\"opaque\")'" }, undefined, undefined, context as never);
+    assert.deepEqual(calls.map((call) => call.operation), ["shell.begin_barrier", "shell.end_barrier"]);
+    assert.equal(calls[1]?.args.barrierId, "barrier-1");
+
+    const strict = createGuardedChildTools({ client, workspacePath: directory, mayWriteRepo: false, mayUseShell: true, shellPolicy: "strict" }).find((tool) => tool.name === "bash");
+    assert.ok(strict);
+    await assert.rejects(() => strict.execute("bash-strict", { command: "node -e 'console.log(\"opaque\")'" }, undefined, undefined, context as never), /allowlist/);
+    assert.throws(() => assertCoordinationShellCommand("git reset --hard"), (error: unknown) => error instanceof FabricError && error.code === "CAPABILITY_DENIED");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("coordination shell treats ordinary diagnostic CLIs as opaque foreground work", () => {
+  for (const command of [
+    "codexbar --provider codex --json-only",
+    "gh issue view 123",
+    "docker inspect agent",
+    "nvidia-smi",
+    "ollama list",
+    "pytest",
+    "custom-internal-cli --report",
+  ]) {
+    assert.equal(assertCoordinationShellCommand(command).kind, "unknown", command);
+  }
+  for (const command of ["git status", "git diff", "rg TODO src", "cat README.md"]) {
+    assert.equal(assertCoordinationShellCommand(command).kind, "read-only", command);
+  }
+});
+
+test("coordination shell keeps explicit external paths on a separate policy axis", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "safe-agents-external-shell-"));
+  const workspace = join(parent, "workspace");
+  const outside = join(parent, "outside.txt");
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(outside, "outside\n", "utf8");
+    const context = { cwd: workspace, sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined } };
+    const client = { request: async <T>(operation: string): Promise<T> => (operation === "shell.begin_barrier" ? { allowed: true, barrierId: "barrier-1" } : { released: true }) as T };
+    const deny = createGuardedChildTools({ client, workspacePath: workspace, mayWriteRepo: false, mayUseShell: true, shellPolicy: "coordination", externalPathAccess: "deny" }).find((tool) => tool.name === "bash");
+    assert.ok(deny);
+    await assert.rejects(() => deny.execute("bash-deny", { command: `cat ${outside}` }, undefined, undefined, context as never), /escapes the managed workspace/);
+
+    const read = createGuardedChildTools({ client, workspacePath: workspace, mayWriteRepo: false, mayUseShell: true, shellPolicy: "coordination", externalPathAccess: "read" }).find((tool) => tool.name === "bash");
+    assert.ok(read);
+    const result = await read.execute("bash-read", { command: `cat ${outside}` }, undefined, undefined, context as never);
+    assert.match((result.content?.[0] as { text?: string })?.text ?? "", /outside/);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("opaque shell barriers exclude foreign mutable borrows and root writes", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  const shell = registerChild(coordinator, "shell", { mayUseShell: true });
+  const writer = registerChild(coordinator, "writer", { mayWriteRepo: true });
+  coordinator.dispatch("root", "resource.define", { resourceId: "file:a.ts", kind: "file", path: "a.ts" });
+  coordinator.dispatch("root", "resource.grant", { resourceId: "file:a.ts", agentId: writer.id, permissions: ["read", "write"] });
+  const started = coordinator.dispatch(shell.id, "shell.begin_barrier", {}).value as { allowed: boolean; barrierId: string };
+  assert.equal(started.allowed, true);
+  assert.equal((coordinator.dispatch("root", "resource.check_write", { path: "a.ts", hostGuard: true }).value as { allowed: boolean }).allowed, false);
+  const waiting = coordinator.dispatch(writer.id, "resource.borrow", { resourceId: "file:a.ts", mode: "mutable", wait: true }).value as { status: string };
+  assert.equal(waiting.status, "waiting");
+  coordinator.dispatch(shell.id, "shell.end_barrier", { barrierId: started.barrierId });
+  const resource = coordinator.dispatch("root", "resource.inspect", { resourceId: "file:a.ts" }).value as ResourceRecord;
+  assert.equal(resource.mutableHold?.agentId, writer.id);
+});
+
+test("shell barriers require the managed-shell capability", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  const child = registerChild(coordinator, "no-shell", { mayUseShell: false });
+  expectCode(() => coordinator.dispatch(child.id, "shell.begin_barrier", {}), "CAPABILITY_DENIED");
+});
+
+test("opaque shell barriers survive checkpoint restore and replay release events", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  const child = registerChild(coordinator, "shell", { mayUseShell: true });
+  const started = coordinator.dispatch(child.id, "shell.begin_barrier", {}).value as { barrierId: string };
+  const restored = makeCoordinator();
+  restored.restoreState(coordinator.exportState());
+  const restoredStatus = restored.dispatch("root", "fabric.status", {}).value as { activeShellBarriers?: number; shellBarriers?: Array<{ id: string }> };
+  assert.equal(restoredStatus.activeShellBarriers, 1);
+  assert.equal(restoredStatus.shellBarriers?.[0]?.id, started.barrierId);
+  const end = restored.dispatch(child.id, "shell.end_barrier", { barrierId: started.barrierId });
+  assert.equal((end.value as { released: boolean }).released, true);
+  const after = restored.dispatch("root", "fabric.snapshot", {}).value as { activeShellBarriers: number };
+  assert.equal(after.activeShellBarriers, 0);
 });
 
 test("managed worktree shells reject detached/background processes", () => {

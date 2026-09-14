@@ -333,6 +333,7 @@ interface FabricStateSnapshotV1 {
   mutableHolds: number;
   activeWriteFences: number;
   activeWriteQuarantines: number;
+  activeShellBarriers?: number;
   pendingRootRequests: number;
   pendingRootDeliveries: number;
 
@@ -347,6 +348,7 @@ Quiescence and session replacement rules are strictly conservative:
 - **Child agent states**: No child agent may be in `starting` or `running` state (`runningChildren === 0`), and no actor may remain in the reconnectable recovery window (`recoveringAgents === 0`).
 - **Fabric tasks**: Every non-terminal task, including a task whose owner was released during recovery, keeps replacement unsafe (`unresolvedChildTasks === 0` and `unownedUnresolvedTasks === 0`).
 - **Resource holds, fences, and restart quarantines**: Zero active mutable borrows (`mutableHolds === 0`), active write fences (`activeWriteFences === 0`), and durable write quarantines (`activeWriteQuarantines === 0`) across the entire fabric.
+- **Opaque shell barriers**: Zero active child barriers (`activeShellBarriers === 0`) is required for quiescence; an unfamiliar foreground command may have an unknown write set until its host releases the barrier.
 - **Pending root requests and deliveries**: Zero unresolved requests in either direction involving the root (`pendingRootRequests === 0`) or unconsumed deliveries directed to the root (`pendingRootDeliveries === 0`).
 - **Root context mutation**: `rootCompactionInFlight === false`; manual, threshold, overflow, and embedded root compaction keep `sessionReplacementSafe === false` for the entire hook interval.
 - **Root provider health**: `rootContextHealth === "degraded"` is a visible recovery gate after an exhausted root provider/context outcome; diagnostics are bounded and automatic message wakes remain suppressed until recovery.
@@ -373,6 +375,29 @@ When registered by a context manager, safe-agent-team's `ManagedChild` requests 
 - Context usage and compactions delegate to upstream Pi `AgentSession.compact(customInstructions?: string)`, passing only explicit `customInstructions` (the `reason` field remains diagnostic metadata).
 - Runs strictly inside the managed child session without ambient extension loading (`noExtensions: true`).
 - Fails soft: any error or throwing provider drops back to `native` context management, deactivating the embedded controller while retaining its reference and recovery artifacts, and notifying the coordinator broker with `agent.update({ contextMode: "native" })` without crashing the child agent. Final child shutdown disposes the manager and cleans those artifacts. Reconnecting children preserve this degraded (or active) `contextMode` during `agent.register`.
+
+## Managed Child Shell Policies
+
+Managed children with `mayUseShell` select one of three policies through the
+fabric configuration (default `shellPolicy: "coordination"`):
+
+- `coordination` allows classified observational commands concurrently, rejects
+  recognized mutators and detached/background forms, and admits an unfamiliar
+  foreground command only after `shell.begin_barrier`. The owning host runs the
+  command and calls `shell.end_barrier` in a `finally` path. The opaque barrier
+  excludes foreign mutable borrows and root guarded writes while ordinary reads
+  continue.
+- `strict` retains the historical single-command read-only allowlist and
+  workspace-contained argument checks.
+- `trusted` is intended for isolated worktrees and only retains the managed
+  process-lifecycle guard against detached/background forms.
+
+`externalPathAccess` is independent of shell risk: `deny` keeps explicit path
+arguments inside the managed workspace, `read` permits outside paths only for
+classified observational commands, and `any` permits them for all managed
+policies except `strict`. Barrier start/release events are journaled, included
+in bounded root status/snapshot projections, and replayed during broker
+recovery so an opaque command cannot be raced by a writer across restart.
 
 ## Root Shell Mutator Preflight Guard
 

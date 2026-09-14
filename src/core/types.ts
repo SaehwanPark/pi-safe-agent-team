@@ -29,6 +29,10 @@ export type ModelTurnRecoveryState = "running" | "stopped";
 export type ArtifactDisposition = "cleaned" | "retained";
 export type RetainedArtifactStatus = "retained" | "resolved";
 export type ResourceStatus = "active" | "retired";
+/** Policy used for managed child shell execution. */
+export type ShellPolicy = "coordination" | "strict" | "trusted";
+/** Boundary for explicit filesystem paths passed to a managed shell. */
+export type ExternalPathAccess = "deny" | "read" | "any";
 
 export const MESSAGE_TYPES = [
   "inform",
@@ -292,6 +296,24 @@ export interface WriteFenceRecord {
   expiresAt: number;
 }
 
+/**
+ * An opaque shared-workspace shell operation. Unlike a resource write fence,
+ * this barrier covers the whole managed workspace because the executable's
+ * write set is not knowable before it runs.
+ */
+export interface OpaqueShellBarrierRecord {
+  id: string;
+  actorId: AgentId;
+  createdAt: number;
+  /** Number of concurrent opaque commands from the owning host. */
+  references?: number;
+}
+
+export interface ActiveShellBarrierSummary {
+  id: string;
+  actorId: AgentId;
+}
+
 export interface ResourceHold {
   leaseId: LeaseId;
   agentId: AgentId;
@@ -420,6 +442,10 @@ export interface FabricConfig {
   maxRetainedArtifacts?: number;
   /** Maximum records archived by one maintenance pass. */
   historyGcBatchSize?: number;
+  /** Managed child shell policy; shared children default to coordination. */
+  shellPolicy?: ShellPolicy;
+  /** Explicit path boundary for managed child shell arguments. */
+  externalPathAccess?: ExternalPathAccess;
 }
 
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
@@ -440,6 +466,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   maxArchivedRecords: 4_096,
   maxRetainedArtifacts: 4_096,
   historyGcBatchSize: 256,
+  shellPolicy: "coordination",
+  externalPathAccess: "deny",
 };
 
 type PersistedResourceRecord = Omit<ResourceRecord, "incarnation"> & { incarnation?: string };
@@ -473,6 +501,8 @@ interface PersistedCoordinatorStateFields {
   acknowledgedMessages?: MessageAckTombstone[];
   /** Capacity reservations for provider calls that may outlive a broker restart. */
   recoveryTurnReservations?: ModelTurnRecoveryReservation[];
+  /** Opaque shared-workspace shell barriers that may span a broker restart. */
+  shellBarriers?: OpaqueShellBarrierRecord[];
 }
 
 /** Persisted state written by v0.2.x. It is accepted only as migration input. */
@@ -545,6 +575,9 @@ export interface FabricStatus {
   activeMutableHolds?: number;
   fences?: ActiveFenceSummary[];
   activeWriteQuarantines?: number;
+  /** Opaque shared-workspace shell operations currently holding the global barrier. */
+  activeShellBarriers?: number;
+  shellBarriers?: ActiveShellBarrierSummary[];
   /** Durable turn requests waiting for global or route capacity. */
   pendingModelTurns?: ModelTurnWaiter[];
   /** Physical route reservations awaiting host recovery confirmation. */
@@ -580,6 +613,8 @@ export interface FabricSnapshot {
   mutableHolds: number;
   activeWriteFences: number;
   activeWriteQuarantines: number;
+  /** Opaque shared-workspace shell operations currently holding the global barrier. */
+  activeShellBarriers: number;
   pendingRootRequests: number;
   pendingModelTurns: number;
   /** Bounded fence details; the count remains authoritative when truncated. */
@@ -606,6 +641,8 @@ export type CoordinatorEvent =
   | { type: "model_turn_cancelled"; waiterId: string; agentId: AgentId }
   | { type: "model_turn_recovery_reserved"; reservation: ModelTurnRecoveryReservation }
   | { type: "model_turn_recovery_resolved"; agentId: AgentId; operationId?: string; state: ModelTurnRecoveryState | "expired" }
+  | { type: "shell_barrier_started"; barrier: OpaqueShellBarrierRecord }
+  | { type: "shell_barrier_released"; barrierId: string; actorId: AgentId; remainingReferences?: number }
   | { type: "agent_artifacts_retained"; agentId: AgentId; artifact: RetainedArtifactRecord }
   | { type: "agent_artifacts_resolved"; agentId: AgentId; artifactId: string; resolvedAt: number; resolution?: string }
   | { type: "agent_artifact_pruned"; artifactId: string }

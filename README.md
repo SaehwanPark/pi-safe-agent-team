@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml/badge.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue.svg)](https://saehwanpark.github.io/pi-safe-agent-team/)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/releases/tag/v0.3.0)
+[![Version](https://img.shields.io/badge/version-0.3.1-blue.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/releases/tag/v0.3.1)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node](https://img.shields.io/badge/node-%3E%3D22.19.0-brightgreen.svg)](https://nodejs.org/)
 
@@ -37,7 +37,7 @@ An LLM should never be asked to act as a mutex, a distributed lock manager, a me
 3. **Physical Path Identity & Case Folding**: Symlinks, directory junctions, and relative path aliases are resolved to canonical real filesystem paths before coordinator checks. The broker automatically probes volume case-folding on startup (macOS APFS / Windows NTFS) to prevent cross-casing write collisions.
 4. **Durable Idempotency & Crash Recovery**: `agent.spawn`, `task.create`, lifecycle turns, and message ACKs enforce unique per-actor `operationId` records committed to an append-only transaction journal (`events.jsonl`). Exact ACK proofs continue in a cold append-only store after hot mailbox history is pruned. Ambiguous network/timeout retries replay original responses safely without duplicating agents, tasks, turns, or acknowledgements. Broker recovery fences complete descendant subtrees, retains task ownership during reconnect grace, and keeps reconnectable capacity reserved until reattach or expiry. Capacity grants are identified, durable, expiring reservations claimed by the exact host retry.
 5. **Non-Blocking Clarifications**: When a child asks for parent or user input via `agent_send(type="clarification")`, it yields its turn (`terminate: true`) and transitions to `waiting`. The parent is never blocked on the JavaScript event loop.
-6. **Hardened Sandboxing**: Shared-workspace shell access is strictly read-only (`git`, `rg`, `grep`, `cat`, etc.) and rejects indirect file-list expansion flags (such as `file -f` or `wc --files0-from`).
+6. **Coordination-First Shell Policy**: Shared-workspace shell defaults to a blocklist: known mutators and detached/background forms are denied, observational commands run concurrently, and unfamiliar foreground commands run under an opaque workspace barrier. Strict allowlist mode and external-path boundaries remain explicit options.
 7. **Root Shell Mutator Preflight Guard**: Root shell execution is intercepted before process spawn to detect broad mutations (`git checkout`, `git restore`, `rm -rf`, `prettier --write`, `sed -i`, `black`, `ruff format`, etc.) or pipe/redirection writes. If active child mutable holds or write fences exist in the workspace, the mutator is safely vetoed before damaging child work.
 8. **Ecosystem Interop & Embedded Context**: Exposes conservative fabric quiescence via `Symbol.for("pi.extension-interop.v1")` as `safe-agent-team.fabric-state.v1` for extensions like `local-context-manager` (LCM). Consumes LCM embedded context policy (`local-context-manager.embedded-context.v1`) for child output reduction and compact turn state while strictly maintaining `noExtensions: true`.
 9. **Centralized Delivery & Turn Discipline**: Pure table-driven root delivery policy routes background progress and informational messages directly into model-visible context without triggering redundant root model wakeups. Clarifications, escalations, blocks, and task completions wake the root immediately. Coalesced notifications carry revisions so an older session receipt cannot acknowledge newer state, and capacity-blocked turns use durable FIFO wakeups instead of polling. Bounded status/snapshot projections keep quiescence checks below the transport frame limit.
@@ -46,7 +46,7 @@ An LLM should never be asked to act as a mutex, a distributed lock manager, a me
 
 ## Comparison at a Glance
 
-| Capability | Standard Pi Subagents | `nicobailon/pi-subagents` | `tmustier/pi-agent-teams` | `pi-safe-agent-team` (v0.3) |
+| Capability | Standard Pi Subagents | `nicobailon/pi-subagents` | `tmustier/pi-agent-teams` | `pi-safe-agent-team` (v0.3.1) |
 | :--- | :--- | :--- | :--- | :--- |
 | **Concurrency Enforcement** | None (advisory) | None (advisory) | Git branch/worktree only | **Authoritative Borrow Checker + Leases** |
 | **Filesystem Write Guard** | None | None | None | **Write boundary hook with Write Fences** |
@@ -69,7 +69,7 @@ An LLM should never be asked to act as a mutex, a distributed lock manager, a me
 ### Option A: Pin the GitHub release (Recommended)
 
 ```bash
-pi install git:github.com/SaehwanPark/pi-safe-agent-team@v0.3.0
+pi install git:github.com/SaehwanPark/pi-safe-agent-team@v0.3.1
 ```
 
 ### Option B: Development/latest from GitHub
@@ -133,10 +133,10 @@ When an agent needs to edit a file:
 
 - **Write Fences Across Broker Crashes**: The live fence object is in memory, while each guarded resource records a journaled restart quarantine through the fence expiry. A surviving broker restart therefore continues excluding foreign writers until the old fence window ends or the original actor closes it.
 - **Recovery and Cleanup**: A reconnectable actor remains part of topology, child capacity, task ownership, and quiescence accounting. Recovery grace expires recursively for a stale subtree; a later runtime startup cleans only worktrees that are clean and still at their recorded base commit, plus matching child session directories, when no live or recovering actor references them. Committed child branches and dirty worktrees remain available for inspection as retained cold artifacts, while terminal agents/tasks can still leave hot state. `artifactsCleanedAt`/`artifactDisposition` prevents repeat GC.
-- **Borrowing Guarantee & Root Shell Escape Hatch**: Guarded Pi writes participate in borrowing and write fencing. Root shell remains a trusted escape hatch with best-effort preflight blocking of recognized broad mutators when live child holds exist. Shell commands are not mechanically sandbox-guaranteed.
+- **Borrowing Guarantee & Shell Policies**: Guarded Pi writes participate in borrowing and write fencing. Shared children use coordination-first shell policy by default: recognized mutators and detached/background forms are blocked, while unknown foreground commands run behind a broad opaque barrier that pauses competing writes. Set `shellPolicy: "strict"` for the historical allowlist, or use `"trusted"` for an isolated worktree. `externalPathAccess` (`deny`/`read`/`any`) controls explicit shell path arguments independently. Root shell remains a trusted escape hatch with best-effort preflight checks.
 - **Child Capability Boundary**: Managed children run with `noExtensions: true` and receive only guarded tools. External web access, browser, MCP tools, and computer-use actions are root capabilities not inherited by children; children request external information through parent messages.
 - **Context Integration**: When an embedded context provider (`local-context-manager.embedded-context.v1`) is discovered via interop, children safely utilize adaptive output reduction and compaction without loading external extensions. If absent, children fall back cleanly to native Pi context behavior.
-- **Local-First IPC**: v0.3.0 provides local multi-agent coordination via Unix domain sockets and Windows named pipes. Distributed network clustering is planned for future milestones.
+- **Local-First IPC**: v0.3.1 provides local multi-agent coordination via Unix domain sockets and Windows named pipes. Distributed network clustering is planned for future milestones.
 
 ---
 

@@ -34,6 +34,8 @@ const CONFIG_KEYS = new Set<keyof FabricConfig>([
   "historyRetentionMs",
   "maxArchivedRecords",
   "historyGcBatchSize",
+  "shellPolicy",
+  "externalPathAccess",
   "modelRouteCapacity",
   "modelRoutePolicies",
   "modelRouteCapacities",

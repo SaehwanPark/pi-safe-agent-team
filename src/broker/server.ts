@@ -550,6 +550,10 @@ export class BrokerServer {
         return observer.depth === 0 || event.reservation.agentId === actorId;
       case "model_turn_recovery_resolved":
         return observer.depth === 0 || event.agentId === actorId;
+      case "shell_barrier_started":
+        return observer.depth === 0 || event.barrier.actorId === actorId;
+      case "shell_barrier_released":
+        return observer.depth === 0 || event.actorId === actorId;
       case "agent_artifacts_retained":
         return observer.depth === 0 || event.agentId === actorId;
       case "agent_artifacts_resolved":

@@ -1,4 +1,5 @@
 import { constants as fsConstants } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { access as fsAccess, lstat as fsLstat, mkdir as fsMkdir, open as fsOpen, readFile as fsReadFile, realpath as fsRealpath, readdir as fsReaddir, stat as fsStat } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
 import {
@@ -16,17 +17,21 @@ import {
   type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 import { FabricError } from "../core/errors.ts";
-import type { FabricStatus } from "../core/types.ts";
-import { classifyRootShellCommand } from "./shell-classifier.ts";
+import type { ExternalPathAccess, FabricStatus, ShellPolicy } from "../core/types.ts";
+import { classifyRootShellCommand, type RootShellRisk } from "./shell-classifier.ts";
 import { detectCaseInsensitivePaths } from "../broker/server.ts";
 
 export interface WriteAuthorizationClient {
   request<T = unknown>(operation: string, args?: Record<string, unknown>, timeoutMs?: number): Promise<T>;
+  requestIdempotent?<T = unknown>(operation: string, args?: Record<string, unknown>, operationId?: string, timeoutMs?: number, signal?: AbortSignal): Promise<T>;
 }
 
-export type ChildShellMode = "read-only" | "workspace";
+/** Backwards-compatible names retained for callers that used the old mode flag. */
+export type ChildShellMode = "read-only" | "workspace" | ShellPolicy;
 
-const DETACHED_SHELL_COMMAND = /(^|[;&|]\s*)(?:nohup|setsid|disown|daemon(?:ize)?|start-stop-daemon|systemctl)\b/i;
+// Match launchers even when wrapped by `env`, `sudo`, or `command`; false
+// positives are preferable to letting a managed child strand a process.
+const DETACHED_SHELL_COMMAND = /\b(?:nohup|setsid|disown|daemon(?:ize)?|start-stop-daemon|systemctl)\b/i;
 
 /** Reject common daemon/background forms in disposable managed worktrees. */
 export function assertNoDetachedShellCommand(command: string): void {
@@ -42,6 +47,10 @@ export interface GuardedChildToolOptions {
   mayUseShell: boolean;
   /** Worktree shells are explicitly trusted to mutate their isolated workspace. */
   shellMode?: ChildShellMode;
+  /** Explicit child shell policy. Defaults to coordination for shared workspaces. */
+  shellPolicy?: ShellPolicy;
+  /** Boundary for explicit filesystem paths in managed shell arguments. */
+  externalPathAccess?: ExternalPathAccess;
 }
 
 interface WriteDecision {
@@ -112,17 +121,13 @@ export function createGuardedReadOnlyTools(workspacePath: string): AnyToolDefini
 export function createGuardedChildTools(options: GuardedChildToolOptions): AnyToolDefinition[] {
   const tools: AnyToolDefinition[] = [];
   if (options.mayUseShell === true) {
-    const shellOperations: BashOperations = options.shellMode === "workspace"
-      ? (() => {
-          const local = createLocalBashOperations();
-          return {
-            exec: async (command, cwd, executionOptions) => {
-              assertNoDetachedShellCommand(command);
-              return local.exec(command, cwd, executionOptions);
-            },
-          };
-        })()
-      : createReadOnlyShellOperations(options.workspacePath);
+    const shellPolicy = resolveShellPolicy(options);
+    const externalPathAccess = options.externalPathAccess ?? "deny";
+    const shellOperations: BashOperations = shellPolicy === "trusted"
+      ? createTrustedShellOperations(options.workspacePath)
+      : shellPolicy === "strict"
+        ? createStrictShellOperations(options.workspacePath)
+        : createCoordinationShellOperations(options.client, options.workspacePath, externalPathAccess);
     tools.push(createBashToolDefinition(options.workspacePath, { operations: shellOperations }));
   }
   if (options.mayWriteRepo === true) {
@@ -411,13 +416,21 @@ export async function evaluateRootShellGuard(
   const childFences = (status.fences ?? []).filter(
     (f) => f.actorId !== rootAgentId,
   );
+  const activeShellBarriers = status.activeShellBarriers ?? status.shellBarriers?.length ?? 0;
+  const childShellBarriers = (status.shellBarriers ?? []).filter((barrier) => barrier.actorId !== rootAgentId);
   // A bounded diagnostic page cannot prove that an omitted contention record
   // is unrelated to the command. Preserve the guard's fail-closed contract
   // when the authoritative count exceeds the visible details.
   const visibleMutableHolds = status.resources.filter((resource) => resource.mutableHold !== undefined).length;
-  const omittedContention = (status.activeMutableHolds ?? 0) > visibleMutableHolds || activeFences > (status.fences?.length ?? 0);
+  const omittedContention = (status.activeMutableHolds ?? 0) > visibleMutableHolds
+    || activeFences > (status.fences?.length ?? 0)
+    || activeShellBarriers > (status.shellBarriers?.length ?? 0);
   if (omittedContention) {
-    const contention = activeFences > (status.fences?.length ?? 0) ? "an active write fence" : "a mutable resource hold";
+    const contention = activeShellBarriers > (status.shellBarriers?.length ?? 0)
+      ? "an opaque shell barrier"
+      : activeFences > (status.fences?.length ?? 0)
+        ? "an active write fence"
+        : "a mutable resource hold";
     return {
       block: true,
       reason: `safe-agents blocked \`${command.trim()}\` because the broker returned a bounded contention projection and may have omitted ${contention}; wait for coordinated work to settle and retry.`,
@@ -429,6 +442,13 @@ export async function evaluateRootShellGuard(
   // an unclassified executable would bypass coordination entirely, so fail
   // closed until the coordinated work is released.
   if (risk.kind === "unknown") {
+    if (activeShellBarriers > 0) {
+      const holder = childShellBarriers[0]?.actorId ?? "a child agent";
+      return {
+        block: true,
+        reason: `safe-agents blocked unknown shell command \`${command.trim()}\` while child ${holder} holds an opaque shared-workspace shell barrier. Wait for the child shell command to exit before retrying.`,
+      };
+    }
     if (childHolds.length === 0 && childFences.length === 0) return undefined;
     const holder = childHolds[0]?.mutableHold?.agentId ?? childFences[0]?.actorId ?? "a child agent";
     const res = childHolds[0]?.path ?? childHolds[0]?.id ?? childFences[0]?.path ?? childFences[0]?.resourceId ?? "workspace";
@@ -440,7 +460,20 @@ export async function evaluateRootShellGuard(
   }
 
   if (childHolds.length === 0 && childFences.length === 0 && activeFences === 0) {
-    return undefined;
+    if (activeShellBarriers === 0) return undefined;
+    const holder = childShellBarriers[0]?.actorId ?? "a child agent";
+    return {
+      block: true,
+      reason: `safe-agents blocked \`${command.trim()}\` while child ${holder} holds an opaque shared-workspace shell barrier. Wait for the child shell command to exit before retrying.`,
+    };
+  }
+
+  if (activeShellBarriers > 0) {
+    const holder = childShellBarriers[0]?.actorId ?? "a child agent";
+    return {
+      block: true,
+      reason: `safe-agents blocked \`${command.trim()}\` while child ${holder} holds an opaque shared-workspace shell barrier. Wait for the child shell command to exit before retrying.`,
+    };
   }
 
   if (risk.scope === "broad" || !risk.paths || risk.paths.length === 0) {
@@ -531,13 +564,40 @@ export function workspaceRelativePath(workspacePath: string, targetPath: string)
   return relativePath.split(sep).join("/");
 }
 
-function createReadOnlyShellOperations(workspacePath: string): BashOperations {
+function resolveShellPolicy(options: GuardedChildToolOptions): ShellPolicy {
+  if (options.shellPolicy) return options.shellPolicy;
+  switch (options.shellMode) {
+    case "workspace":
+    case "trusted":
+      return "trusted";
+    case "read-only":
+    case "strict":
+      return "strict";
+    case "coordination":
+      return "coordination";
+    default:
+      return "coordination";
+  }
+}
+
+function createTrustedShellOperations(workspacePath: string): BashOperations {
+  const local = createLocalBashOperations();
+  return {
+    exec: async (command, cwd, options) => {
+      await assertFilesystemTargetWithinWorkspace(workspacePath, cwd);
+      assertNoDetachedShellCommand(command);
+      return local.exec(command, cwd, options);
+    },
+  };
+}
+
+function createStrictShellOperations(workspacePath: string): BashOperations {
   const local = createLocalBashOperations();
   return {
     exec: async (command, cwd, options) => {
       await assertFilesystemTargetWithinWorkspace(workspacePath, cwd);
       assertReadOnlyShellCommand(command);
-      await assertShellArgumentsWithinWorkspace(workspacePath, cwd, command);
+      await assertShellArgumentsWithinPolicy(workspacePath, cwd, command, { kind: "read-only" }, "deny");
       return local.exec(hardenGitCommand(command), cwd, {
         ...options,
         env: safeShellEnvironment(options.env, workspacePath),
@@ -546,11 +606,118 @@ function createReadOnlyShellOperations(workspacePath: string): BashOperations {
   };
 }
 
+function createCoordinationShellOperations(client: WriteAuthorizationClient, workspacePath: string, externalPathAccess: ExternalPathAccess): BashOperations {
+  const local = createLocalBashOperations();
+  return {
+    exec: async (command, cwd, options) => {
+      await assertFilesystemTargetWithinWorkspace(workspacePath, cwd);
+      const risk = assertCoordinationShellCommand(command);
+      assertCoordinationInspectionSafety(command, risk);
+      await assertShellArgumentsWithinPolicy(workspacePath, cwd, command, risk, externalPathAccess);
+
+      let barrierId: string | undefined;
+      if (risk.kind === "unknown") {
+        const operationId = `shell-barrier:${randomUUID()}`;
+        const result = typeof client.requestIdempotent === "function"
+          ? await client.requestIdempotent<OpaqueShellBarrierResult>("shell.begin_barrier", {}, operationId, undefined, options.signal)
+          : await client.request<OpaqueShellBarrierResult>("shell.begin_barrier", {});
+        if (result?.allowed !== true || typeof result.barrierId !== "string") {
+          throw new FabricError("RESOURCE_CONFLICT", result?.reason ?? "An opaque shell barrier could not be acquired");
+        }
+        barrierId = result.barrierId;
+      }
+
+      try {
+        return await local.exec(hardenGitCommand(command), cwd, {
+          ...options,
+          env: safeShellEnvironment(options.env, workspacePath),
+        });
+      } finally {
+        if (barrierId) {
+          await client.request("shell.end_barrier", { barrierId }).catch(() => undefined);
+        }
+      }
+    },
+  };
+}
+
+interface OpaqueShellBarrierResult {
+  allowed?: boolean;
+  barrierId?: string;
+  reason?: string;
+}
+
 /**
- * Shell syntax is intentionally conservative. Shared-workspace children get a
- * small read-only inspection surface; worktree children may opt into the
- * explicitly trusted workspace shell above. This is not a shell sandbox.
+ * Coordination mode is blocklist-first: unfamiliar foreground commands are
+ * opaque and admitted under a broker barrier, while recognized mutators and
+ * detached process forms are rejected before spawn.
  */
+export function assertCoordinationShellCommand(command: string): RootShellRisk {
+  const trimmed = command.trim();
+  if (!trimmed) throw new FabricError("CAPABILITY_DENIED", "Empty shell commands are not allowed");
+  if (trimmed.includes("\u0000")) throw new FabricError("CAPABILITY_DENIED", "Shell commands must not contain NUL characters");
+  assertNoDetachedShellCommand(trimmed);
+  const risk = classifyRootShellCommand(trimmed);
+  if (risk.kind === "known-mutator") {
+    throw new FabricError("CAPABILITY_DENIED", `Shared-workspace coordination shell blocks recognized mutators: ${risk.reason}`);
+  }
+  return risk;
+}
+
+/** Keep known observational commands from bypassing the direct path policy. */
+function assertCoordinationInspectionSafety(command: string, risk: RootShellRisk): void {
+  if (risk.kind !== "read-only") return;
+  const trimmed = command.trim();
+  if (hasUnquotedShellExpansion(trimmed)) {
+    throw new FabricError("CAPABILITY_DENIED", "Shared-workspace coordination shell does not allow shell glob or brace expansion for observational commands");
+  }
+  const tokens = trimmed.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+  const executable = stripQuotes(tokens[0] ?? "").toLowerCase().replace(/\.exe$/, "");
+  if ((executable === "find" || executable === "grep" || executable === "ls" || executable === "stat" || executable === "du" || executable === "file") && tokens.some((token) => {
+    const option = stripQuotes(token);
+    const followsSymlink = executable === "grep"
+      ? /^-[^-]*R/.test(option)
+      : executable === "find"
+        ? /^-[^-]*L/.test(option) || option === "-H"
+        : executable === "ls"
+          ? /^-[^-]*L/.test(option) || option === "-H"
+          : executable === "stat" || executable === "file"
+            ? /^-[^-]*L/.test(option)
+            : option === "-D";
+    return followsSymlink || option === "--dereference" || option === "--dereference-args" || option === "--dereference-recursive" || option === "--dereference-command-line" || option === "--dereference-command-line-symlink-to-dir";
+  })) {
+    throw new FabricError("CAPABILITY_DENIED", "Shared-workspace inspection cannot follow symbolic links");
+  }
+  if (executable === "find" && tokens.some((token) => {
+    const option = stripQuotes(token);
+    return ["-delete", "-exec", "-execdir", "-ok", "-okdir"].includes(option) || option.startsWith("-fdelete") || option.startsWith("-fprint") || option.startsWith("-fls");
+  })) {
+    throw new FabricError("CAPABILITY_DENIED", "Mutating find actions are not allowed in a shared workspace");
+  }
+  if (executable === "rg" && tokens.some((token) => {
+    const option = stripQuotes(token);
+    return option === "-L" || /^-[^-]*L/.test(option) || option === "--follow" || option === "--pre" || option.startsWith("--pre=") || option === "--hostname-bin" || option.startsWith("--hostname-bin=");
+  })) {
+    throw new FabricError("CAPABILITY_DENIED", "ripgrep preprocessors and command hooks are not allowed in a shared workspace");
+  }
+  if ((executable === "diff" || executable === "git") && tokens.some((token) => {
+    const option = stripQuotes(token);
+    return option === "-o" || option === "--output" || option.startsWith("--output=");
+  })) {
+    throw new FabricError("CAPABILITY_DENIED", "Commands that write an output file are not allowed in a shared workspace");
+  }
+  if (tokens.some((token) => {
+    const option = stripQuotes(token);
+    if (executable === "file" && (option === "-f" || /^-[^-]*f/.test(option) || option === "--files-from" || option.startsWith("--files-from="))) return true;
+    if ((executable === "wc" || executable === "du" || executable === "sort") && (option === "--files0-from" || option.startsWith("--files0-from="))) return true;
+    if (executable === "find" && (option === "-files0-from" || option.startsWith("-files0-from="))) return true;
+    return false;
+  })) {
+    throw new FabricError("CAPABILITY_DENIED", "Indirect file-list options are not allowed in a shared workspace");
+  }
+}
+
+/** The historical strict shared-shell policy: one allowlisted read-only command. */
 export function assertReadOnlyShellCommand(command: string): void {
   const trimmed = command.trim();
   if (!trimmed) throw new FabricError("CAPABILITY_DENIED", "Empty shell commands are not allowed");
@@ -650,6 +817,11 @@ export function assertReadOnlyShellCommand(command: string): void {
   }
 }
 
+/** Explicit name for the historical shared-shell allowlist policy. */
+export function assertStrictShellCommand(command: string): void {
+  assertReadOnlyShellCommand(command);
+}
+
 function hasUnquotedShellExpansion(command: string): boolean {
   let quote: "'" | '"' | undefined;
   let escaped = false;
@@ -675,7 +847,21 @@ function hasUnquotedShellExpansion(command: string): boolean {
   return false;
 }
 
-async function assertShellArgumentsWithinWorkspace(workspacePath: string, cwd: string, command: string): Promise<void> {
+/**
+ * Enforce the explicit external-path boundary without trying to infer the
+ * hidden behavior of an opaque executable. `read` is only granted to commands
+ * the classifier can prove observational; unknown commands require `any` for
+ * direct outside-workspace path arguments.
+ */
+async function assertShellArgumentsWithinPolicy(
+  workspacePath: string,
+  cwd: string,
+  command: string,
+  risk: RootShellRisk,
+  externalPathAccess: ExternalPathAccess,
+): Promise<void> {
+  if (externalPathAccess === "any") return;
+  const allowExternalRead = externalPathAccess === "read" && risk.kind === "read-only";
   const tokens = command.trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
   let afterDoubleDash = false;
   for (const token of tokens.slice(1)) {
@@ -686,6 +872,7 @@ async function assertShellArgumentsWithinWorkspace(workspacePath: string, cwd: s
     }
     const candidate = value.includes("=") ? value.slice(value.indexOf("=") + 1) : value;
     if (!candidate || (!afterDoubleDash && candidate.startsWith("-"))) continue;
+    if (allowExternalRead && shellTokenEscapesWorkspace(value)) continue;
     await assertFilesystemTargetWithinWorkspace(workspacePath, resolve(cwd, candidate));
   }
 }

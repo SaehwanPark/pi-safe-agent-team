@@ -15,6 +15,8 @@ The file may contain the fields directly or under a `safeAgents`, `piSafeAgents`
 ```json
 {
   "safeAgents": {
+    "shellPolicy": "coordination",
+    "externalPathAccess": "deny",
     "modelRoutePolicies": {
       "omlx/qwen3": { "maxConcurrent": 1, "effectivePrefillBudget": 48000 }
     }
@@ -89,6 +91,8 @@ Current defaults:
 | `historyGcBatchSize` | 256 records | Maximum terminal records archived by one maintenance pass. |
 | `fenceMs` (per `resource.begin_write`) | 30s, clamped 1s-120s | Lifetime of a guarded-write fence. Not a config field: passed per call by the guarded host. The active fence map is ephemeral, while the matched resource carries a journaled restart quarantine through this expiry. |
 | `caseInsensitivePaths` | auto | Fold policy keys so differently-cased spellings share one resource. Undefined = probe the broker volume at startup (always true on Windows). Set `false` to keep keys case-sensitive. |
+| `shellPolicy` | `coordination` | Managed child shell mode: `coordination` blocks recognized mutators and fences unfamiliar foreground commands, `strict` keeps the historical allowlist, and `trusted` is intended for isolated worktrees. |
+| `externalPathAccess` | `deny` | Explicit shell path arguments: `deny` keeps them in the workspace, `read` permits outside paths only for classified observational commands, and `any` permits them for all managed shell policies except strict mode. |
 
 Model-runtime coordination is configured independently from the global agent count:
 
@@ -137,14 +141,14 @@ A role can choose a route and capability ceiling. Child requests are intersected
 
 - `scout`: read/search, no shell/write/spawn;
 - `reviewer`: read/search, peer messaging, no write;
-- `worker`: read/write through declared resources, optional shell, no peer broadcast by default; shared-workspace shell is read-only and allowlisted, while worktree shell is explicitly trusted;
+- `worker`: read/write through declared resources, optional shell, no peer broadcast by default; shared-workspace shell uses coordination-first policy, while worktree shell is trusted unless an explicit policy overrides it;
 - `lead`: bounded spawn, peer messaging, resource transfer.
 
 The authority fields are coordinator state. Role prompt text is guidance only.
 
 ## Workspace policy
 
-Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Worktrees are reclaimed after a completed child shutdown or a later startup GC pass only when their status is clean and `HEAD` still equals the recorded base commit; clean branches containing child commits, dirty, or uncertain artifacts are retained for inspection. A durable `artifactsCleanedAt` marker records successful workspace/session cleanup.
+Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Shared child shell defaults to `shellPolicy: "coordination"`: known mutators are blocked, observational commands run concurrently, and unknown foreground commands acquire an opaque whole-workspace barrier so root/child writes cannot race them. `shellPolicy: "strict"` restores the historical allowlist; `"trusted"` is intended for isolated worktrees. `externalPathAccess` is a separate `deny`/`read`/`any` boundary for explicit shell arguments. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Worktrees are reclaimed after a completed child shutdown or a later startup GC pass only when their status is clean and `HEAD` still equals the recorded base commit; clean branches containing child commits, dirty, or uncertain artifacts are retained for inspection. A durable `artifactsCleanedAt` marker records successful workspace/session cleanup.
 
 ## Broker startup
 
