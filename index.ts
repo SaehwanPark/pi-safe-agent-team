@@ -253,7 +253,16 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     const ackKey = `${messageId}\u0000${revision}`;
     const inFlight = rootAckInFlight.get(ackKey);
     if (inFlight) return inFlight;
-    const operation = runtime.request("message.ack", { messageId, revision }, FabricRuntime.shutdownRpcTimeoutMs)
+    const ackArgs = { messageId, revision };
+    const ackOperation = `ack:${runtime.rootAgentId ?? "root"}:${messageId}:${revision}`;
+    const operation = (runtime.client && typeof runtime.client.requestIdempotent === "function"
+      ? runtime.requestIdempotent("message.ack", ackArgs, ackOperation, FabricRuntime.shutdownRpcTimeoutMs).catch((error) => {
+        if (error instanceof FabricError && error.code === "INVALID_ARGUMENT" && /operationId.*supported/i.test(error.message)) {
+          return runtime.request("message.ack", ackArgs, FabricRuntime.shutdownRpcTimeoutMs);
+        }
+        throw error;
+      })
+      : runtime.request("message.ack", ackArgs, FabricRuntime.shutdownRpcTimeoutMs))
       .then(() => {
         const current = rootDeliveryStates.get(messageId);
         if (current && messageRevision(current.message) > revision) {
@@ -407,9 +416,12 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
         runtime.resetRootContextHealth();
         let started = false;
         while (!started && generation === lifecycleQueue.currentGeneration) {
-          const result = await requestRootLifecycle<{ started?: boolean }>("agent.begin_turn", {}, `${rootLogicalTurnId}:begin`);
+          const result = await requestRootLifecycle<{ started?: boolean; queued?: boolean }>("agent.begin_turn", {}, `${rootLogicalTurnId}:begin`);
           started = result?.started !== false;
-          if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
+          if (!started) {
+            if (result?.queued === true) await runtime.waitForRootTurnAdmission();
+            else await new Promise((resolve) => setTimeout(resolve, 100));
+          }
         }
         if (started) {
           // Keep the broker admission and process-local capacity permit in the

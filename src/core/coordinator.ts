@@ -5,12 +5,14 @@ import {
   cloneAgent,
   cloneCapabilities,
   cloneMessage,
+  cloneModelTurnWaiter,
   cloneRequest,
   cloneResource,
   cloneTask,
   type ActiveFenceSummary,
   type AgentCapabilities,
   type AgentId,
+  type AgentTombstone,
   type AgentMessage,
   type AgentRecord,
   type AgentStatus,
@@ -23,12 +25,14 @@ import {
   type IdempotencyRecord,
   type IdempotencyStateEntry,
   type MessagePriority,
+  type ModelTurnWaiter,
   type MessageType,
   type ModelRoute,
   type PersistedCoordinatorState,
   type RequestId,
   type RequestRecord,
   type RequestStatus,
+  type RequestTombstone,
   type ResourceHold,
   type ResourceId,
   type ResourcePermission,
@@ -37,6 +41,8 @@ import {
   type TaskId,
   type TaskRecord,
   type TaskResult,
+  type TaskStatus,
+  type TaskTombstone,
   type WriteFenceRecord,
 } from "./types.ts";
 import {
@@ -137,7 +143,26 @@ export class Coordinator {
     "agent.end_turn",
     "agent.finish_turn",
     "message.send",
+    "message.ack",
   ]);
+  /** Operations that only read hot state and therefore do not need rollback snapshots. */
+  static readonly readOnlyOperations = new Set([
+    "agent.status",
+    "discover.agents",
+    "message.inbox",
+    "message.list",
+    "task.list",
+    "task.show",
+    "resource.inspect",
+    "resource.snapshot",
+    "resource.list",
+    "resource.check_write",
+    "fabric.status",
+  ]);
+
+  static isReadOnlyOperation(operation: string): boolean {
+    return Coordinator.readOnlyOperations.has(operation);
+  }
 
   readonly rootId: string;
   readonly rootAgentId?: string;
@@ -157,6 +182,13 @@ export class Coordinator {
   private nextBrokerSequence = 0;
   private nextResourceWaiterSequence = 0;
   private idempotency = new Map<string, IdempotencyStateEntry>();
+  /** Durable FIFO admission tickets for model turns waiting on capacity. */
+  private modelWaiters = new Map<string, ModelTurnWaiter>();
+  private nextModelTurnWaiterSequence = 0;
+  /** Terminal records leave compact tombstones so dependencies and identities remain safe. */
+  private archivedAgents = new Map<AgentId, AgentTombstone>();
+  private archivedTasks = new Map<TaskId, TaskTombstone>();
+  private archivedRequests = new Map<RequestId, RequestTombstone>();
   /** Ephemeral write fences (begin_write/end_write); never persisted or replayed. */
   private fences = new Map<string, WriteFenceRecord>();
 
@@ -182,6 +214,8 @@ export class Coordinator {
     assertCondition(this.config.maxMessageBody > 0, "INVALID_ARGUMENT", "maxMessageBody must be positive");
     assertCondition(this.config.maxTaskOutput > 0, "INVALID_ARGUMENT", "maxTaskOutput must be positive");
     assertCondition(this.config.messageRetention > 0, "INVALID_ARGUMENT", "messageRetention must be positive");
+    assertCondition((this.config.historyRetentionMs ?? 0) > 0, "INVALID_ARGUMENT", "historyRetentionMs must be positive");
+    assertCondition((this.config.maxArchivedRecords ?? 0) > 0, "INVALID_ARGUMENT", "maxArchivedRecords must be positive");
     assertCondition(this.config.leaseMs > 0, "INVALID_ARGUMENT", "leaseMs must be positive");
     assertCondition(this.config.heartbeatMs > 0, "INVALID_ARGUMENT", "heartbeatMs must be positive");
     assertCondition((this.config.agentHeartbeatTimeoutMs ?? 0) > 0, "INVALID_ARGUMENT", "agentHeartbeatTimeoutMs must be positive");
@@ -221,13 +255,22 @@ export class Coordinator {
   }
 
   /** Apply a protocol operation as one synchronous, atomic state transition. */
-  dispatch(actorId: AgentId | undefined, operation: string, args: Record<string, unknown> = {}): DispatchResult<any> {
+  dispatch(
+    actorId: AgentId | undefined,
+    operation: string,
+    args: Record<string, unknown> = {},
+    rollbackState?: PersistedCoordinatorState,
+  ): DispatchResult<any> {
     const replay = this.idempotentReplay(actorId, operation, args);
     if (replay) return replay;
-    const before = this.exportState();
+    const readOnly = Coordinator.isReadOnlyOperation(operation);
+    // Read projections do not mutate coordinator state and must not pay the
+    // full-world clone cost. The broker supplies its one rollback snapshot for
+    // mutations so coordinator and transport do not clone the same state twice.
+    const before = readOnly ? undefined : rollbackState ?? this.exportState();
     const events: CoordinatorEvent[] = [];
     assertCondition(Boolean(args) && typeof args === "object" && !Array.isArray(args), "INVALID_ARGUMENT", "operation args must be an object");
-    this.reclaimExpired(this.clock(), events);
+    if (!readOnly) this.reclaimExpired(this.clock(), events);
 
     try {
       const run = (): DispatchResult<any> => {
@@ -240,8 +283,10 @@ export class Coordinator {
         return this.withEvents(events, this.updateAgent(this.requireActor(actorId).id, args, events));
       case "agent.configure_child":
         return this.withEvents(events, this.configureChild(this.requireActor(actorId).id, args, events));
+      case "agent.mark_artifacts_cleaned":
+        return this.withEvents(events, this.markArtifactsCleaned(this.requireActor(actorId).id, parseString(args.agentId, "agentId"), events));
       case "agent.begin_turn":
-        return this.withEvents(events, this.beginTurn(this.requireActor(actorId).id, events));
+        return this.withEvents(events, this.beginTurn(this.requireActor(actorId).id, args, events));
       case "agent.drain":
         return this.withEvents(events, this.drainAgent(this.requireActor(actorId).id, parseString(args.agentId ?? actorId, "agentId"), parseOptionalString(args.reason, "reason", 2048), events));
       case "agent.end_turn":
@@ -255,7 +300,7 @@ export class Coordinator {
       case "agent.status":
         return this.withEvents(events, this.getAgentStatus(this.requireActor(actorId).id, parseOptionalString(args.agentId, "agentId"), args.scope), events);
       case "discover.agents":
-        return this.withEvents(events, this.discoverAgents(this.requireActor(actorId).id, args.scope), events);
+        return this.withEvents(events, this.discoverAgents(this.requireActor(actorId).id, args), events);
       case "message.send":
         return this.withEvents(events, this.sendMessage(this.requireActor(actorId).id, args as unknown as MessageSendArgs, events));
       case "message.reply":
@@ -311,7 +356,7 @@ export class Coordinator {
       this.rememberIdempotency(actorId, operation, args, result);
       return result;
     } catch (error) {
-      this.restoreState(before);
+      if (before) this.restoreState(before);
       throw error;
     }
   }
@@ -396,7 +441,7 @@ export class Coordinator {
         assertCondition(existing.status === "failed", "LIFECYCLE_CONFLICT", `Agent ${id} has an invalid recovery state`);
         const reconnectParent = existing.parentId ? this.requireAgent(existing.parentId) : undefined;
         if (reconnectParent) {
-          assertCondition(this.isReservedLive(reconnectParent) && reconnectParent.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${id} cannot reconnect beneath inactive parent ${reconnectParent.id}`);
+          assertCondition(this.isReservedLive(reconnectParent) && reconnectParent.reconnectable !== true && reconnectParent.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${id} cannot reconnect beneath inactive parent ${reconnectParent.id}`);
           this.assertChildCapacity(reconnectParent, id, false);
           assertCondition(existing.depth === reconnectParent.depth + 1, "IDENTITY_CONFLICT", "Recovered child depth no longer matches its parent");
         } else {
@@ -411,6 +456,7 @@ export class Coordinator {
         next.status = "ready";
         next.reconnectable = false;
         next.recoveryExpiredAt = undefined;
+        next.terminalAt = undefined;
       } else if (next.status === "starting") {
         next.status = "ready";
       }
@@ -440,6 +486,7 @@ export class Coordinator {
       return { agent: publicAgent(next), token: next.authToken as string };
     }
 
+    assertCondition(!this.archivedAgents.has(id), "IDENTITY_CONFLICT", `Agent ${id} is an archived terminal identity and cannot be reused`);
     assertCondition(rootId === this.rootId, "IDENTITY_CONFLICT", `Agent ${id} must register with fabric ${this.rootId}`);
     assertCondition(taskId === undefined, "IDENTITY_CONFLICT", "A new agent cannot self-assign a task; use agent.spawn or task.claim");
     if (!parentId) {
@@ -525,7 +572,7 @@ export class Coordinator {
       const task = this.requireTask(taskId);
       const currentOwner = task.owner ? this.requireAgent(task.owner) : undefined;
       assertCondition(!isTaskTerminal(task.status), "TASK_BUSY", `Task ${taskId} is already ${task.status}`);
-      assertCondition(!currentOwner || isTerminal(currentOwner.status) || currentOwner.id === result.agent.id, "TASK_BUSY", `Task ${taskId} already has an owner`);
+      assertCondition(!currentOwner || (isTerminal(currentOwner.status) && currentOwner.reconnectable !== true) || currentOwner.id === result.agent.id, "TASK_BUSY", `Task ${taskId} already has an owner`);
       assertCondition(this.taskDependenciesCompleted(task), "TASK_BLOCKED", `Task ${taskId} dependencies are not complete`);
       task.owner = result.agent.id;
       task.status = "active";
@@ -558,6 +605,20 @@ export class Coordinator {
     return publicAgent(next);
   }
 
+  private markArtifactsCleaned(actorId: AgentId, targetId: AgentId, events: CoordinatorEvent[]): AgentRecord {
+    const actor = this.requireActor(actorId);
+    const target = this.requireAgent(targetId);
+    assertCondition(target.depth > 0, "INVALID_ARGUMENT", "Only child agent artifacts may be marked cleaned");
+    assertCondition(this.canControl(actor, target), "CAPABILITY_DENIED", `Agent ${actorId} cannot mark artifacts for ${targetId}`);
+    assertCondition(isTerminal(target.status) && target.reconnectable !== true, "LIFECYCLE_CONFLICT", `Agent ${targetId} is not permanently stopped`);
+    if (target.artifactsCleanedAt !== undefined) return publicAgent(target);
+    const next = cloneAgent(target);
+    next.artifactsCleanedAt = this.clock();
+    this.agents.set(target.id, next);
+    events.push({ type: "agent_updated", agent: cloneAgent(next) });
+    return publicAgent(next);
+  }
+
   private updateAgent(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): AgentRecord {
     const agent = this.requireAgent(actorId);
     const next = cloneAgent(agent);
@@ -580,29 +641,113 @@ export class Coordinator {
     next.lastActivity = this.clock();
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
-    if (requestedStatus === "blocked") this.releaseAgentResourceClaims(actorId, events);
+    if (requestedStatus === "blocked") {
+      this.removeModelTurnWaiter(actorId, events);
+      this.releaseAgentResourceClaims(actorId, events);
+      this.drainModelTurnWaiters(events);
+    }
     return publicAgent(next);
   }
 
-  private beginTurn(actorId: AgentId, events: CoordinatorEvent[]): { started: boolean; reason?: string } {
+  private beginTurn(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): { started: boolean; reason?: string; queued?: boolean } {
     const agent = this.requireAgent(actorId);
-    if (agent.status === "running") throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} is already running`);
+    // A retry can arrive after the broker granted a durable ticket but before
+    // its response reached the host. Compaction is deliberately different: it
+    // is nested inside the root's already-running turn and must not release the
+    // outer reservation when it finishes.
+    if (agent.status === "running") {
+      if (args.purpose === "compaction") throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} is already running`);
+      return { started: true };
+    }
     if (isTerminal(agent.status)) throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} is terminal`);
     assertCondition(agent.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot start another turn`);
-    if (this.runningAgentCount() >= this.config.maxConcurrentAgents) {
-      return { started: false, reason: "maxConcurrentAgents reached" };
+
+    const queued = this.findModelTurnWaiter(actorId);
+    if (queued) {
+      this.drainModelTurnWaiters(events);
+      if (this.requireAgent(actorId).status === "running") return { started: true };
+      return { started: false, reason: this.turnCapacityReason(agent), queued: true };
     }
-    const routeLimit = this.routeCapacityLimit(agent.route);
-    if (routeLimit !== undefined && this.runningRouteCount(agent.route, agent.id) >= routeLimit) {
-      return { started: false, reason: `model route capacity reached for ${modelRouteKey(agent.route)}` };
+
+    const reason = this.turnCapacityReason(agent);
+    if (reason) {
+      const waiter: ModelTurnWaiter = {
+        id: this.idFactory("model-turn"),
+        enqueuedSequence: ++this.nextModelTurnWaiterSequence,
+        agentId: actorId,
+        route: { ...agent.route },
+        capacityKey: modelRouteCapacityKey(this.config, agent.route),
+        enqueuedAt: this.clock(),
+      };
+      this.modelWaiters.set(waiter.id, waiter);
+      events.push({ type: "model_turn_waiting", waiter: cloneModelTurnWaiter(waiter) });
+      // `queued` is only needed by current hosts. Omitting it for direct
+      // coordinator callers preserves the legacy false-result shape while the
+      // brokered runtime switches from polling to the durable wake event.
+      return args.operationId === undefined
+        ? { started: false, reason }
+        : { started: false, reason, queued: true };
     }
+
+    this.startTurn(agent, events);
+    return { started: true };
+  }
+
+  private startTurn(agent: AgentRecord, events: CoordinatorEvent[]): void {
     const next = cloneAgent(agent);
     if (next.status === "starting") next.status = "ready";
     this.transitionStatus(next, "running");
     next.lastActivity = this.clock();
-    this.agents.set(actorId, next);
+    this.agents.set(next.id, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
-    return { started: true };
+  }
+
+  private turnCapacityReason(agent: AgentRecord): string | undefined {
+    if (this.runningAgentCount() >= this.config.maxConcurrentAgents) return "maxConcurrentAgents reached";
+    const routeLimit = this.routeCapacityLimit(agent.route);
+    if (routeLimit !== undefined && this.runningRouteCount(agent.route, agent.id) >= routeLimit) {
+      return `model route capacity reached for ${modelRouteKey(agent.route)}`;
+    }
+    return undefined;
+  }
+
+  private findModelTurnWaiter(agentId: AgentId): ModelTurnWaiter | undefined {
+    return [...this.modelWaiters.values()].find((waiter) => waiter.agentId === agentId);
+  }
+
+  private drainModelTurnWaiters(events: CoordinatorEvent[]): void {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      const waiters = [...this.modelWaiters.values()].sort((left, right) => left.enqueuedSequence - right.enqueuedSequence || left.id.localeCompare(right.id));
+      for (const waiter of waiters) {
+        const agent = this.agents.get(waiter.agentId);
+        if (!agent || isTerminal(agent.status) || agent.reconnectable === true || agent.status === "draining") {
+          this.modelWaiters.delete(waiter.id);
+          events.push({ type: "model_turn_cancelled", waiterId: waiter.id, agentId: waiter.agentId });
+          changed = true;
+          break;
+        }
+        // Preserve FIFO per physical backend while allowing an unrelated route
+        // to use an otherwise free global slot.
+        if ([...this.modelWaiters.values()].some((earlier) => earlier.id !== waiter.id && earlier.capacityKey === waiter.capacityKey && earlier.enqueuedSequence < waiter.enqueuedSequence)) continue;
+        if (this.turnCapacityReason(agent)) continue;
+        this.modelWaiters.delete(waiter.id);
+        events.push({ type: "model_turn_granted", waiterId: waiter.id, agentId: waiter.agentId });
+        this.startTurn(agent, events);
+        events.push({ type: "slot_available", agentId: waiter.agentId });
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  private removeModelTurnWaiter(agentId: AgentId, events: CoordinatorEvent[]): void {
+    for (const waiter of [...this.modelWaiters.values()]) {
+      if (waiter.agentId !== agentId) continue;
+      this.modelWaiters.delete(waiter.id);
+      events.push({ type: "model_turn_cancelled", waiterId: waiter.id, agentId });
+    }
   }
 
   private endTurn(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): { agent: AgentRecord; task?: TaskRecord } {
@@ -626,8 +771,12 @@ export class Coordinator {
 
     const next = cloneAgent(agent);
     this.transitionStatus(next, effectiveStatus, parseOptionalString(args.statusReason, "statusReason", 2048));
-    if (isTerminal(effectiveStatus)) next.reconnectable = false;
+    if (isTerminal(effectiveStatus)) {
+      next.reconnectable = false;
+      next.terminalAt = this.clock();
+    }
     next.lastActivity = this.clock();
+    this.removeModelTurnWaiter(actorId, events);
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
 
@@ -650,6 +799,7 @@ export class Coordinator {
         task = cloneTask(this.requireTask(agent.taskId));
       }
     }
+    this.drainModelTurnWaiters(events);
     return { agent: publicAgent(this.requireAgent(actorId)), task };
   }
 
@@ -752,6 +902,7 @@ export class Coordinator {
     assertCondition(this.canControl(actor, target), "CAPABILITY_DENIED", `Agent ${actorId} cannot cancel ${targetId}`);
     const cancelled: AgentId[] = [];
     this.cancelSubtree(target, `Cancelled by ${actorId}`, events, cancelled);
+    this.drainModelTurnWaiters(events);
     return { cancelled };
   }
 
@@ -795,8 +946,10 @@ export class Coordinator {
     const next = cloneAgent(agent);
     next.status = "cancelled";
     next.reconnectable = false;
+    next.terminalAt = this.clock();
     next.statusReason = reason;
     next.lastActivity = this.clock();
+    this.removeModelTurnWaiter(next.id, events);
     this.agents.set(next.id, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
     this.cancelRequestsFor(next.id, "cancelled", "Agent was cancelled", events);
@@ -809,12 +962,13 @@ export class Coordinator {
     const target = requestedId ? this.requireAgent(requestedId) : this.requireActor(actorId);
     const actor = this.requireActor(actorId);
     assertCondition(actor.id === target.id || this.canControl(actor, target) || this.isVisiblePeer(actor, target), "MESSAGE_NOT_VISIBLE", `Agent ${actorId} cannot inspect ${target.id}`);
-    if (scope === "tree" || scope === "children") return this.discoverAgents(actorId, scope);
+    if (scope === "tree" || scope === "children") return this.discoverAgents(actorId, { scope });
     return publicAgent(target);
   }
 
-  private discoverAgents(actorId: AgentId, scope: unknown): AgentSummary[] {
+  private discoverAgents(actorId: AgentId, args: Record<string, unknown>): AgentSummary[] {
     const actor = this.requireActor(actorId);
+    const scope = args.scope;
     const selected = [...this.agents.values()].filter((candidate) => {
       if (candidate.id === actor.id) return true;
       switch (scope) {
@@ -832,7 +986,12 @@ export class Coordinator {
           return this.canControl(actor, candidate) || this.isVisiblePeer(actor, candidate);
       }
     });
-    return selected.map((candidate) => this.toSummary(candidate));
+    const status = args.status === undefined ? undefined : parseString(args.status, "status", 32);
+    const filtered = status ? selected.filter((candidate) => candidate.status === status) : selected;
+    const sorted = filtered.sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    const after = args.after === undefined ? undefined : parseString(args.after, "after", 512);
+    const start = after === undefined ? 0 : Math.max(0, sorted.findIndex((candidate) => candidate.id === after) + 1);
+    return sorted.slice(start, start + this.listLimit(args.limit)).map((candidate) => this.toSummary(candidate));
   }
 
   private sendMessage(actorId: AgentId, input: MessageSendArgs, events: CoordinatorEvent[]): { message: AgentMessage; request?: RequestRecord } {
@@ -858,7 +1017,11 @@ export class Coordinator {
   private replyToRequest(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): { message: AgentMessage; request: RequestRecord } {
     const requestId = parseString(args.requestId, "requestId");
     const request = this.requests.get(requestId);
-    assertCondition(request, "REQUEST_NOT_FOUND", `Request ${requestId} was not found`);
+    if (!request) {
+      const archived = this.archivedRequests.get(requestId);
+      if (archived) throw new FabricError("REQUEST_ALREADY_RESOLVED", `Request ${requestId} is already ${archived.status}`);
+      throw new FabricError("REQUEST_NOT_FOUND", `Request ${requestId} was not found`);
+    }
     assertCondition(request.status === "pending", "REQUEST_ALREADY_RESOLVED", `Request ${requestId} is already ${request.status}`);
     assertCondition(request.to === actorId, "MESSAGE_NOT_VISIBLE", `Agent ${actorId} cannot answer request ${requestId}`);
     const body = parseString(args.body, "body", this.config.maxMessageBody);
@@ -940,10 +1103,10 @@ export class Coordinator {
     if (args.dependencies !== undefined) assertCondition(Array.isArray(args.dependencies), "INVALID_ARGUMENT", "dependencies must be an array");
     const dependencies = (args.dependencies as unknown[] | undefined)?.map((id) => parseString(id, "dependency")) ?? [];
     for (const dependency of dependencies) {
-      assertCondition(this.tasks.has(dependency), "TASK_NOT_FOUND", `Dependency ${dependency} was not found`);
+      assertCondition(this.hasTask(dependency), "TASK_NOT_FOUND", `Dependency ${dependency} was not found`);
     }
     const parentTaskId = parseOptionalString(args.parentTaskId, "parentTaskId");
-    if (parentTaskId) assertCondition(this.tasks.has(parentTaskId), "TASK_NOT_FOUND", `Parent task ${parentTaskId} was not found`);
+    if (parentTaskId) assertCondition(this.hasTask(parentTaskId), "TASK_NOT_FOUND", `Parent task ${parentTaskId} was not found`);
     const owner = parseOptionalString(args.owner, "owner");
     if (owner) {
       const ownerAgent = this.requireAgent(owner);
@@ -953,7 +1116,7 @@ export class Coordinator {
     }
     const id = this.idFactory("task");
     const now = this.clock();
-    const ready = dependencies.every((dependency) => this.tasks.get(dependency)?.status === "completed");
+    const ready = dependencies.every((dependency) => this.taskStatus(dependency) === "completed");
     const task: TaskRecord = {
       id,
       description,
@@ -980,10 +1143,13 @@ export class Coordinator {
     const actor = this.requireActor(actorId);
     assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot claim tasks`);
     const task = this.requireTask(taskId);
-    if (task.owner && isTerminal(this.requireAgent(task.owner).status)) {
-      task.owner = undefined;
-      task.status = "ready";
-      task.updatedAt = this.clock();
+    if (task.owner) {
+      const currentOwner = this.agents.get(task.owner);
+      if (currentOwner && isTerminal(currentOwner.status) && currentOwner.reconnectable !== true) {
+        task.owner = undefined;
+        task.status = "ready";
+        task.updatedAt = this.clock();
+      }
     }
     assertCondition(!task.owner || task.owner === actorId, "TASK_BUSY", `Task ${taskId} is owned by ${task.owner}`);
     assertCondition(!actor.taskId || actor.taskId === taskId, "TASK_BUSY", `Agent ${actorId} already has primary task ${actor.taskId}`);
@@ -1090,16 +1256,27 @@ export class Coordinator {
   private listTasks(actorId: AgentId, args: Record<string, unknown>): TaskRecord[] {
     const actor = this.requireActor(actorId);
     const includeAll = actor.depth === 0 && args.scope === "all";
-    return [...this.tasks.values()]
-      .filter((task) => includeAll || task.owner === actorId || task.creator === actorId || (task.parentTaskId && this.taskVisibleTo(actorId, task)))
-      .sort((left, right) => left.createdAt - right.createdAt)
-      .map(cloneTask);
+    const status = args.status === undefined ? undefined : parseString(args.status, "status", 32);
+    const owner = args.owner === undefined ? undefined : parseString(args.owner, "owner", 512);
+    const sorted = [...this.tasks.values()]
+      .filter((task) => includeAll || task.owner === actorId || task.creator === actorId || Boolean(task.parentTaskId && this.taskVisibleTo(actorId, task)))
+      .filter((task) => status === undefined || task.status === status)
+      .filter((task) => owner === undefined || task.owner === owner)
+      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    const after = args.after === undefined ? undefined : parseString(args.after, "after", 512);
+    const start = after === undefined ? 0 : Math.max(0, sorted.findIndex((task) => task.id === after) + 1);
+    return sorted.slice(start, start + this.listLimit(args.limit)).map(cloneTask);
   }
 
   private showTask(actorId: AgentId, taskId: TaskId): TaskRecord {
     const task = this.requireTask(taskId);
-    assertCondition(this.listTasks(actorId, { scope: "all" }).some((candidate) => candidate.id === taskId), "MESSAGE_NOT_VISIBLE", `Task ${taskId} is not visible to ${actorId}`);
+    const actor = this.requireActor(actorId);
+    assertCondition(actor.depth === 0 || task.owner === actorId || task.creator === actorId || Boolean(task.parentTaskId && this.taskVisibleTo(actorId, task)), "MESSAGE_NOT_VISIBLE", `Task ${taskId} is not visible to ${actorId}`);
     return cloneTask(task);
+  }
+
+  private listLimit(value: unknown): number {
+    return Math.max(1, Math.min(100, Math.floor(parseNumber(value, "limit", 100))));
   }
 
   private defineResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
@@ -1451,6 +1628,12 @@ export class Coordinator {
           };
         }),
       activeWriteQuarantines: [...this.resources.values()].filter((resource) => (resource.writeQuarantineUntil ?? 0) > now).length,
+      pendingModelTurns: [...this.modelWaiters.values()].sort((left, right) => left.enqueuedSequence - right.enqueuedSequence).map(cloneModelTurnWaiter),
+      archivedCounts: {
+        agents: this.archivedAgents.size,
+        tasks: this.archivedTasks.size,
+        requests: this.archivedRequests.size,
+      },
     };
   }
 
@@ -1460,6 +1643,7 @@ export class Coordinator {
     const now = this.clock();
     this.reclaimExpired(now, events);
     this.reclaimStaleAgents(now, events, options.skipStaleAgents !== true);
+    this.archiveHistoricalRecords(now, events);
     return { value: null, events };
   }
 
@@ -1487,6 +1671,7 @@ export class Coordinator {
       if (now - agent.lastActivity < reconnectGrace) continue;
       this.retireReconnectableSubtree(agent, events);
     }
+    this.drainModelTurnWaiters(events);
   }
 
   private retireReconnectableSubtree(agent: AgentRecord, events: CoordinatorEvent[]): void {
@@ -1499,13 +1684,134 @@ export class Coordinator {
     next.status = "cancelled";
     next.reconnectable = false;
     next.recoveryExpiredAt = this.clock();
+    next.terminalAt = next.recoveryExpiredAt;
     next.statusReason = "Reconnect grace expired; unfinished work returned to the task pool";
     next.lastActivity = next.recoveryExpiredAt;
+    this.removeModelTurnWaiter(next.id, events);
     this.agents.set(next.id, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
     this.cancelRequestsFor(next.id, "cancelled", "Agent reconnect grace expired", events);
     this.markMessagesUndeliverable(next.id, events);
     this.releaseAgentRuntime(next.id, "reconnect-expired", events);
+    if (next.parentId && this.agents.has(next.parentId)) {
+      // A grace expiry is a semantic retirement, unlike a temporary broker
+      // recovery transition, so the parent receives the ordinary failure wake.
+      this.sendInternalMessage(next.id, next.parentId, "agent_failed", next.statusReason, { failedAgentId: next.id }, events);
+    }
+  }
+
+  private archiveHistoricalRecords(now: number, events: CoordinatorEvent[]): void {
+    const retention = this.config.historyRetentionMs ?? DEFAULT_FABRIC_CONFIG.historyRetentionMs as number;
+    const cutoff = now - retention;
+
+    // Archive leaves first. Removing an old child can then make its terminal
+    // parent eligible on the same maintenance pass without disturbing live
+    // topology or task ownership.
+    const terminalAgents = [...this.agents.values()]
+      .filter((agent) => agent.depth > 0 && isTerminal(agent.status) && agent.reconnectable !== true)
+      .sort((left, right) => right.depth - left.depth || (left.terminalAt ?? left.lastActivity) - (right.terminalAt ?? right.lastActivity));
+    for (const agent of terminalAgents) {
+      const current = this.agents.get(agent.id);
+      if (!current || !isTerminal(current.status) || current.reconnectable === true) continue;
+      const terminalAt = current.terminalAt ?? current.lastActivity;
+      if (terminalAt > cutoff) continue;
+      // Runtime-managed children carry workspace/session artifacts. Keep the
+      // hot identity until the host or startup GC certifies both are handled.
+      if (current.workspace && current.artifactsCleanedAt === undefined) continue;
+      if ([...this.agents.values()].some((candidate) => candidate.parentId === current.id)) continue;
+      if ([...this.tasks.values()].some((task) => task.owner === current.id && !isTaskTerminal(task.status))) continue;
+      if ([...this.resources.values()].some((resource) => resource.owner === current.id)) continue;
+
+      for (const resource of this.resources.values()) {
+        if (!hasOwn(resource.grants, current.id)) continue;
+        delete resource.grants[current.id];
+        resource.updatedAt = now;
+        events.push({ type: "resource_changed", resource: cloneResource(resource) });
+      }
+      const tombstone: AgentTombstone = {
+        id: current.id,
+        rootId: current.rootId,
+        parentId: current.parentId,
+        depth: current.depth,
+        role: current.role,
+        status: current.status as AgentTombstone["status"],
+        terminalAt,
+        recoveryExpiredAt: current.recoveryExpiredAt,
+        artifactsCleanedAt: current.artifactsCleanedAt,
+      };
+      this.agents.delete(current.id);
+      this.archivedAgents.set(current.id, tombstone);
+      this.nextMessageSequence.delete(current.id);
+      events.push({ type: "agent_archived", agent: { ...tombstone } });
+    }
+
+    for (const task of [...this.tasks.values()]) {
+      if (!isTaskTerminal(task.status) || task.updatedAt > cutoff) continue;
+      // A hot terminal agent may still use taskId for lifecycle reconciliation.
+      if ([...this.agents.values()].some((agent) => agent.taskId === task.id)) continue;
+      if ([...this.tasks.values()].some((candidate) => candidate.id !== task.id && candidate.dependencies.includes(task.id) && !isTaskTerminal(candidate.status))) continue;
+      const tombstone: TaskTombstone = { id: task.id, status: task.status as TaskTombstone["status"], updatedAt: task.updatedAt };
+      this.tasks.delete(task.id);
+      this.archivedTasks.set(task.id, tombstone);
+      events.push({ type: "task_archived", task: { ...tombstone } });
+    }
+
+    for (const request of [...this.requests.values()]) {
+      if (request.status === "pending" || request.resolvedAt === undefined || request.resolvedAt > cutoff) continue;
+      const tombstone: RequestTombstone = { id: request.id, status: request.status, resolvedAt: request.resolvedAt };
+      this.requests.delete(request.id);
+      this.archivedRequests.set(request.id, tombstone);
+      events.push({ type: "request_archived", request: { ...tombstone } });
+    }
+    this.trimArchivedHistory(events);
+  }
+
+  private trimArchivedHistory(events: CoordinatorEvent[]): void {
+    const limit = this.config.maxArchivedRecords ?? DEFAULT_FABRIC_CONFIG.maxArchivedRecords as number;
+    const referencedAgents = new Set<AgentId>();
+    for (const task of this.tasks.values()) {
+      if (task.owner) referencedAgents.add(task.owner);
+      referencedAgents.add(task.creator);
+    }
+    for (const resource of this.resources.values()) {
+      if (resource.owner) referencedAgents.add(resource.owner);
+      for (const id of Object.keys(resource.grants)) referencedAgents.add(id);
+      for (const hold of [...resource.sharedHolds, ...(resource.mutableHold ? [resource.mutableHold] : [])]) referencedAgents.add(hold.agentId);
+      for (const waiter of resource.waiters) referencedAgents.add(waiter.agentId);
+    }
+    for (const message of this.messages.values()) {
+      referencedAgents.add(message.from);
+      referencedAgents.add(message.to);
+    }
+    for (const waiter of this.modelWaiters.values()) referencedAgents.add(waiter.agentId);
+
+    const referencedTasks = new Set<TaskId>();
+    for (const task of this.tasks.values()) {
+      if (task.parentTaskId) referencedTasks.add(task.parentTaskId);
+      for (const dependency of task.dependencies) referencedTasks.add(dependency);
+    }
+    const referencedRequests = new Set<RequestId>();
+    for (const message of this.messages.values()) if (message.requestId) referencedRequests.add(message.requestId);
+
+    this.trimArchiveMap(this.archivedAgents, limit, (entry) => entry.terminalAt, (entry) => referencedAgents.has(entry.id), (id) => events.push({ type: "agent_archive_pruned", agentId: id }));
+    this.trimArchiveMap(this.archivedTasks, limit, (entry) => entry.updatedAt, (entry) => referencedTasks.has(entry.id), (id) => events.push({ type: "task_archive_pruned", taskId: id }));
+    this.trimArchiveMap(this.archivedRequests, limit, (entry) => entry.resolvedAt, (entry) => referencedRequests.has(entry.id), (id) => events.push({ type: "request_archive_pruned", requestId: id }));
+  }
+
+  private trimArchiveMap<T extends { id: string }>(
+    archive: Map<string, T>,
+    limit: number,
+    timestamp: (entry: T) => number,
+    referenced: (entry: T) => boolean,
+    onPrune: (id: string) => void,
+  ): void {
+    if (archive.size <= limit) return;
+    const candidates = [...archive.values()].filter((entry) => !referenced(entry)).sort((left, right) => timestamp(left) - timestamp(right) || left.id.localeCompare(right.id));
+    for (const entry of candidates) {
+      if (archive.size <= limit) break;
+      archive.delete(entry.id);
+      onPrune(entry.id);
+    }
   }
 
   /** Mark non-terminal runtime actors stale after a broker restart and release their leases. */
@@ -1547,15 +1853,16 @@ export class Coordinator {
     next.status = "failed";
     next.statusReason = reason;
     next.reconnectable = true;
+    next.terminalAt = undefined;
     next.lastActivity = now;
     this.agents.set(next.id, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
-    // Preserve the durable task link for a reconnecting runtime, but release
-    // resources and make the task available if the grace window expires.
-    this.releaseAgentRuntime(next.id, "broker-recovery", events);
-    if (next.parentId && this.agents.has(next.parentId)) {
-      this.sendInternalMessage("broker", next.parentId, "agent_failed", next.statusReason, { failedAgentId: next.id }, events);
-    }
+    // Recovery releases only runtime claims. A queued model turn is a runtime
+    // claim too, so cancel its ticket; the reconnecting host will enqueue a
+    // fresh turn after it has reconciled its durable task state. The task owner
+    // remains reserved until this actor reconnects or grace expires.
+    this.removeModelTurnWaiter(next.id, events);
+    this.releaseAgentResourceClaims(next.id, events);
     recovered?.push(next.id);
   }
 
@@ -1585,6 +1892,11 @@ export class Coordinator {
       nextBrokerSequence: this.nextBrokerSequence,
       nextResourceWaiterSequence: this.nextResourceWaiterSequence,
       idempotency: [...this.idempotency.values()].map((entry) => ({ ...entry })),
+      nextModelTurnWaiterSequence: this.nextModelTurnWaiterSequence,
+      modelWaiters: [...this.modelWaiters.values()].map(cloneModelTurnWaiter),
+      archivedAgents: [...this.archivedAgents.values()].map((agent) => ({ ...agent })),
+      archivedTasks: [...this.archivedTasks.values()].map((task) => ({ ...task })),
+      archivedRequests: [...this.archivedRequests.values()].map((request) => ({ ...request })),
     };
   }
 
@@ -1596,9 +1908,14 @@ export class Coordinator {
     this.messages.clear();
     this.requests.clear();
     this.dedupe.clear();
+    this.modelWaiters.clear();
+    this.archivedAgents.clear();
+    this.archivedTasks.clear();
+    this.archivedRequests.clear();
     this.nextMessageSequence.clear();
     this.nextBrokerSequence = state.nextBrokerSequence ?? 0;
     this.nextResourceWaiterSequence = state.nextResourceWaiterSequence ?? 0;
+    this.nextModelTurnWaiterSequence = state.nextModelTurnWaiterSequence ?? 0;
     for (const agent of state.agents) {
       assertCondition(agent.rootId === this.rootId, "IDENTITY_CONFLICT", `Persisted agent ${agent.id} belongs to another fabric`);
       this.agents.set(agent.id, cloneAgent(agent));
@@ -1617,6 +1934,14 @@ export class Coordinator {
     for (const request of state.requests) this.requests.set(request.id, cloneRequest(request));
     for (const [key, value] of state.dedupe) this.dedupe.set(key, value);
     for (const [agentId, sequence] of Object.entries(state.nextMessageSequence)) this.nextMessageSequence.set(agentId, sequence);
+    for (const waiter of state.modelWaiters ?? []) {
+      const next = cloneModelTurnWaiter(waiter);
+      this.nextModelTurnWaiterSequence = Math.max(this.nextModelTurnWaiterSequence, next.enqueuedSequence);
+      this.modelWaiters.set(next.id, next);
+    }
+    for (const archived of state.archivedAgents ?? []) this.archivedAgents.set(archived.id, { ...archived });
+    for (const archived of state.archivedTasks ?? []) this.archivedTasks.set(archived.id, { ...archived });
+    for (const archived of state.archivedRequests ?? []) this.archivedRequests.set(archived.id, { ...archived });
     this.idempotency.clear();
     for (const entry of state.idempotency ?? []) this.rememberIdempotencyEntry({ ...entry });
   }
@@ -1669,6 +1994,38 @@ export class Coordinator {
           break;
         case "request_changed":
           this.requests.set(event.request.id, cloneRequest(event.request));
+          break;
+        case "model_turn_waiting": {
+          const waiter = cloneModelTurnWaiter(event.waiter);
+          this.nextModelTurnWaiterSequence = Math.max(this.nextModelTurnWaiterSequence, waiter.enqueuedSequence);
+          this.modelWaiters.set(waiter.id, waiter);
+          break;
+        }
+        case "model_turn_granted":
+        case "model_turn_cancelled":
+          this.modelWaiters.delete(event.waiterId);
+          break;
+        case "agent_archived":
+          this.agents.delete(event.agent.id);
+          this.archivedAgents.set(event.agent.id, { ...event.agent });
+          this.nextMessageSequence.delete(event.agent.id);
+          break;
+        case "task_archived":
+          this.tasks.delete(event.task.id);
+          this.archivedTasks.set(event.task.id, { ...event.task });
+          break;
+        case "request_archived":
+          this.requests.delete(event.request.id);
+          this.archivedRequests.set(event.request.id, { ...event.request });
+          break;
+        case "agent_archive_pruned":
+          this.archivedAgents.delete(event.agentId);
+          break;
+        case "task_archive_pruned":
+          this.archivedTasks.delete(event.taskId);
+          break;
+        case "request_archive_pruned":
+          this.archivedRequests.delete(event.requestId);
           break;
         case "slot_available":
         case "diagnostic":
@@ -1945,6 +2302,11 @@ export class Coordinator {
 
   private releaseAgentRuntime(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
     this.releaseAgentResourceClaims(agentId, events);
+    this.releaseAgentTaskOwnership(agentId, reason, events);
+  }
+
+  /** Release semantic task ownership only after the actor is truly terminal. */
+  private releaseAgentTaskOwnership(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
     let ownerTaskCleared = false;
     const owner = this.agents.get(agentId);
     for (const task of this.tasks.values()) {
@@ -1956,7 +2318,7 @@ export class Coordinator {
         task.blockedReason = reason === "cancelled" ? "Agent cancelled" : `Owner ${agentId} released (${reason})`;
       }
       task.updatedAt = this.clock();
-      if (owner?.taskId === task.id && (reason !== "broker-recovery" || wasTerminal)) {
+      if (owner?.taskId === task.id) {
         owner.taskId = undefined;
         ownerTaskCleared = true;
       }
@@ -2248,19 +2610,39 @@ export class Coordinator {
   }
 
   private canControlTask(actor: AgentRecord, task: TaskRecord): boolean {
-    if (task.owner === actor.id || task.creator === actor.id) return true;
-    if (task.owner) return this.canControl(actor, this.requireAgent(task.owner));
-    return actor.depth === 0 || task.creator === actor.id;
+    if (actor.depth === 0 || task.owner === actor.id || task.creator === actor.id) return true;
+    if (task.owner) {
+      const owner = this.agents.get(task.owner);
+      if (owner && this.canControl(actor, owner)) return true;
+    }
+    return task.creator === actor.id;
   }
 
   private taskVisibleTo(actorId: AgentId, task: TaskRecord): boolean {
     const actor = this.requireAgent(actorId);
-    if (task.owner && this.canControl(actor, this.requireAgent(task.owner))) return true;
-    return task.creator === actorId || (task.parentTaskId ? this.taskVisibleTo(actorId, this.requireTask(task.parentTaskId)) : actor.depth === 0);
+    if (actor.depth === 0) return true;
+    if (task.owner) {
+      const owner = this.agents.get(task.owner);
+      if (owner && this.canControl(actor, owner)) return true;
+    }
+    if (task.creator === actorId) return true;
+    if (!task.parentTaskId) return false;
+    const parent = this.tasks.get(task.parentTaskId);
+    // An archived parent remains valid for dependency semantics, but its
+    // tombstone does not grant a child visibility into another actor's task.
+    return parent ? this.taskVisibleTo(actorId, parent) : false;
+  }
+
+  private hasTask(taskId: TaskId): boolean {
+    return this.tasks.has(taskId) || this.archivedTasks.has(taskId);
+  }
+
+  private taskStatus(taskId: TaskId): TaskStatus | undefined {
+    return this.tasks.get(taskId)?.status ?? this.archivedTasks.get(taskId)?.status;
   }
 
   private taskDependenciesCompleted(task: TaskRecord): boolean {
-    return task.dependencies.every((dependency) => this.tasks.get(dependency)?.status === "completed");
+    return task.dependencies.every((dependency) => this.taskStatus(dependency) === "completed");
   }
 
   /** Return every non-cancelled downstream task, including transitive dependents. */
@@ -2350,6 +2732,7 @@ export class Coordinator {
       status: agent.status,
       reconnectable: agent.reconnectable,
       recoveryExpiredAt: agent.recoveryExpiredAt,
+      artifactsCleanedAt: agent.artifactsCleanedAt,
       workspace: agent.workspace ? { ...agent.workspace } : undefined,
       lastActivity: agent.lastActivity,
       contextMode: agent.contextMode,

@@ -49,7 +49,10 @@ export class GitWorkspaceStrategy implements WorkspaceStrategy {
     const root = await git(request.cwd, ["rev-parse", "--show-toplevel"]);
     const status = await git(root, ["status", "--porcelain"]);
     if (status) throw new FabricError("WORKSPACE_FAILURE", "worktree mode requires a clean base checkout", { root });
-    const baseRef = request.baseRef ?? await git(root, ["rev-parse", "HEAD"]);
+    // Resolve the base once. Comparing against a moving branch name during
+    // cleanup could make an unchanged child look divergent after the base
+    // branch advances.
+    const baseRef = await git(root, ["rev-parse", request.baseRef ?? "HEAD"]);
     const worktreeRoot = join(request.stateDirectory, "worktrees");
     await fs.mkdir(worktreeRoot, { recursive: true });
     const branch = `pi-safe/${safeSegment(request.agentId)}-${Date.now().toString(36)}`;
@@ -65,10 +68,42 @@ export class GitWorkspaceStrategy implements WorkspaceStrategy {
 
   async cleanup(info: WorkspaceInfo, force = false): Promise<void> {
     if (info.mode !== "worktree") return;
+    // A successful cleanup followed by a lost broker response is retried on
+    // the next root attachment. Treat the already-removed path as idempotent
+    // only when its named branch is gone too; a surviving branch is still a
+    // user-visible recovery artifact and must not be certified as cleaned.
+    try {
+      await fs.access(info.path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (info.branch && await git(info.root, ["branch", "--list", info.branch])) {
+        throw new FabricError("WORKSPACE_FAILURE", "refusing to certify a missing worktree with a retained branch", { path: info.path, branch: info.branch });
+      }
+      return;
+    }
+    if (!force && !info.baseRef) {
+      throw new FabricError("WORKSPACE_FAILURE", "refusing to remove a worktree without a recorded base commit", { path: info.path, branch: info.branch });
+    }
     const status = await git(info.path, ["status", "--porcelain"]);
     if (status && !force) throw new FabricError("WORKSPACE_FAILURE", "refusing to remove a dirty worktree without force", { path: info.path });
+    if (!force && info.baseRef) {
+      const [head, base] = await Promise.all([
+        git(info.path, ["rev-parse", "HEAD"]),
+        git(info.root, ["rev-parse", info.baseRef]),
+      ]);
+      if (head !== base) {
+        throw new FabricError("WORKSPACE_FAILURE", "refusing to remove a clean worktree with committed child work", {
+          path: info.path,
+          branch: info.branch,
+          head,
+          baseRef: base,
+        });
+      }
+    }
     await git(info.root, ["worktree", "remove", ...(force ? ["--force"] : []), info.path]);
-    if (info.branch) await git(info.root, ["branch", "-D", info.branch]).catch(() => undefined);
+    if (info.branch && await git(info.root, ["branch", "--list", info.branch])) {
+      await git(info.root, ["branch", "-D", info.branch]);
+    }
   }
 }
 

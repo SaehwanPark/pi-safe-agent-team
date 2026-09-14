@@ -115,6 +115,10 @@ export interface AgentRecord {
   reconnectable?: boolean;
   /** Set when broker recovery grace expires and the actor becomes permanently retired. */
   recoveryExpiredAt?: number;
+  /** Timestamp of the terminal transition, used for bounded hot-state retention. */
+  terminalAt?: number;
+  /** Durable marker set after the matching workspace/session artifacts are handled. */
+  artifactsCleanedAt?: number;
   /** Context management mode (e.g. lcm-embedded or native). */
   contextMode?: string;
   /** Bounded last context/provider diagnostic, for recovery visibility. */
@@ -142,6 +146,41 @@ export interface TaskRecord {
   blockedReason?: string;
   createdAt: number;
   updatedAt: number;
+}
+
+/** Compact identity/status records retained after hot records are archived. */
+export interface AgentTombstone {
+  id: AgentId;
+  rootId: RootId;
+  parentId?: AgentId;
+  depth: number;
+  role: string;
+  status: Extract<AgentStatus, "completed" | "failed" | "cancelled">;
+  terminalAt: number;
+  recoveryExpiredAt?: number;
+  artifactsCleanedAt?: number;
+}
+
+export interface TaskTombstone {
+  id: TaskId;
+  status: Extract<TaskStatus, "completed" | "failed" | "cancelled">;
+  updatedAt: number;
+}
+
+export interface RequestTombstone {
+  id: RequestId;
+  status: Exclude<RequestStatus, "pending">;
+  resolvedAt: number;
+}
+
+/** Durable FIFO ticket for a turn waiting on global or route capacity. */
+export interface ModelTurnWaiter {
+  id: string;
+  enqueuedSequence: number;
+  agentId: AgentId;
+  route: ModelRoute;
+  capacityKey: string;
+  enqueuedAt: number;
 }
 
 /**
@@ -275,6 +314,10 @@ export interface FabricConfig {
   modelRouteCapacities?: Record<string, number>;
   /** Explicit effective prefill budgets keyed as `provider/model`. */
   effectivePrefillBudgets?: Record<string, number>;
+  /** Age after which terminal hot records may be moved to compact tombstones. */
+  historyRetentionMs?: number;
+  /** Bound each compact tombstone collection so cold history cannot grow forever. */
+  maxArchivedRecords?: number;
 }
 
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
@@ -290,6 +333,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   agentHeartbeatTimeoutMs: 3 * 60 * 1000,
   reconnectGraceMs: 10 * 60 * 1000,
   messageRetention: 2048,
+  historyRetentionMs: 24 * 60 * 60 * 1000,
+  maxArchivedRecords: 4_096,
 };
 
 export interface PersistedCoordinatorState {
@@ -307,6 +352,14 @@ export interface PersistedCoordinatorState {
   nextResourceWaiterSequence?: number;
   /** Optional for replay compatibility with pre-idempotency journals. */
   idempotency?: IdempotencyStateEntry[];
+  /** Optional for replay compatibility with pre-R7 journals. */
+  nextModelTurnWaiterSequence?: number;
+  /** Optional for replay compatibility with pre-R7 journals. */
+  modelWaiters?: ModelTurnWaiter[];
+  /** Compact terminal history retained for dependencies and identity fencing. */
+  archivedAgents?: AgentTombstone[];
+  archivedTasks?: TaskTombstone[];
+  archivedRequests?: RequestTombstone[];
 }
 
 export interface AgentSummary {
@@ -321,6 +374,8 @@ export interface AgentSummary {
   reconnectable?: boolean;
   /** Broker timestamp at which a recovery-retired actor became terminal. */
   recoveryExpiredAt?: number;
+  /** Durable marker set after the matching workspace/session artifacts are handled. */
+  artifactsCleanedAt?: number;
   workspace?: WorkspaceInfo;
   lastActivity: number;
   contextMode?: string;
@@ -347,6 +402,10 @@ export interface FabricStatus {
   activeFences?: number;
   fences?: ActiveFenceSummary[];
   activeWriteQuarantines?: number;
+  /** Durable turn requests waiting for global or route capacity. */
+  pendingModelTurns?: ModelTurnWaiter[];
+  /** Counts of terminal records moved out of hot coordinator state. */
+  archivedCounts?: { agents: number; tasks: number; requests: number };
 }
 
 export type CoordinatorEvent =
@@ -361,6 +420,15 @@ export type CoordinatorEvent =
   | { type: "messages_pruned"; ids: MessageId[] }
   | { type: "request_changed"; request: RequestRecord }
   | { type: "slot_available"; agentId: AgentId }
+  | { type: "model_turn_waiting"; waiter: ModelTurnWaiter }
+  | { type: "model_turn_granted"; waiterId: string; agentId: AgentId }
+  | { type: "model_turn_cancelled"; waiterId: string; agentId: AgentId }
+  | { type: "agent_archived"; agent: AgentTombstone }
+  | { type: "task_archived"; task: TaskTombstone }
+  | { type: "request_archived"; request: RequestTombstone }
+  | { type: "agent_archive_pruned"; agentId: AgentId }
+  | { type: "task_archive_pruned"; taskId: TaskId }
+  | { type: "request_archive_pruned"; requestId: RequestId }
   | { type: "diagnostic"; code: string; message: string; details?: Record<string, unknown> };
 
 export interface DispatchResult<T = unknown> {
@@ -408,6 +476,10 @@ export function cloneAgent(agent: AgentRecord): AgentRecord {
     workspace: agent.workspace ? { ...agent.workspace } : undefined,
     contextMode: agent.contextMode,
   };
+}
+
+export function cloneModelTurnWaiter(waiter: ModelTurnWaiter): ModelTurnWaiter {
+  return { ...waiter, route: { ...waiter.route } };
 }
 
 export function cloneTask(task: TaskRecord): TaskRecord {

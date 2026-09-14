@@ -215,6 +215,9 @@ export class FabricRuntime {
   private rootModelCapacityController?: AbortController;
   private rootContextHealth: "healthy" | "degraded" = "healthy";
   private rootContextDiagnostic?: string;
+  /** Broker wake for a root turn admitted from the durable capacity queue. */
+  private rootTurnAdmissionWake?: () => void;
+  private rootTurnAdmissionNotified = false;
   private drainPromise?: Promise<readonly HandoffSnapshot[]>;
   private drainDeadlineAt = 0;
   private drainWake?: () => void;
@@ -312,12 +315,13 @@ export class FabricRuntime {
           while (true) {
             if (this.stopped) throw new FabricError("LIFECYCLE_CONFLICT", "Root compaction admission stopped with the fabric");
             if (signal?.aborted) throw new FabricError("BROKER_UNAVAILABLE", "Root compaction admission was aborted");
-            const result = await this.requestLifecycleOnClient<{ started?: boolean }>(this.root.client, "agent.begin_turn", {}, `${operationBase}:begin`, FabricRuntime.shutdownRpcTimeoutMs, signal);
+            const result = await this.requestLifecycleOnClient<{ started?: boolean; queued?: boolean }>(this.root.client, "agent.begin_turn", { purpose: "compaction" }, `${operationBase}:begin`, FabricRuntime.shutdownRpcTimeoutMs, signal);
             if (result?.started === true) {
               brokerReservation = true;
               break;
             }
-            await new Promise((resolve) => setTimeout(resolve, 100));
+            if (result?.queued === true) await this.waitForRootTurnAdmission(signal);
+            else await new Promise((resolve) => setTimeout(resolve, 100));
           }
         } catch (error) {
           // Automatic compaction runs inside an already-admitted root turn, so
@@ -666,6 +670,7 @@ export class FabricRuntime {
         activeWriteQuarantines: 0,
         pendingRootRequests: 0,
         pendingRootDeliveries: 0,
+        pendingModelTurns: 0,
         rootCompactionInFlight: this.isRootCompactionInFlight,
         rootContextHealth: this.rootHealth,
         rootContextDiagnostic: this.rootHealthDiagnostic,
@@ -704,6 +709,7 @@ export class FabricRuntime {
         (r) => (r.to === rootAgentId || r.from === rootAgentId) && r.status === "pending",
       ).length;
       const pendingRootDeliveries = this.pendingRootDeliveriesCount;
+      const pendingModelTurns = status.pendingModelTurns?.length ?? 0;
       const activeWriteFences = status.activeFences ?? 0;
       const activeWriteQuarantines = status.activeWriteQuarantines ?? status.resources.filter((resource) => (resource.writeQuarantineUntil ?? 0) > now).length;
 
@@ -720,6 +726,7 @@ export class FabricRuntime {
       if (activeWriteQuarantines > 0) quiescenceReasons.push("active_write_quarantines");
       if (pendingRootRequests > 0) quiescenceReasons.push("pending_root_requests");
       if (pendingRootDeliveries > 0) quiescenceReasons.push("pending_root_deliveries");
+      if (pendingModelTurns > 0) quiescenceReasons.push("model_turns_waiting_for_capacity");
 
       const quiescent = quiescenceReasons.length === 0;
       const sessionReplacementSafe = quiescent;
@@ -761,6 +768,7 @@ export class FabricRuntime {
         activeWriteQuarantines,
         pendingRootRequests,
         pendingRootDeliveries,
+        pendingModelTurns,
         rootCompactionInFlight: this.isRootCompactionInFlight,
         rootContextHealth: this.rootHealth,
         rootContextDiagnostic: this.rootHealthDiagnostic,
@@ -787,6 +795,7 @@ export class FabricRuntime {
         activeWriteQuarantines: 0,
         pendingRootRequests: 0,
         pendingRootDeliveries: this.pendingRootDeliveriesCount,
+        pendingModelTurns: 0,
         rootCompactionInFlight: this.isRootCompactionInFlight,
         rootContextHealth: this.rootHealth,
         rootContextDiagnostic: this.rootHealthDiagnostic,
@@ -799,6 +808,35 @@ export class FabricRuntime {
 
   async status(signal?: AbortSignal, timeoutMs?: number): Promise<unknown> {
     return this.request("fabric.status", {}, timeoutMs, signal);
+  }
+
+  /** Wait for the broker's FIFO admission wake instead of polling capacity. */
+  async waitForRootTurnAdmission(signal?: AbortSignal): Promise<void> {
+    if (this.rootTurnAdmissionNotified) {
+      this.rootTurnAdmissionNotified = false;
+      return;
+    }
+    if (signal?.aborted) throw new FabricError("BROKER_UNAVAILABLE", "Root turn admission was aborted");
+    await new Promise<void>((resolve, reject) => {
+      let onAbort: (() => void) | undefined;
+      const finish = (error?: unknown): void => {
+        this.rootTurnAdmissionNotified = false;
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+        if (this.rootTurnAdmissionWake === wake) this.rootTurnAdmissionWake = undefined;
+        if (error) reject(error);
+        else resolve();
+      };
+      const wake = () => finish();
+      this.rootTurnAdmissionWake = wake;
+      if (signal) {
+        onAbort = () => finish(new FabricError("BROKER_UNAVAILABLE", "Root turn admission was aborted"));
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+      if (this.rootTurnAdmissionNotified) {
+        this.rootTurnAdmissionNotified = false;
+        finish();
+      }
+    });
   }
 
   async modelRuntimeForChildren(): Promise<ModelRuntime> {
@@ -827,6 +865,12 @@ export class FabricRuntime {
   /** Remove only the stopped instance; a replacement with the same id wins. */
   onChildStopped(child: ManagedChild): void {
     if (this.children.get(child.agentId) === child) this.children.delete(child.agentId);
+  }
+
+  /** Persist successful handling of a terminal child's external artifacts. */
+  async markArtifactsCleaned(agentId: string): Promise<void> {
+    if (!this.root) return;
+    await this.root.client.request("agent.mark_artifacts_cleaned", { agentId });
   }
 
   /**
@@ -975,6 +1019,8 @@ export class FabricRuntime {
     this.stopped = true;
     this.draining = true;
     this.resetRootCompactionState();
+    this.rootTurnAdmissionNotified = true;
+    this.rootTurnAdmissionWake?.();
     await this.endRootModelTurnCapacity();
     if (this.rootHeartbeatTimer) clearInterval(this.rootHeartbeatTimer);
     this.rootEventUnsubscribe?.();
@@ -1161,6 +1207,8 @@ export class FabricRuntime {
           });
           this.rootToken = refreshed.token;
           this.root.client.setIdentity(this.root.agentId, refreshed.token);
+          this.rootTurnAdmissionNotified = true;
+          this.rootTurnAdmissionWake?.();
           await this.cleanupAbandonedAgentArtifacts().catch(() => undefined);
           const inbox = await this.drainRootInbox();
           for (const message of inbox) this.rootDelivery?.(message);
@@ -1201,8 +1249,9 @@ export class FabricRuntime {
 
   /**
    * Reclaim artifacts left by actors whose broker recovery window expired.
-   * Workspace strategies decide whether a worktree is clean; a failed cleanup
-   * therefore preserves the worktree and its session history for inspection.
+   * Workspace strategies decide whether a worktree is disposable (clean and at
+   * its recorded base); a failed cleanup therefore preserves the worktree and
+   * its session history for inspection.
    */
   private cleanupAbandonedAgentArtifacts(status?: FabricStatus): Promise<void> {
     if (this.cleanupPromise) return this.cleanupPromise;
@@ -1218,29 +1267,38 @@ export class FabricRuntime {
       };
       const protectedPaths = new Set(
         durable.agents
-          .filter((agent) => !["completed", "failed", "cancelled"].includes(agent.status) || agent.reconnectable === true)
+          .filter((agent) => (!["completed", "failed", "cancelled"].includes(agent.status) || agent.reconnectable === true) && agent.workspace?.mode === "worktree")
           .map((agent) => agent.workspace?.path)
           .filter((path): path is string => Boolean(path))
           .map(pathKey),
       );
       const candidates = durable.agents.filter((agent) => {
-        if (agent.depth === 0 || !agent.workspace || !["completed", "failed", "cancelled"].includes(agent.status) || agent.reconnectable === true) return false;
+        if (agent.depth === 0 || !agent.workspace || agent.artifactsCleanedAt !== undefined || !["completed", "failed", "cancelled"].includes(agent.status) || agent.reconnectable === true) return false;
         if (agent.recoveryExpiredAt !== undefined) return agent.recoveryExpiredAt <= now;
         return now - agent.lastActivity >= grace;
       });
       for (const agent of candidates) {
         const workspace = agent.workspace;
         if (!workspace || protectedPaths.has(pathKey(workspace.path))) continue;
-        try {
-          await this.workspaceStrategy.cleanup(workspace);
-        } catch {
-          // A dirty worktree is intentionally retained as a recovery artifact.
-          continue;
-        }
         const sessionsRoot = resolve(this.stateDirectory, "sessions");
         const sessionPath = resolve(sessionsRoot, agent.id);
         if (sessionPath === sessionsRoot || !sessionPath.startsWith(`${sessionsRoot}${sep}`)) continue;
-        await fs.rm(sessionPath, { recursive: true, force: true }).catch(() => undefined);
+        try {
+          await this.workspaceStrategy.cleanup(workspace);
+        } catch {
+          // A dirty or divergent worktree is intentionally retained as a
+          // recovery artifact.
+          continue;
+        }
+        try {
+          await fs.rm(sessionPath, { recursive: true, force: true });
+        } catch {
+          continue;
+        }
+        // The marker is written only after both external artifacts have been
+        // handled. It makes a successful GC pass durable across every later
+        // root attachment instead of repeatedly revisiting the same actor.
+        await this.markArtifactsCleaned(agent.id).catch(() => undefined);
       }
     })();
     const cleanupPromise = operation.finally(() => {
@@ -1259,6 +1317,14 @@ export class FabricRuntime {
   }
 
   private handleRootEvent(event: { event: string; data: unknown }): void {
+    if (event.event === "slot_available") {
+      const data = event.data as { agentId?: string };
+      if (data.agentId === this.root?.agentId) {
+        this.rootTurnAdmissionNotified = true;
+        this.rootTurnAdmissionWake?.();
+      }
+      return;
+    }
     if (event.event !== "message_sent" && event.event !== "message_updated") return;
     const data = event.data as { message?: AgentMessage };
     const message = data.message;
@@ -1310,6 +1376,9 @@ export class ManagedChild {
   private readonly pendingReplyIds = new Set<string>();
   /** Cancels a route-capacity wait as soon as local child shutdown begins. */
   private readonly stopController = new AbortController();
+  /** Resolves when the broker grants this child's durable turn ticket. */
+  private turnAdmissionWake?: () => void;
+  private turnAdmissionNotified = false;
   private embeddedManager?: EmbeddedContextManager;
   /** Number of model operations currently holding the child route token. */
   private modelCapacityDepth = 0;
@@ -1613,6 +1682,7 @@ export class ManagedChild {
     if (this.stopping) return;
     this.stopping = true;
     this.stopController.abort();
+    this.turnAdmissionWake?.();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.eventUnsubscribe?.();
     this.sessionEventUnsubscribe?.();
@@ -1647,6 +1717,7 @@ export class ManagedChild {
     }
     this.stopping = true;
     this.stopController.abort();
+    this.turnAdmissionWake?.();
     try {
       void this.session?.abort();
     } catch {}
@@ -1657,6 +1728,7 @@ export class ManagedChild {
   disposeNow(): void {
     this.stopping = true;
     this.stopController.abort();
+    this.turnAdmissionWake?.();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.eventUnsubscribe?.();
     this.sessionEventUnsubscribe?.();
@@ -1673,10 +1745,29 @@ export class ManagedChild {
   }
 
   private async cleanupWorkspace(): Promise<void> {
-    if (!this.workspace || this.workspace.mode !== "worktree") return;
-    // Clean worktrees are disposable. A dirty worktree is a recovery artifact
-    // and is intentionally retained for the user to inspect or merge later.
-    await this.runtime.workspaceStrategy.cleanup(this.workspace).catch(() => undefined);
+    // Only a clean worktree still at its recorded base is disposable. A clean
+    // branch with commits is a user-owned recovery artifact and must remain
+    // available for merge, cherry-pick, or inspection. Shared workspaces have
+    // no workspace deletion step, but their child session directory is still
+    // safe to remove after the session abort boundary.
+    try {
+      if (this.workspace?.mode === "worktree") await this.runtime.workspaceStrategy.cleanup(this.workspace);
+      await this.cleanupSessionArtifacts();
+      if (this.workspace) await this.runtime.markArtifactsCleaned(this.agentId).catch(() => undefined);
+    } catch {
+      // Dirty, committed, or uncertain child work is intentionally retained as
+      // a recovery artifact; the durable cleanup marker remains unset for
+      // later inspection.
+    }
+  }
+
+  private async cleanupSessionArtifacts(): Promise<void> {
+    const sessionsRoot = resolve(this.stateDirectory, "sessions");
+    const sessionPath = resolve(sessionsRoot, this.agentId);
+    if (sessionPath === sessionsRoot || !sessionPath.startsWith(`${sessionsRoot}${sep}`)) {
+      throw new FabricError("WORKSPACE_FAILURE", "refusing to remove a child session outside the sessions directory");
+    }
+    await fs.rm(sessionPath, { recursive: true, force: true });
   }
 
   private async reconnect(): Promise<void> {
@@ -1699,6 +1790,11 @@ export class ManagedChild {
             contextDiagnostic: this.lastDiagnostic,
           });
           const durable = await this.reconcileDurableAgentState(registered.agent);
+          // A slot grant may have happened while the socket was down. Wake the
+          // admission loop; its idempotent begin_turn retry observes the
+          // durable running state even if the notification was missed.
+          this.turnAdmissionNotified = true;
+          this.turnAdmissionWake?.();
           if (["completed", "cancelled"].includes(durable.status) || durable.status === "failed" && durable.reconnectable !== true) {
             await this.stop();
             return;
@@ -1710,7 +1806,7 @@ export class ManagedChild {
           }
           return;
         } catch (error) {
-          if (isTerminalReconnectFailure(error)) {
+          if (isTerminalReconnectFailure(error) && !isParentRecoveryConflict(error)) {
             await this.stop();
             return;
           }
@@ -1781,6 +1877,26 @@ export class ManagedChild {
     );
     void operation.finally(() => {
       if (epoch === this.recoveryWakeEpoch) this.recoveryWakePending = false;
+    });
+  }
+
+  private waitForTurnAdmission(): Promise<void> {
+    if (this.turnAdmissionNotified) {
+      this.turnAdmissionNotified = false;
+      return Promise.resolve();
+    }
+    if (this.stopping) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      this.turnAdmissionWake = () => {
+        this.turnAdmissionWake = undefined;
+        this.turnAdmissionNotified = false;
+        resolve();
+      };
+      if (this.turnAdmissionNotified || this.stopping) {
+        this.turnAdmissionWake = undefined;
+        this.turnAdmissionNotified = false;
+        resolve();
+      }
     });
   }
 
@@ -1944,10 +2060,14 @@ export class ManagedChild {
     this.lastObservedOutcome = undefined;
     this.compactionFailure = undefined;
     let started = false;
+    this.turnAdmissionNotified = false;
     while (!started && !this.stopping) {
-      const result = await this.requestLifecycle<{ started: boolean }>("agent.begin_turn", {}, `${turnId}:begin`);
+      const result = await this.requestLifecycle<{ started: boolean; queued?: boolean }>("agent.begin_turn", {}, `${turnId}:begin`);
       started = result.started;
-      if (!started) await new Promise((resolve) => setTimeout(resolve, 100));
+      if (!started) {
+        if (result.queued === true) await this.waitForTurnAdmission();
+        else await new Promise((resolve) => setTimeout(resolve, 100));
+      }
     }
     if (!started || this.stopping) return false;
     if (this.embeddedManager && this.contextMode === "lcm-embedded") {
@@ -2020,6 +2140,14 @@ export class ManagedChild {
   }
 
   private handleEvent(event: { event: string; data: unknown }): void {
+    if (event.event === "slot_available") {
+      const data = event.data as { agentId?: string };
+      if (data.agentId === this.agentId) {
+        this.turnAdmissionNotified = true;
+        this.turnAdmissionWake?.();
+      }
+      return;
+    }
     if (event.event === "request_changed") {
       const request = (event.data as { request?: { id?: string; from?: string; status?: string; failureReason?: string } }).request;
       if (request?.from !== this.agentId || !request.id || !["failed", "cancelled"].includes(request.status ?? "")) return;
@@ -2255,7 +2383,17 @@ export class ManagedChild {
     // Once a prior completion/settlement boundary recorded the ID, a later
     // compaction may legitimately remove that transcript entry. Do not make a
     // broker ACK retry depend on the entry still being present.
-    const operation = this.client.request("message.ack", { messageId: message.id, revision })
+    const ackArgs = { messageId: message.id, revision };
+    const ackOperationId = `ack:${this.agentId}:${message.id}:${revision}`;
+    const retry = (this.client as unknown as { requestIdempotent?: (...input: any[]) => Promise<unknown> }).requestIdempotent;
+    const operation = (typeof retry === "function"
+      ? (retry.call(this.client, "message.ack", ackArgs, ackOperationId) as Promise<unknown>).catch((error) => {
+        if (error instanceof FabricError && error.code === "INVALID_ARGUMENT" && /operationId.*supported/i.test(error.message)) {
+          return this.client.request("message.ack", ackArgs);
+        }
+        throw error;
+      })
+      : this.client.request("message.ack", ackArgs))
       .then(() => this.markMessageAcknowledged(message))
       .catch((error) => {
         // The broker may have coalesced a newer payload before this ACK
@@ -2327,6 +2465,10 @@ export class ManagedChild {
 
 function isTerminalReconnectFailure(error: unknown): boolean {
   return error instanceof FabricError && ["LIFECYCLE_CONFLICT", "IDENTITY_CONFLICT", "AGENT_NOT_FOUND"].includes(error.code);
+}
+
+function isParentRecoveryConflict(error: unknown): boolean {
+  return error instanceof FabricError && error.code === "LIFECYCLE_CONFLICT" && /cannot reconnect beneath inactive parent/i.test(error.message);
 }
 
 function stripAuth(agent: AgentRecord): Omit<AgentRecord, "authToken"> {

@@ -78,9 +78,11 @@ Current defaults:
 | `maxTaskOutput` | 32 KiB |
 | `leaseMs` | 30 minutes |
 | `heartbeatMs` | 1 minute |
-| `agentHeartbeatTimeoutMs` | 3 minutes | Time without an actor heartbeat before the broker marks it failed/reconnectable and releases runtime claims. |
-| `reconnectGraceMs` | 10 minutes | How long a stale reconnectable actor keeps its `maxTotalAgents` slot before retirement; unfinished tasks return to `ready`. |
+| `agentHeartbeatTimeoutMs` | 3 minutes | Time without an actor heartbeat before the broker marks it failed/reconnectable and releases runtime resource claims. Semantic task ownership remains reserved during grace. |
+| `reconnectGraceMs` | 10 minutes | How long a stale reconnectable actor keeps its `maxTotalAgents` slot and task ownership before terminal retirement; unfinished tasks then return to `ready`. |
 | `messageRetention` | 2048 recent records |
+| `historyRetentionMs` | 24 hours | Age before terminal agents/tasks/resolved requests may move to compact tombstones. |
+| `maxArchivedRecords` | 4096 per record type | Bound for retained agent/task/request tombstones; referenced entries remain until safe to prune. |
 | `fenceMs` (per `resource.begin_write`) | 30s, clamped 1s-120s | Lifetime of a guarded-write fence. Not a config field: passed per call by the guarded host. The active fence map is ephemeral, while the matched resource carries a journaled restart quarantine through this expiry. |
 | `caseInsensitivePaths` | auto | Fold policy keys so differently-cased spellings share one resource. Undefined = probe the broker volume at startup (always true on Windows). Set `false` to keep keys case-sensitive. |
 
@@ -107,7 +109,8 @@ provider/model name. Routes that point at the same local GPU or inference
 server should use one group so broker admission and the process-local arbiter
 share one limit. When omitted, the route's provider/model key remains the
 fallback identity and local-provider name heuristics still provide the
-conservative one-turn default.
+conservative one-turn default. A full broker slot creates a durable FIFO turn
+waiter and emits a targeted wake when admitted; hosts do not poll at 100 ms.
 
 Limits fail closed. There is no automatic unbounded retry or fallback provider.
 
@@ -117,7 +120,7 @@ leases update liveness in memory without creating a synchronous journal write;
 lease renewals remain durable. Lifecycle writes (`agent.begin_turn`,
 `agent.end_turn`, and `agent.finish_turn`) accept durable `operationId` values,
 so a lost response can be retried without applying the transition twice.
-`message.send` supports the same replay contract.
+`message.send` and `message.ack` support the same replay contract. Acknowledgements include the exact message revision, so a lost ACK response remains retryable even if retention prunes the message.
 
 ## Roles and capabilities
 
@@ -132,11 +135,11 @@ The authority fields are coordinator state. Role prompt text is guidance only.
 
 ## Workspace policy
 
-Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Clean worktrees are reclaimed after a completed child shutdown or a later startup GC pass once the actor's recovery grace has expired and no live/reconnectable actor references the path; dirty or uncertain artifacts are retained for inspection and require user confirmation/force through a future cleanup command.
+Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Worktrees are reclaimed after a completed child shutdown or a later startup GC pass only when their status is clean and `HEAD` still equals the recorded base commit; clean branches containing child commits, dirty, or uncertain artifacts are retained for inspection. A durable `artifactsCleanedAt` marker records successful workspace/session cleanup.
 
 ## Broker startup
 
-Normally the first root extension instance starts the local broker; later instances join the locked fabric. The runtime uses a stable per-session root identity and stores its reconnect credential in `root.token` with mode `0600`. A broker restart permits one matching-token reattach for live actors and recovery-fences their live descendants; completed, failed, and cancelled semantic terminal actors remain terminal. If the broker maintenance timer was suspended past a liveness interval, its first resumed pass skips stale-agent reclamation so heartbeats can re-establish liveness. A stale lock can be removed only when its recorded PID is no longer alive. The endpoint is local-user scoped. The broker is one writer for `events.jsonl`.
+Normally the first root extension instance starts the local broker; later instances join the locked fabric. The runtime uses a stable per-session root identity and stores its reconnect credential in `root.token` with mode `0600`. A broker restart permits one matching-token reattach for live actors and recovery-fences their live descendants; descendants reconnect only after their parent is active again; completed, failed, and cancelled semantic terminal actors remain terminal. If the broker maintenance timer was suspended past a liveness interval, its first resumed pass skips stale-agent reclamation so heartbeats can re-establish liveness. A stale lock can be removed only when its recorded PID is no longer alive. The endpoint is local-user scoped. The broker is one writer for `events.jsonl`.
 
 ## Diagnostics
 
