@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { FabricError, asFabricError } from "./src/core/errors.ts";
-import type { AgentMessage, FabricStatus } from "./src/core/types.ts";
+import type { AgentMessage, FabricStatus, RetainedArtifactRecord } from "./src/core/types.ts";
 import { FabricRuntime, type DescendantShutdownMode } from "./src/pi/runtime.ts";
 import { LifecycleQueue } from "./src/pi/lifecycle.ts";
 import { createCoordinationTools } from "./src/pi/tools.ts";
@@ -20,6 +20,7 @@ export { resolveRoute, routeId } from "./src/core/routing.ts";
 export { effectivePrefillBudget, modelRouteCapacity, modelRouteCapacityKey, modelRouteKey, modelRoutePolicy } from "./src/core/coordinator-wire.ts";
 export { BrokerClient } from "./src/broker/client.ts";
 export { BrokerServer, startBroker } from "./src/broker/server.ts";
+export { RetainedArtifactStore } from "./src/broker/artifact-store.ts";
 export { Journal } from "./src/broker/journal.ts";
 export { FabricRuntime, ManagedChild, taskAwareTurnStatus } from "./src/pi/runtime.ts";
 export type { DescendantShutdownMode, HandoffSnapshot } from "./src/pi/runtime.ts";
@@ -524,7 +525,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("agents", {
-    description: "Inspect or stop the safe-agents fabric (status, tree, tasks, resources, messages, inbox, stop)",
+    description: "Inspect or stop the safe-agents fabric (status, tree, tasks, resources, artifacts, messages, inbox, stop)",
     handler: async (args, ctx) => {
       try {
         const mode = args.trim() || "status";
@@ -547,6 +548,34 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
           return;
         }
         await runtime.ensureRoot(pi, ctx, rootDelivery(pi));
+        if (mode === "artifacts" || mode.startsWith("artifacts ")) {
+          const artifactCommand = mode.slice("artifacts".length).trim();
+          if (artifactCommand.startsWith("resolve ")) {
+            const [, artifactId, ...resolutionParts] = artifactCommand.split(/\s+/);
+            if (!artifactId) throw new FabricError("INVALID_ARGUMENT", "usage: /agents artifacts resolve <artifact-id> [resolution]");
+            const resolution = resolutionParts.join(" ").trim();
+            const artifact = await runtime.request<RetainedArtifactRecord>("agent.resolve_artifact", {
+              artifactId,
+              ...(resolution ? { resolution } : {}),
+            });
+            ctx.ui.notify(`safe-agents: resolved artifact ${artifact.id}${artifact.resolution ? ` (${artifact.resolution})` : ""}`, "info");
+            return;
+          }
+          if (artifactCommand) throw new FabricError("INVALID_ARGUMENT", "usage: /agents artifacts [resolve <artifact-id> [resolution]]");
+          const artifacts: RetainedArtifactRecord[] = [];
+          let after: string | undefined;
+          for (let page = 0; page < 10_000; page += 1) {
+            const result = await runtime.request<{ artifacts: RetainedArtifactRecord[]; nextAfter?: string }>("agent.artifacts", {
+              limit: 100,
+              ...(after ? { after } : {}),
+            });
+            artifacts.push(...result.artifacts);
+            if (!result.nextAfter || result.nextAfter === after) break;
+            after = result.nextAfter;
+          }
+          ctx.ui.notify(artifacts.length ? artifacts.map(formatArtifact).join("\n") : "safe-agents: no retained artifacts", "info");
+          return;
+        }
         if (mode === "inbox") {
           const messages = await runtime.request<AgentMessage[]>("message.inbox", { limit: 50 });
           ctx.ui.notify(messages.length ? messages.map(formatMessage).join("\n\n") : "safe-agents inbox is empty", "info");
@@ -584,9 +613,16 @@ function formatMessage(message: AgentMessage): string {
   return `[${message.type}] ${message.from} -> ${message.to}: ${message.body}`;
 }
 
-function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricStateSnapshotV1 | null): string {
+function formatArtifact(artifact: RetainedArtifactRecord): string {
+  const workspace = artifact.workspace ? `${artifact.workspace.mode}:${artifact.workspace.path}` : "none";
+  const session = artifact.sessionPath ?? "none";
+  const resolution = artifact.resolution ? ` resolution=${artifact.resolution}` : "";
+  return `${artifact.id} [${artifact.status ?? "retained"}] agent=${artifact.agentId} workspace=${workspace} session=${session}${resolution}${artifact.reason ? ` reason=${artifact.reason}` : ""}`;
+}
+
+export function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricStateSnapshotV1 | null): string {
   if (mode === "tree" || mode === "agents") {
-    return status.agents.map((agent) => {
+    const rows = status.agents.map((agent) => {
       const indent = "  ".repeat(agent.depth);
       if (agent.depth === 0) {
         return `${agent.id} [${agent.status}] ${agent.role} ${agent.route.provider}/${agent.route.model}`;
@@ -603,10 +639,17 @@ function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricState
         agent.contextDiagnostic ? `${indent}  context-diagnostic=${agent.contextDiagnostic}` : undefined,
       ].filter(Boolean);
       return lines.join("\n");
-    }).join("\n") || "safe-agents: no agents";
+    }).join("\n");
+    return [boundedNotice("agents", status.agents.length, status.totalAgents, status.truncated?.agents), rows || "safe-agents: no agents"].filter(Boolean).join("\n");
   }
-  if (mode === "tasks") return status.tasks.map((task) => `${task.id} [${task.status}] ${task.owner ?? "unclaimed"}: ${task.description}`).join("\n") || "safe-agents: no tasks";
-  if (mode === "resources") return status.resources.map((resource) => `${resource.id}@${resource.version} owner=${resource.owner ?? "none"} shared=${resource.sharedHolds.length} mutable=${resource.mutableHold?.agentId ?? "none"} waiters=${resource.waiters.length}`).join("\n") || "safe-agents: no resources";
+  if (mode === "tasks") {
+    const rows = status.tasks.map((task) => `${task.id} [${task.status}] ${task.owner ?? "unclaimed"}: ${task.description}`).join("\n");
+    return [boundedNotice("tasks", status.tasks.length, status.totalTasks, status.truncated?.tasks), rows || "safe-agents: no tasks"].filter(Boolean).join("\n");
+  }
+  if (mode === "resources") {
+    const rows = status.resources.map((resource) => `${resource.id}@${resource.version} owner=${resource.owner ?? "none"} shared=${resource.sharedHolds.length} mutable=${resource.mutableHold?.agentId ?? "none"} waiters=${resource.waiters.length}`).join("\n");
+    return [boundedNotice("resources", status.resources.length, status.totalResources, status.truncated?.resources), rows || "safe-agents: no resources"].filter(Boolean).join("\n");
+  }
   if (mode === "messages") return status.recentMessages.slice(0, 30).map(formatMessage).join("\n\n") || "safe-agents: no recent messages";
 
   const quiescentStr = snapshot ? (snapshot.quiescent ? "yes" : "no") : "unknown";
@@ -624,12 +667,21 @@ function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricState
     `pending root requests: ${pendingRequests}`,
     `pending root deliveries: ${pendingDeliveries}`,
     `root context: ${snapshot?.rootCompactionInFlight ? "compacting" : snapshot?.rootContextHealth === "degraded" ? `degraded${snapshot.rootContextDiagnostic ? ` (${snapshot.rootContextDiagnostic})` : ""}` : "healthy"}`,
-    `agents: ${status.agents.length} (running ${status.runningChildren})`,
-    `tasks: ${status.tasks.length}`,
-    `resources: ${status.resources.length}`,
+    formatCount("agents", status.agents.length, status.totalAgents, status.truncated?.agents) + ` (running ${status.runningChildren})`,
+    formatCount("tasks", status.tasks.length, status.totalTasks, status.truncated?.tasks),
+    formatCount("resources", status.resources.length, status.totalResources, status.truncated?.resources),
     "",
     ...status.agents.map((agent) => `${agent.id} [${agent.status}] ${agent.role} context=${agent.contextMode ?? "native"}`),
   ].filter((line): line is string => Boolean(line)).join("\n");
 
   return summary;
+}
+
+function formatCount(label: string, visible: number, total: number | undefined, truncated: boolean | undefined): string {
+  const authoritative = Number.isInteger(total) ? total as number : visible;
+  return truncated ? `${label}: showing ${visible} of ${authoritative} (truncated)` : `${label}: ${authoritative}`;
+}
+
+function boundedNotice(label: string, visible: number, total: number | undefined, truncated: boolean | undefined): string | undefined {
+  return truncated ? `safe-agents: showing ${visible} of ${Number.isInteger(total) ? total : "an unknown total"} ${label}; use the paginated ${label} operation for complete results` : undefined;
 }

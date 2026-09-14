@@ -25,7 +25,9 @@ export type BorrowMode = "shared" | "mutable";
 export type MessagePriority = "normal" | "urgent";
 export type ModelTurnPurpose = "turn" | "compaction";
 export type ModelTurnState = "queued" | "granted";
+export type ModelTurnRecoveryState = "running" | "stopped";
 export type ArtifactDisposition = "cleaned" | "retained";
+export type RetainedArtifactStatus = "retained" | "resolved";
 export type ResourceStatus = "active" | "retired";
 
 export const MESSAGE_TYPES = [
@@ -198,6 +200,46 @@ export interface RetainedArtifactRecord {
   headRef?: string;
   reason?: string;
   retainedAt: number;
+  /** Retained artifacts remain recoverable until an operator resolves them. */
+  status?: RetainedArtifactStatus;
+  resolvedAt?: number;
+  resolution?: string;
+}
+
+/** Compact acknowledgement proof retained after the full mailbox record is pruned. */
+export interface MessageAckTombstone {
+  id: MessageId;
+  to: AgentId;
+  revision: number;
+  acknowledgedAt: number;
+  acknowledged: true;
+  /** Present only on a replay after the full mailbox record was pruned. */
+  alreadyAcknowledged?: true;
+}
+
+/** Physical route capacity reserved while a running host reconnects after broker recovery. */
+export interface ModelTurnRecoveryReservation {
+  agentId: AgentId;
+  operationId?: string;
+  purpose?: ModelTurnPurpose;
+  route: ModelRoute;
+  capacityKey: string;
+  reservedAt: number;
+  expiresAt: number;
+}
+
+/** Compact retired-resource identity retained after its runtime record is compacted. */
+export interface ResourceTombstone {
+  id: ResourceId;
+  kind: string;
+  parentId?: ResourceId;
+  path?: string;
+  owner?: AgentId;
+  version: number;
+  status: "retired";
+  createdAt: number;
+  retiredAt: number;
+  updatedAt: number;
 }
 
 export interface RequestTombstone {
@@ -220,6 +262,8 @@ export interface ModelTurnWaiter {
   state?: ModelTurnState;
   grantedAt?: number;
   grantExpiresAt?: number;
+  /** Number of expired unclaimed leases; after one retry the ticket demotes. */
+  grantExpiryCount?: number;
 }
 
 /**
@@ -362,6 +406,8 @@ export interface FabricConfig {
   historyRetentionMs?: number;
   /** Bound each compact tombstone collection so cold history cannot grow forever. */
   maxArchivedRecords?: number;
+  /** Bound retained-artifact metadata; resolved entries are pruned first. */
+  maxRetainedArtifacts?: number;
   /** Maximum records archived by one maintenance pass. */
   historyGcBatchSize?: number;
 }
@@ -382,6 +428,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   messageRetention: 2048,
   historyRetentionMs: 24 * 60 * 60 * 1000,
   maxArchivedRecords: 4_096,
+  maxRetainedArtifacts: 4_096,
   historyGcBatchSize: 256,
 };
 
@@ -408,8 +455,16 @@ export interface PersistedCoordinatorState {
   archivedAgents?: AgentTombstone[];
   archivedTasks?: TaskTombstone[];
   archivedRequests?: RequestTombstone[];
-  /** Useful retained Git/session artifacts are intentionally outside hot agent state. */
+  /** Legacy/full form; production broker checkpoints keep this collection external. */
   retainedArtifacts?: RetainedArtifactRecord[];
+  /** Compact references emitted when retained artifact metadata is externalized. */
+  retainedArtifactIds?: string[];
+  /** Compact ACK proofs survive message and ordinary idempotency retention. */
+  acknowledgedMessages?: MessageAckTombstone[];
+  /** Capacity reservations for provider calls that may outlive a broker restart. */
+  recoveryTurnReservations?: ModelTurnRecoveryReservation[];
+  /** Compact retired-resource history; active resources stay in `resources`. */
+  archivedResources?: ResourceTombstone[];
 }
 
 export interface AgentSummary {
@@ -466,8 +521,10 @@ export interface FabricStatus {
   activeWriteQuarantines?: number;
   /** Durable turn requests waiting for global or route capacity. */
   pendingModelTurns?: ModelTurnWaiter[];
+  /** Physical route reservations awaiting host recovery confirmation. */
+  recoveryTurnReservations?: ModelTurnRecoveryReservation[];
   /** Counts of terminal records moved out of hot coordinator state. */
-  archivedCounts?: { agents: number; tasks: number; requests: number };
+  archivedCounts?: { agents: number; tasks: number; requests: number; resources?: number };
   truncated?: { agents: boolean; tasks: boolean; resources: boolean; pendingRequests: boolean; recentMessages: boolean };
 }
 
@@ -521,7 +578,13 @@ export type CoordinatorEvent =
   | { type: "model_turn_granted"; waiterId: string; agentId: AgentId; operationId?: string; purpose?: ModelTurnPurpose; grantedAt?: number; grantExpiresAt?: number }
   | { type: "model_turn_claimed"; waiterId: string; agentId: AgentId; operationId?: string; purpose?: ModelTurnPurpose }
   | { type: "model_turn_cancelled"; waiterId: string; agentId: AgentId }
+  | { type: "model_turn_recovery_reserved"; reservation: ModelTurnRecoveryReservation }
+  | { type: "model_turn_recovery_resolved"; agentId: AgentId; operationId?: string; state: ModelTurnRecoveryState | "expired" }
   | { type: "agent_artifacts_retained"; agentId: AgentId; artifact: RetainedArtifactRecord }
+  | { type: "agent_artifacts_resolved"; agentId: AgentId; artifactId: string; resolvedAt: number; resolution?: string }
+  | { type: "agent_artifact_pruned"; artifactId: string }
+  | { type: "resource_archived"; resource: ResourceTombstone }
+  | { type: "resource_archive_pruned"; resourceId: ResourceId }
   | { type: "agent_archived"; agent: AgentTombstone }
   | { type: "task_archived"; task: TaskTombstone }
   | { type: "request_archived"; request: RequestTombstone }
@@ -581,6 +644,10 @@ export function cloneModelTurnWaiter(waiter: ModelTurnWaiter): ModelTurnWaiter {
   return { ...waiter, route: { ...waiter.route } };
 }
 
+export function cloneModelTurnRecoveryReservation(reservation: ModelTurnRecoveryReservation): ModelTurnRecoveryReservation {
+  return { ...reservation, route: { ...reservation.route } };
+}
+
 export function cloneTask(task: TaskRecord): TaskRecord {
   return { ...task, dependencies: [...(task.dependencies ?? [])], result: task.result ? { ...task.result } : undefined };
 }
@@ -596,6 +663,24 @@ export function cloneResource(resource: ResourceRecord): ResourceRecord {
   };
 }
 
+export function resourceFromTombstone(tombstone: ResourceTombstone): ResourceRecord {
+  return {
+    id: tombstone.id,
+    kind: tombstone.kind,
+    parentId: tombstone.parentId,
+    path: tombstone.path,
+    owner: tombstone.owner,
+    version: tombstone.version,
+    status: "retired",
+    grants: {},
+    sharedHolds: [],
+    waiters: [],
+    retiredAt: tombstone.retiredAt,
+    createdAt: tombstone.createdAt,
+    updatedAt: tombstone.updatedAt,
+  };
+}
+
 export function cloneMessage(message: AgentMessage): AgentMessage {
   return {
     ...message,
@@ -606,4 +691,8 @@ export function cloneMessage(message: AgentMessage): AgentMessage {
 
 export function cloneRequest(request: RequestRecord): RequestRecord {
   return { ...request };
+}
+
+export function cloneAckTombstone(tombstone: MessageAckTombstone): MessageAckTombstone {
+  return { ...tombstone };
 }

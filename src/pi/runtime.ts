@@ -491,6 +491,7 @@ export class FabricRuntime {
         });
         this.rootToken = refreshed.token;
         this.root.client.setIdentity(this.root.agentId, refreshed.token);
+        await this.reconcileRecoveredTurn(this.root.client, refreshed.agent, false);
       }
       await this.cleanupAbandonedAgentArtifacts().catch(() => undefined);
       if (this.rootDelivery) {
@@ -527,6 +528,7 @@ export class FabricRuntime {
     this.rootToken = result.token;
     await this.saveRootToken(result.token);
     client.setIdentity(agentId, result.token);
+    await this.reconcileRecoveredTurn(client, result.agent, false);
     this.root = { api, ctx, agentId, client };
     await this.cleanupAbandonedAgentArtifacts().catch(() => undefined);
     this.rootHeartbeatTimer = setInterval(() => {
@@ -1205,6 +1207,22 @@ export class FabricRuntime {
     }
   }
 
+  async reconcileRecoveredTurn(client: BrokerClient, registered: AgentRecord, providerStillRunning: boolean, operationId?: string): Promise<AgentRecord> {
+    try {
+      const result = await client.request<{ agent: AgentRecord }>("agent.reconcile_turn", {
+        state: providerStillRunning ? "running" : "stopped",
+        ...(operationId ? { operationId } : {}),
+      });
+      return result.agent;
+    } catch (error) {
+      // Older brokers do not have the recovery reservation operation. They
+      // already released runtime capacity during recovery, so retain legacy
+      // reconnect behaviour only for this explicit unknown-operation error.
+      if (error instanceof FabricError && error.code === "INVALID_ARGUMENT" && /unknown coordinator operation/i.test(error.message)) return registered;
+      throw error;
+    }
+  }
+
   private async reconnectRoot(): Promise<void> {
     if (this.rootReconnectPromise || this.stopped || !this.root) return this.rootReconnectPromise;
     this.rootReconnectPromise = (async () => {
@@ -1224,6 +1242,7 @@ export class FabricRuntime {
             workspace: { mode: "shared", root: ctx.cwd, path: ctx.cwd },
             token: this.rootToken,
           });
+          await this.reconcileRecoveredTurn(this.root.client, refreshed.agent, this.rootModelCapacityRelease !== undefined);
           this.rootToken = refreshed.token;
           this.root.client.setIdentity(this.root.agentId, refreshed.token);
           this.rootTurnAdmissionNotified = true;
@@ -1303,20 +1322,30 @@ export class FabricRuntime {
         const sessionsRoot = resolve(this.stateDirectory, "sessions");
         const sessionPath = resolve(sessionsRoot, agent.id);
         if (sessionPath === sessionsRoot || !sessionPath.startsWith(`${sessionsRoot}${sep}`)) continue;
-        let workspaceHandled = false;
+        let workspaceError: unknown;
         try {
           await this.workspaceStrategy.cleanup(workspace);
-          workspaceHandled = true;
         } catch (error) {
-          // A dirty or divergent worktree is intentionally retained. Record
-          // both locations because the session may contain recovery context.
-          await this.markArtifactsRetained(agent.id, await this.retainedArtifactMetadata(workspace, sessionPath, error)).catch(() => undefined);
-          continue;
+          // A dirty or divergent worktree is intentionally retained, but it
+          // must not prevent the independent session cleanup below.
+          workspaceError = error;
         }
+        let sessionError: unknown;
         try {
           await fs.rm(sessionPath, { recursive: true, force: true });
         } catch (error) {
-          await this.markArtifactsRetained(agent.id, await this.retainedArtifactMetadata(workspaceHandled ? undefined : workspace, sessionPath, error)).catch(() => undefined);
+          sessionError = error;
+        }
+        if (workspaceError || sessionError) {
+          const reasons = [workspaceError, sessionError]
+            .filter((error): error is unknown => error !== undefined)
+            .map((error) => error instanceof Error ? error.message : String(error))
+            .join("; ");
+          await this.markArtifactsRetained(agent.id, await this.retainedArtifactMetadata(
+            workspaceError ? workspace : undefined,
+            sessionError ? sessionPath : undefined,
+            new Error(reasons || "artifact cleanup failed"),
+          )).catch(() => undefined);
           continue;
         }
         // The marker is written only after both external artifacts have been
@@ -1335,9 +1364,16 @@ export class FabricRuntime {
   private async discoverAllAgentsForCleanup(status: FabricStatus): Promise<AgentSummary[]> {
     const byId = new Map(status.agents.map((agent) => [agent.id, agent]));
     if (status.truncated?.agents !== true || !this.root) return [...byId.values()];
-    let after = status.agents.at(-1)?.cursor;
-    for (let page = 0; page < 10_000 && after; page++) {
-      const batch = await this.root.client.request<AgentSummary[]>("discover.agents", { scope: "all", limit: 100, after });
+    // `fabric.status` summaries deliberately omit pagination cursors. Restart
+    // the complete discovery from its own first page rather than attempting to
+    // page from the last bounded diagnostic row.
+    let after: string | undefined;
+    for (let page = 0; page < 10_000; page++) {
+      const batch = await this.root.client.request<AgentSummary[]>("discover.agents", {
+        scope: "all",
+        limit: 100,
+        ...(after ? { after } : {}),
+      });
       if (!Array.isArray(batch) || batch.length === 0) break;
       for (const agent of batch) byId.set(agent.id, agent);
       const next = batch.at(-1)?.cursor;
@@ -1350,7 +1386,9 @@ export class FabricRuntime {
   private async retainedArtifactMetadata(workspace: AgentRecord["workspace"] | undefined, sessionPath: string | undefined, error: unknown): Promise<Record<string, unknown>> {
     const metadata: Record<string, unknown> = {
       workspace,
+      workspaceRetained: workspace !== undefined,
       sessionPath,
+      sessionRetained: sessionPath !== undefined,
       baseRef: workspace?.baseRef,
       reason: (error instanceof Error ? error.message : String(error)).slice(0, 1800),
     };
@@ -1440,6 +1478,8 @@ export class ManagedChild {
   private turnOutcome?: ModelTurnOutcome;
   private lastObservedOutcome?: ModelTurnOutcome;
   private compactionFailure?: ModelTurnOutcome;
+  /** Operation identity of the provider call currently running locally. */
+  private activeTurnOperationId?: string;
   private lastDiagnostic?: string;
   /** A blocked context/provider turn must not be retried by ordinary inbox wakes. */
   private blockedByOutcome?: ModelTurnOutcome;
@@ -1687,7 +1727,7 @@ export class ManagedChild {
     });
     this.session = session;
     this.sessionEventUnsubscribe = session.subscribe((event: any) => this.observeSessionEvent(event));
-    this.record = (await this.client.request<{ agent: AgentRecord }>("agent.register", {
+    const registered = (await this.client.request<{ agent: AgentRecord }>("agent.register", {
       rootId: this.runtime.fabricId,
       parentId: this.parentId,
       role: this.role,
@@ -1699,6 +1739,7 @@ export class ManagedChild {
       contextMode: this.contextMode,
       contextDiagnostic: this.lastDiagnostic,
     })).agent;
+    this.record = await this.reconcileRecoveredTurn(registered, false);
     this.taskId = this.record.taskId;
     await this.reconcileDurableAgentState(this.record);
     this.started = true;
@@ -1800,23 +1841,33 @@ export class ManagedChild {
   private async cleanupWorkspace(): Promise<void> {
     // Only a clean worktree still at its recorded base is disposable. A clean
     // branch with commits is a user-owned recovery artifact and must remain
-    // available for merge, cherry-pick, or inspection. Record that deliberate
-    // retention separately so terminal hot records can still be archived.
-    let workspaceHandled = this.workspace?.mode !== "worktree";
-    let sessionHandled = false;
+    // available for merge, cherry-pick, or inspection. Workspace and session
+    // cleanup are independent: retaining a useful branch must not retain its
+    // much larger Pi transcript as a side effect.
+    let workspaceError: unknown;
+    if (this.workspace?.mode === "worktree") {
+      try {
+        await this.runtime.workspaceStrategy.cleanup(this.workspace);
+      } catch (error) {
+        workspaceError = error;
+      }
+    }
+    let sessionError: unknown;
     const sessionPath = this.sessionArtifactPath();
     try {
-      if (this.workspace?.mode === "worktree") {
-        await this.runtime.workspaceStrategy.cleanup(this.workspace);
-        workspaceHandled = true;
-      }
       await this.cleanupSessionArtifacts();
-      sessionHandled = true;
     } catch (error) {
+      sessionError = error;
+    }
+    if (workspaceError || sessionError) {
+      const reasons = [workspaceError, sessionError]
+        .filter((error): error is unknown => error !== undefined)
+        .map((error) => error instanceof Error ? error.message : String(error))
+        .join("; ");
       await (this.runtime.markArtifactsRetained?.(this.agentId, await this.retainedArtifactMetadata(
-        workspaceHandled ? undefined : this.workspace,
-        sessionHandled ? undefined : sessionPath,
-        error,
+        workspaceError ? this.workspace : undefined,
+        sessionError ? sessionPath : undefined,
+        new Error(reasons || "artifact cleanup failed"),
       )) ?? Promise.resolve()).catch(() => undefined);
       return;
     }
@@ -1837,7 +1888,9 @@ export class ManagedChild {
   ): Promise<Record<string, unknown>> {
     const metadata: Record<string, unknown> = {
       workspace,
+      workspaceRetained: workspace !== undefined,
       sessionPath,
+      sessionRetained: sessionPath !== undefined,
       baseRef: workspace?.baseRef,
       reason: (error instanceof Error ? error.message : String(error)).slice(0, 1800),
     };
@@ -1876,7 +1929,8 @@ export class ManagedChild {
             contextMode: this.contextMode,
             contextDiagnostic: this.lastDiagnostic,
           });
-          const durable = await this.reconcileDurableAgentState(registered.agent);
+          const reconciled = await this.reconcileRecoveredTurn(registered.agent, this.session?.isStreaming === true, this.activeTurnOperationId);
+          const durable = await this.reconcileDurableAgentState(reconciled);
           // A slot grant may have happened while the socket was down. Wake the
           // admission loop; its idempotent begin_turn retry observes the
           // durable running state even if the notification was missed.
@@ -1915,6 +1969,11 @@ export class ManagedChild {
    * missed. Clearing first also lets an explicit task reopen release a stale
    * in-memory gate before inbox delivery resumes.
    */
+  private async reconcileRecoveredTurn(registered: AgentRecord, providerStillRunning: boolean, operationId?: string): Promise<AgentRecord> {
+    const reconcile = (this.runtime as unknown as { reconcileRecoveredTurn?: (client: BrokerClient, agent: AgentRecord, running: boolean, operationId?: string) => Promise<AgentRecord> }).reconcileRecoveredTurn;
+    return typeof reconcile === "function" ? reconcile.call(this.runtime, this.client, registered, providerStillRunning, operationId) : registered;
+  }
+
   private async reconcileDurableAgentState(agent?: AgentRecord): Promise<AgentRecord> {
     const durable = agent ?? await this.client.request<AgentRecord>("agent.status", {});
     this.record = durable;
@@ -2143,6 +2202,7 @@ export class ManagedChild {
   private async executePrompt(prompt: string): Promise<boolean> {
     if (!this.session || this.stopping || this.blockedByOutcome) return false;
     const turnId = `turn-${this.operationNonce}-${++this.turnSequence}`;
+    this.activeTurnOperationId = `${turnId}:begin`;
     this.turnOutcome = undefined;
     this.lastObservedOutcome = undefined;
     this.compactionFailure = undefined;
@@ -2197,6 +2257,7 @@ export class ManagedChild {
     if (promptThrownOutcome) {
       const agent = await this.client.request<AgentRecord>("agent.status", {});
       await this.finishTurnWithOutcome(promptThrownOutcome, agent.taskId ?? this.taskId, turnId);
+      this.activeTurnOperationId = undefined;
       return true;
     }
     if (this.embeddedManager && this.contextMode === "lcm-embedded") {
@@ -2223,6 +2284,7 @@ export class ManagedChild {
     this.record = ended.agent;
     this.taskId = ended.agent.taskId;
     if (["completed", "failed", "cancelled"].includes(ended.agent.status)) await this.stop();
+    this.activeTurnOperationId = undefined;
     return true;
   }
 

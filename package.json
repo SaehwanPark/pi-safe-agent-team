@@ -50,7 +50,8 @@
     "example:core": "node --experimental-strip-types examples/core-demo.ts",
     "example:broker": "node --experimental-strip-types examples/broker-demo.ts",
     "bench:r7": "node --experimental-strip-types bench/r7-long-run.ts",
-    "bench:r8": "node --experimental-strip-types bench/r8-longevity-scale.ts"
+    "bench:r8": "node --experimental-strip-types bench/r8-longevity-scale.ts",
+    "bench:r9-chaos": "node --experimental-strip-types bench/r9-chaos.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": ">=0.85.0",

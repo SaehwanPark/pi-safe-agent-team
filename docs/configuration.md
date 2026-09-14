@@ -80,10 +80,11 @@ Current defaults:
 | `heartbeatMs` | 1 minute |
 | `agentHeartbeatTimeoutMs` | 3 minutes | Time without an actor heartbeat before the broker marks it failed/reconnectable and releases runtime resource claims. Semantic task ownership remains reserved during grace. |
 | `reconnectGraceMs` | 10 minutes | How long a stale reconnectable actor keeps its `maxTotalAgents` slot and task ownership before terminal retirement; unfinished tasks then return to `ready`. |
-| `modelTurnGrantTtlMs` | 30 seconds | Lease for a capacity grant before an unclaimed model-turn ticket returns to the FIFO queue. |
+| `modelTurnGrantTtlMs` | 30 seconds | Lease for a capacity grant; one unclaimed expiry is retried, then the ticket is demoted to the FIFO tail so a dead head cannot starve later turns. |
 | `messageRetention` | 2048 recent records |
 | `historyRetentionMs` | 24 hours | Age before terminal agents/tasks/resolved requests may move to compact tombstones. |
-| `maxArchivedRecords` | 4096 per record type | Bound for retained agent/task/request tombstones; referenced entries remain until safe to prune. |
+| `maxArchivedRecords` | 4096 per record type | Bound for retained agent/task/request/resource tombstones; referenced entries remain until safe to prune. |
+| `maxRetainedArtifacts` | 4096 | Bound for retained artifact metadata; resolved entries are pruned first, and new retention is refused when every slot is unresolved. Production checkpoints keep only compact artifact IDs; full metadata lives in the atomic `retained-artifacts.json` manifest. |
 | `historyGcBatchSize` | 256 records | Maximum terminal records archived by one maintenance pass. |
 | `fenceMs` (per `resource.begin_write`) | 30s, clamped 1s-120s | Lifetime of a guarded-write fence. Not a config field: passed per call by the guarded host. The active fence map is ephemeral, while the matched resource carries a journaled restart quarantine through this expiry. |
 | `caseInsensitivePaths` | auto | Fold policy keys so differently-cased spellings share one resource. Undefined = probe the broker volume at startup (always true on Windows). Set `false` to keep keys case-sensitive. |
@@ -145,7 +146,7 @@ Normally the first root extension instance starts the local broker; later instan
 
 ## Diagnostics
 
-Use `/agents`, `/agents tree`, `/agents tasks`, `/agents resources`, `/agents messages`, and `/agents inbox`. `/agents stop` performs a bounded graceful descendant drain; `/agents stop --budget` captures model-free handoff state for quota emergencies; `/agents stop --now` uses the shortest best-effort deadline. For tests and embedding, inspect structured `FabricError.code` values rather than matching human messages. Important categories include `CAPABILITY_DENIED`, `AGENT_LIMIT_REACHED`, `MAILBOX_FULL`, `RESOURCE_CONFLICT`, `MODEL_NOT_FOUND`, `WORKSPACE_FAILURE`, and `BROKER_UNAVAILABLE`.
+Use `/agents`, `/agents tree`, `/agents tasks`, `/agents resources`, `/agents artifacts`, `/agents messages`, and `/agents inbox`. `/agents artifacts resolve <id> [resolution]` marks a retained branch/session disposition as explicitly integrated, merged, or discarded. `/agents stop` performs a bounded graceful descendant drain; `/agents stop --budget` captures model-free handoff state for quota emergencies; `/agents stop --now` uses the shortest best-effort deadline. For tests and embedding, inspect structured `FabricError.code` values rather than matching human messages. Important categories include `CAPABILITY_DENIED`, `AGENT_LIMIT_REACHED`, `MAILBOX_FULL`, `RESOURCE_CONFLICT`, `MODEL_NOT_FOUND`, `WORKSPACE_FAILURE`, and `BROKER_UNAVAILABLE`.
 
 ## Isolated smoke modes
 
