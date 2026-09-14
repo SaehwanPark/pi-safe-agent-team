@@ -104,6 +104,7 @@ test("coordination shell allows opaque foreground commands and keeps strict mode
     await coordination.execute("bash-coordination", { command: "node -e 'console.log(\"opaque\")'" }, undefined, undefined, context as never);
     assert.deepEqual(calls.map((call) => call.operation), ["shell.begin_barrier", "shell.end_barrier"]);
     assert.equal(calls[1]?.args.barrierId, "barrier-1");
+    await assert.rejects(() => coordination.execute("bash-substitution", { command: "echo $(touch marker)" }, undefined, undefined, context as never), /substitution/);
 
     const strict = createGuardedChildTools({ client, workspacePath: directory, mayWriteRepo: false, mayUseShell: true, shellPolicy: "strict" }).find((tool) => tool.name === "bash");
     assert.ok(strict);
@@ -143,6 +144,7 @@ test("coordination shell keeps explicit external paths on a separate policy axis
     const deny = createGuardedChildTools({ client, workspacePath: workspace, mayWriteRepo: false, mayUseShell: true, shellPolicy: "coordination", externalPathAccess: "deny" }).find((tool) => tool.name === "bash");
     assert.ok(deny);
     await assert.rejects(() => deny.execute("bash-deny", { command: `cat ${outside}` }, undefined, undefined, context as never), /escapes the managed workspace/);
+    await assert.rejects(() => deny.execute("bash-expansion", { command: "cat \"$HOME/.ssh/id_rsa\"" }, undefined, undefined, context as never), /substitution/);
 
     const read = createGuardedChildTools({ client, workspacePath: workspace, mayWriteRepo: false, mayUseShell: true, shellPolicy: "coordination", externalPathAccess: "read" }).find((tool) => tool.name === "bash");
     assert.ok(read);
@@ -191,6 +193,24 @@ test("opaque shell barriers survive checkpoint restore and replay release events
   assert.equal((end.value as { released: boolean }).released, true);
   const after = restored.dispatch("root", "fabric.snapshot", {}).value as { activeShellBarriers: number };
   assert.equal(after.activeShellBarriers, 0);
+});
+
+test("turn settlement releases a barrier left behind by an ambiguous shell cleanup", () => {
+  const coordinator = makeCoordinator();
+  registerRoot(coordinator);
+  const shell = registerChild(coordinator, "shell", { mayUseShell: true });
+  const writer = registerChild(coordinator, "writer", { mayWriteRepo: true });
+  coordinator.dispatch("root", "resource.define", { resourceId: "file:a.ts", kind: "file", path: "a.ts" });
+  coordinator.dispatch("root", "resource.grant", { resourceId: "file:a.ts", agentId: writer.id, permissions: ["read", "write"] });
+  const started = coordinator.dispatch(shell.id, "shell.begin_barrier", {}).value as { barrierId: string };
+  const waiting = coordinator.dispatch(writer.id, "resource.borrow", { resourceId: "file:a.ts", mode: "mutable", wait: true }).value as { status: string };
+  assert.equal(waiting.status, "waiting");
+  coordinator.dispatch(shell.id, "agent.end_turn", { status: "ready" });
+  const status = coordinator.dispatch("root", "fabric.status", {}).value as { activeShellBarriers?: number };
+  assert.equal(status.activeShellBarriers, 0);
+  const resource = coordinator.dispatch("root", "resource.inspect", { resourceId: "file:a.ts" }).value as ResourceRecord;
+  assert.equal(resource.mutableHold?.agentId, writer.id);
+  assert.equal(started.barrierId.startsWith("shell-barrier-"), true);
 });
 
 test("managed worktree shells reject detached/background processes", () => {

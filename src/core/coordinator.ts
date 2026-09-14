@@ -1045,6 +1045,11 @@ export class Coordinator {
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
 
+    // A shell tool normally releases its barrier in a finally path. Releasing
+    // any leftover owner barriers at the turn boundary also converges an
+    // ambiguous/lost end-barrier response once the local process has settled.
+    this.releaseShellBarriers(actorId, events);
+
     // A blocked context/provider turn is deliberately recoverable, but it is
     // not making progress. Release mutable claims immediately so another actor
     // can proceed while the task remains assigned for explicit recovery.
@@ -1891,7 +1896,7 @@ export class Coordinator {
     if (!actor.capabilities.mayWriteRepo) {
       return { allowed: false, reason: `Agent ${actorId} is not allowed to write repository files` };
     }
-    const shellBarrier = this.activeForeignShellBarrier(actorId);
+    const shellBarrier = this.shellBarriers.values().next().value as OpaqueShellBarrierRecord | undefined;
     if (shellBarrier) {
       return {
         allowed: false,
@@ -3271,14 +3276,7 @@ export class Coordinator {
 
   /** Release leases, waiters, and in-flight write fences without changing task ownership. */
   private releaseAgentResourceClaims(agentId: AgentId, events: CoordinatorEvent[], releaseShellBarrier = true): void {
-    if (releaseShellBarrier) {
-      for (const [id, barrier] of this.shellBarriers) {
-        if (barrier.actorId === agentId) {
-          this.shellBarriers.delete(id);
-          events.push({ type: "shell_barrier_released", barrierId: id, actorId: agentId });
-        }
-      }
-    }
+    if (releaseShellBarrier) this.releaseShellBarriers(agentId, events);
     for (const resource of this.resources.values()) {
       let changed = false;
       const beforeShared = resource.sharedHolds.length;
@@ -3301,6 +3299,17 @@ export class Coordinator {
       }
     }
     this.drainWaiters(events);
+  }
+
+  private releaseShellBarriers(agentId: AgentId, events: CoordinatorEvent[]): void {
+    let released = false;
+    for (const [id, barrier] of this.shellBarriers) {
+      if (barrier.actorId !== agentId) continue;
+      this.shellBarriers.delete(id);
+      events.push({ type: "shell_barrier_released", barrierId: id, actorId: agentId });
+      released = true;
+    }
+    if (released) this.drainWaiters(events);
   }
 
   private releaseAgentRuntime(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
@@ -3441,7 +3450,7 @@ export class Coordinator {
     // An opaque shell command may touch any path in the shared workspace. Keep
     // mutable borrows behind its broad barrier while allowing shared readers
     // to continue concurrently.
-    if (mode === "mutable" && this.activeForeignShellBarrier(agentId)) return false;
+    if (mode === "mutable" && this.shellBarriers.size > 0) return false;
     // A write fence is a promise that no one else touches the file while a
     // guarded write is in flight, so it excludes conflicting grants even in
     // the gap where the writer's own lease has just lapsed.

@@ -676,6 +676,9 @@ function hasUnsafeGitInspectionOption(command: string): boolean {
 function assertCoordinationInspectionSafety(command: string, risk: RootShellRisk): void {
   if (risk.kind !== "read-only") return;
   const trimmed = command.trim();
+  if (/[`$]/.test(trimmed) || /[<>]\s*\(/.test(trimmed)) {
+    throw new FabricError("CAPABILITY_DENIED", "Shared-workspace inspection does not allow variable, command, or process substitution");
+  }
   if (hasUnquotedShellExpansion(trimmed)) {
     throw new FabricError("CAPABILITY_DENIED", "Shared-workspace coordination shell does not allow shell glob or brace expansion for observational commands");
   }
@@ -875,6 +878,9 @@ async function assertShellArgumentsWithinPolicy(
   externalPathAccess: ExternalPathAccess,
 ): Promise<void> {
   if (externalPathAccess === "any") return;
+  if (/[`$]/.test(command) || /[<>]\s*\(/.test(command)) {
+    throw new FabricError("CAPABILITY_DENIED", "Shell expansion is not allowed when explicit external path access is restricted");
+  }
   const allowExternalRead = externalPathAccess === "read" && risk.kind === "read-only";
   const tokens = command.trim().match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
   let afterDoubleDash = false;
