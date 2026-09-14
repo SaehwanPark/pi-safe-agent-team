@@ -262,24 +262,44 @@ export function requestFingerprint(operation: string, args: Record<string, unkno
   return createHash("sha256").update(stableStringify({ operation, args: rest })).digest("hex");
 }
 
-/** Encode the ordering tuple used by stable agent/task pagination. */
+/**
+ * Cursor values are opaque and have their own wire-size contract. The v2
+ * payload avoids URI escaping, which used to make a valid long/Unicode
+ * resource ID exceed the decoder's entity-ID limit after pagination.
+ */
+export const MAX_PAGINATION_CURSOR_LENGTH = 16 * 1024;
+const MAX_PAGINATION_ID_LENGTH = 1024;
+
+/** Encode the ordering tuple used by stable agent/task/resource pagination. */
 export function encodePaginationCursor(createdAt: number, id: string): string {
-  return `v1:${createdAt}:${encodeURIComponent(id)}`;
+  return `v2:${createdAt}:${Buffer.from(id, "utf8").toString("base64url")}`;
 }
 
 export function decodePaginationCursor(value: string): { createdAt: number; id: string } | undefined {
-  if (!value.startsWith("v1:")) return undefined;
+  if (value.length > MAX_PAGINATION_CURSOR_LENGTH) return undefined;
+  const version = value.startsWith("v2:") ? "v2" : value.startsWith("v1:") ? "v1" : undefined;
+  if (!version) return undefined;
   const separator = value.indexOf(":", 3);
   if (separator < 0) return undefined;
   const createdAt = Number(value.slice(3, separator));
   if (!Number.isSafeInteger(createdAt) || createdAt < 0) return undefined;
   let id: string;
   try {
-    id = decodeURIComponent(value.slice(separator + 1));
+    if (version === "v2") {
+      const encoded = value.slice(separator + 1);
+      if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded)) return undefined;
+      const bytes = Buffer.from(encoded, "base64url");
+      id = bytes.toString("utf8");
+      // Buffer decoding is deliberately permissive; round-trip the opaque
+      // bytes so malformed base64 cannot produce a different cursor identity.
+      if (bytes.length === 0 || Buffer.from(id, "utf8").toString("base64url") !== encoded) return undefined;
+    } else {
+      id = decodeURIComponent(value.slice(separator + 1));
+    }
   } catch {
     return undefined;
   }
-  return id.length > 0 && id.length <= 512 && !id.includes("\u0000") ? { createdAt, id } : undefined;
+  return id.length > 0 && id.length <= MAX_PAGINATION_ID_LENGTH && !id.includes("\u0000") ? { createdAt, id } : undefined;
 }
 
 export function normalizeClone<T>(value: T): T {

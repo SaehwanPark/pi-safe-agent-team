@@ -461,8 +461,19 @@ export class BrokerServer {
       case "model_turn_claimed":
       case "model_turn_cancelled":
         return event.agentId === actorId;
+      case "model_turn_recovery_reserved":
+        return observer.depth === 0 || event.reservation.agentId === actorId;
+      case "model_turn_recovery_resolved":
+        return observer.depth === 0 || event.agentId === actorId;
       case "agent_artifacts_retained":
         return observer.depth === 0 || event.agentId === actorId;
+      case "agent_artifacts_resolved":
+        return observer.depth === 0 || event.agentId === actorId;
+      case "agent_artifact_pruned":
+        return observer.depth === 0;
+      case "resource_archived":
+      case "resource_archive_pruned":
+        return observer.depth === 0;
       case "agent_archived":
       case "task_archived":
       case "request_archived":

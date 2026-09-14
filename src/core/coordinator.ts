@@ -2,13 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { FabricError, assertCondition } from "./errors.ts";
 import {
   DEFAULT_FABRIC_CONFIG,
+  cloneAckTombstone,
   cloneAgent,
   cloneCapabilities,
   cloneMessage,
+  cloneModelTurnRecoveryReservation,
   cloneModelTurnWaiter,
   cloneRequest,
   cloneResource,
   cloneTask,
+  resourceFromTombstone,
   type ActiveFenceSummary,
   type AgentCapabilities,
   type AgentId,
@@ -24,7 +27,11 @@ import {
   type FabricStatus,
   type IdempotencyRecord,
   type IdempotencyStateEntry,
+  type MessageAckTombstone,
+  type MessageId,
   type MessagePriority,
+  type ModelTurnRecoveryReservation,
+  type ModelTurnRecoveryState,
   type ModelTurnWaiter,
   type MessageType,
   type ModelRoute,
@@ -38,6 +45,7 @@ import {
   type ResourceId,
   type ResourcePermission,
   type ResourceRecord,
+  type ResourceTombstone,
   type ResourceWaiter,
   type TaskId,
   type TaskRecord,
@@ -194,8 +202,13 @@ export class Coordinator {
   private archivedAgents = new Map<AgentId, AgentTombstone>();
   private archivedTasks = new Map<TaskId, TaskTombstone>();
   private archivedRequests = new Map<RequestId, RequestTombstone>();
+  private archivedResources = new Map<ResourceId, ResourceTombstone>();
   /** Retained Git/session artifacts are cold metadata, not hot agent pins. */
   private retainedArtifacts = new Map<string, RetainedArtifactRecord>();
+  /** Compact ACK proofs survive message and ordinary idempotency retention. */
+  private acknowledgedMessages = new Map<string, MessageAckTombstone>();
+  /** Reservations preserve physical provider capacity across broker recovery. */
+  private recoveryTurnReservations = new Map<AgentId, ModelTurnRecoveryReservation>();
   /** Ephemeral write fences (begin_write/end_write); never persisted or replayed. */
   private fences = new Map<string, WriteFenceRecord>();
 
@@ -223,6 +236,7 @@ export class Coordinator {
     assertCondition(this.config.messageRetention > 0, "INVALID_ARGUMENT", "messageRetention must be positive");
     assertCondition((this.config.historyRetentionMs ?? 0) > 0, "INVALID_ARGUMENT", "historyRetentionMs must be positive");
     assertCondition((this.config.maxArchivedRecords ?? 0) > 0, "INVALID_ARGUMENT", "maxArchivedRecords must be positive");
+    assertCondition((this.config.maxRetainedArtifacts ?? 0) > 0, "INVALID_ARGUMENT", "maxRetainedArtifacts must be positive");
     assertCondition(this.config.leaseMs > 0, "INVALID_ARGUMENT", "leaseMs must be positive");
     assertCondition(this.config.heartbeatMs > 0, "INVALID_ARGUMENT", "heartbeatMs must be positive");
     assertCondition((this.config.agentHeartbeatTimeoutMs ?? 0) > 0, "INVALID_ARGUMENT", "agentHeartbeatTimeoutMs must be positive");
@@ -296,8 +310,12 @@ export class Coordinator {
         return this.withEvents(events, this.markArtifactsCleaned(this.requireActor(actorId).id, parseString(args.agentId, "agentId"), events));
       case "agent.mark_artifacts_retained":
         return this.withEvents(events, this.markArtifactsRetained(this.requireActor(actorId).id, parseString(args.agentId, "agentId"), args.artifact, events));
+      case "agent.resolve_artifact":
+        return this.withEvents(events, this.resolveArtifact(this.requireActor(actorId).id, parseString(args.artifactId, "artifactId"), args.resolution, events));
       case "agent.begin_turn":
         return this.withEvents(events, this.beginTurn(this.requireActor(actorId).id, args, events));
+      case "agent.reconcile_turn":
+        return this.withEvents(events, this.reconcileTurn(this.requireActor(actorId).id, args, events));
       case "agent.drain":
         return this.withEvents(events, this.drainAgent(this.requireActor(actorId).id, parseString(args.agentId ?? actorId, "agentId"), parseOptionalString(args.reason, "reason", 2048), events));
       case "agent.end_turn":
@@ -495,6 +513,7 @@ export class Coordinator {
       }
       const routeChanged = input.route && (input.route.provider !== existing.route.provider || input.route.model !== existing.route.model || input.route.thinking !== existing.route.thinking || input.route.capacityGroup !== existing.route.capacityGroup);
       assertCondition(!routeChanged || this.findModelTurnWaiter(id) === undefined, "LIFECYCLE_CONFLICT", `Agent ${id} cannot change route while a model turn is queued`);
+      assertCondition(!routeChanged || !this.recoveryTurnReservations.has(id), "LIFECYCLE_CONFLICT", `Agent ${id} cannot change route while its recovered model turn is unresolved`);
       if (routeChanged) next.route = route;
       this.agents.set(id, next);
       events.push({ type: "agent_updated", agent: cloneAgent(next) });
@@ -646,17 +665,24 @@ export class Coordinator {
     assertCondition(rawArtifact === undefined || (Boolean(rawArtifact) && typeof rawArtifact === "object" && !Array.isArray(rawArtifact)), "INVALID_ARGUMENT", "artifact must be an object");
     const input = (rawArtifact ?? {}) as Record<string, unknown>;
     const existing = target.retainedArtifactId ? this.retainedArtifacts.get(target.retainedArtifactId) : undefined;
+    assertCondition(input.workspaceRetained === undefined || typeof input.workspaceRetained === "boolean", "INVALID_ARGUMENT", "artifact.workspaceRetained must be boolean");
+    assertCondition(input.sessionRetained === undefined || typeof input.sessionRetained === "boolean", "INVALID_ARGUMENT", "artifact.sessionRetained must be boolean");
+    assertCondition(!existing || existing.status !== "resolved", "LIFECYCLE_CONFLICT", `Artifact ${existing?.id ?? target.retainedArtifactId} has already been resolved`);
+    const keepWorkspace = input.workspaceRetained === undefined ? true : input.workspaceRetained;
+    const keepSession = input.sessionRetained === undefined ? true : input.sessionRetained;
     const artifact: RetainedArtifactRecord = {
       id: existing?.id ?? this.idFactory("retained-artifact"),
       agentId: target.id,
-      workspace: input.workspace === undefined ? target.workspace ? { ...target.workspace } : undefined : parseWorkspace(input.workspace),
-      sessionPath: parseOptionalString(input.sessionPath, "artifact.sessionPath", 4096),
-      baseRef: parseOptionalString(input.baseRef, "artifact.baseRef", 512),
-      headRef: parseOptionalString(input.headRef, "artifact.headRef", 512),
-      reason: parseOptionalString(input.reason, "artifact.reason", 2048),
+      workspace: input.workspace !== undefined ? parseWorkspace(input.workspace) : keepWorkspace ? existing?.workspace ? { ...existing.workspace } : target.workspace ? { ...target.workspace } : undefined : undefined,
+      sessionPath: !keepSession ? undefined : input.sessionPath === undefined ? existing?.sessionPath : parseOptionalString(input.sessionPath, "artifact.sessionPath", 4096),
+      baseRef: input.baseRef === undefined ? existing?.baseRef : parseOptionalString(input.baseRef, "artifact.baseRef", 512),
+      headRef: input.headRef === undefined ? existing?.headRef : parseOptionalString(input.headRef, "artifact.headRef", 512),
+      reason: input.reason === undefined ? existing?.reason : parseOptionalString(input.reason, "artifact.reason", 2048),
       retainedAt: existing?.retainedAt ?? this.clock(),
+      status: "retained",
     };
     this.retainedArtifacts.set(artifact.id, { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined });
+    this.trimRetainedArtifacts(events);
     const next = cloneAgent(target);
     next.artifactDisposition = "retained";
     next.retainedArtifactId = artifact.id;
@@ -668,6 +694,34 @@ export class Coordinator {
     return publicAgent(next);
   }
 
+  private trimRetainedArtifacts(events: CoordinatorEvent[]): void {
+    const limit = this.config.maxRetainedArtifacts ?? DEFAULT_FABRIC_CONFIG.maxRetainedArtifacts!;
+    if (this.retainedArtifacts.size <= limit) return;
+    const resolved = [...this.retainedArtifacts.values()]
+      .filter((artifact) => artifact.status === "resolved")
+      .sort((left, right) => (left.resolvedAt ?? 0) - (right.resolvedAt ?? 0) || left.id.localeCompare(right.id));
+    for (const artifact of resolved) {
+      if (this.retainedArtifacts.size <= limit) break;
+      this.retainedArtifacts.delete(artifact.id);
+      events.push({ type: "agent_artifact_pruned", artifactId: artifact.id });
+    }
+  }
+
+  private resolveArtifact(actorId: AgentId, artifactId: string, rawResolution: unknown, events: CoordinatorEvent[]): RetainedArtifactRecord {
+    const actor = this.requireActor(actorId);
+    assertCondition(actor.depth === 0, "CAPABILITY_DENIED", "Only a fabric root may resolve retained artifacts");
+    const artifact = this.retainedArtifacts.get(artifactId);
+    assertCondition(artifact, "INVALID_ARGUMENT", `Retained artifact ${artifactId} was not found`);
+    if (artifact.status === "resolved") return { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined };
+    const resolution = rawResolution === undefined ? undefined : parseString(rawResolution, "resolution", 2048);
+    const resolvedAt = this.clock();
+    artifact.status = "resolved";
+    artifact.resolvedAt = resolvedAt;
+    artifact.resolution = resolution;
+    events.push({ type: "agent_artifacts_resolved", agentId: artifact.agentId, artifactId, resolvedAt, resolution });
+    return { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined };
+  }
+
   private updateAgent(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): AgentRecord {
     const agent = this.requireAgent(actorId);
     const next = cloneAgent(agent);
@@ -676,7 +730,7 @@ export class Coordinator {
     const routeChanged = next.route.provider !== agent.route.provider || next.route.model !== agent.route.model || next.route.thinking !== agent.route.thinking || next.route.capacityGroup !== agent.route.capacityGroup;
     assertCondition(!routeChanged || this.findModelTurnWaiter(agent.id) === undefined, "LIFECYCLE_CONFLICT", `Agent ${agent.id} cannot change route while a model turn is queued`);
     if ((requestedStatus === "running" && agent.status !== "running") || (agent.status === "running" && routeChanged)) {
-      const runningExcludingSelf = this.runningAgentCount() - (agent.status === "running" ? 1 : 0) + this.grantedModelTurnCount();
+      const runningExcludingSelf = this.runningAgentCount() - (agent.status === "running" ? 1 : 0) + this.grantedModelTurnCount() + this.recoveryTurnReservationCount();
       assertCondition(runningExcludingSelf < this.config.maxConcurrentAgents, "AGENT_LIMIT_REACHED", "maxConcurrentAgents reached");
       this.assertRouteCapacity(next.route, agent.id);
     }
@@ -685,6 +739,7 @@ export class Coordinator {
     }
     if (requestedStatus) this.transitionStatus(next, requestedStatus, parseOptionalString(args.statusReason, "statusReason", 2048));
     if (requestedStatus === "running" && next.status === "running" && next.activeTurnOperationId === undefined) {
+      assertCondition(!this.recoveryTurnReservations.has(agent.id), "LIFECYCLE_CONFLICT", `Agent ${agent.id} must reconcile its recovered model turn first`);
       next.activeTurnOperationId = this.idFactory("turn");
       next.activeTurnPurpose = "turn";
     } else if (requestedStatus !== undefined && requestedStatus !== "running") {
@@ -700,6 +755,7 @@ export class Coordinator {
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
     if (requestedStatus === "blocked") {
       this.removeModelTurnWaiter(actorId, events);
+      this.removeRecoveryTurnReservation(actorId, events);
       this.releaseAgentResourceClaims(actorId, events);
       this.drainModelTurnWaiters(events);
     }
@@ -786,10 +842,45 @@ export class Coordinator {
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
   }
 
+  /**
+   * Resolve the one provider call that may have survived an independent broker
+   * restart. A reconnecting host must explicitly say whether its local
+   * session is still streaming before the reservation can be released or
+   * converted back into a normal running turn.
+   */
+  private reconcileTurn(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): { agent: AgentRecord; reconciled: boolean } {
+    const agent = this.requireActor(actorId);
+    const state = args.state;
+    assertCondition(state === "running" || state === "stopped", "INVALID_ARGUMENT", "reconcile state must be running or stopped");
+    const operationId = args.operationId === undefined ? undefined : parseString(args.operationId, "operationId", 128);
+    const reservation = this.recoveryTurnReservations.get(actorId);
+    if (!reservation) return { agent: publicAgent(agent), reconciled: false };
+    assertCondition(operationId === undefined || operationId === reservation.operationId, "IDENTITY_CONFLICT", `Agent ${actorId} supplied the wrong recovered model operation`);
+    const next = cloneAgent(agent);
+    const now = this.clock();
+    this.recoveryTurnReservations.delete(actorId);
+    events.push({ type: "model_turn_recovery_resolved", agentId: actorId, operationId: reservation.operationId, state });
+    if (state === "running") {
+      next.activeTurnOperationId = reservation.operationId ?? this.idFactory("recovered-turn");
+      next.activeTurnPurpose = reservation.purpose ?? "turn";
+      this.transitionStatus(next, "running", undefined);
+    } else {
+      next.activeTurnOperationId = undefined;
+      next.activeTurnPurpose = undefined;
+      if (next.status !== "ready") this.transitionStatus(next, "ready");
+    }
+    next.lastActivity = now;
+    this.agents.set(actorId, next);
+    events.push({ type: "agent_updated", agent: cloneAgent(next) });
+    this.drainModelTurnWaiters(events);
+    return { agent: publicAgent(next), reconciled: true };
+  }
+
   private turnCapacityReason(agent: AgentRecord): string | undefined {
-    if (this.runningAgentCount() + this.grantedModelTurnCount() >= this.config.maxConcurrentAgents) return "maxConcurrentAgents reached";
+    if (this.recoveryTurnReservationCount() > 0 && this.recoveryTurnReservations.has(agent.id)) return "Agent must reconcile its recovered model turn before starting new work";
+    if (this.runningAgentCount() + this.grantedModelTurnCount() + this.recoveryTurnReservationCount() >= this.config.maxConcurrentAgents) return "maxConcurrentAgents reached";
     const routeLimit = this.routeCapacityLimit(agent.route);
-    if (routeLimit !== undefined && this.runningRouteCount(agent.route, agent.id) + this.grantedModelTurnCount(modelRouteCapacityKey(this.config, agent.route)) >= routeLimit) {
+    if (routeLimit !== undefined && this.runningRouteCount(agent.route, agent.id) + this.grantedModelTurnCount(modelRouteCapacityKey(this.config, agent.route)) + this.recoveryTurnReservationCount(modelRouteCapacityKey(this.config, agent.route)) >= routeLimit) {
       return `model route capacity reached for ${modelRouteKey(agent.route)}`;
     }
     return undefined;
@@ -797,6 +888,10 @@ export class Coordinator {
 
   private grantedModelTurnCount(capacityKey?: string): number {
     return [...this.modelWaiters.values()].filter((waiter) => waiter.state === "granted" && (capacityKey === undefined || waiter.capacityKey === capacityKey)).length;
+  }
+
+  private recoveryTurnReservationCount(capacityKey?: string): number {
+    return [...this.recoveryTurnReservations.values()].filter((reservation) => capacityKey === undefined || reservation.capacityKey === capacityKey).length;
   }
 
   private findModelTurnWaiter(agentId: AgentId): ModelTurnWaiter | undefined {
@@ -839,9 +934,15 @@ export class Coordinator {
     for (const waiter of this.modelWaiters.values()) {
       if (waiter.state !== "granted" || (waiter.grantExpiresAt ?? Number.POSITIVE_INFINITY) > now) continue;
       // A lost grant notification must not lose the caller's logical turn.
-      // Return the same ticket to the FIFO queue and let the normal drain
-      // path re-grant it when capacity is available.
+      // Permit one notification-loss retry, then forfeit priority by moving
+      // the ticket to the tail so one dead/nonclaiming waiter cannot
+      // repeatedly reacquire a single-slot route ahead of healthy peers.
       waiter.state = "queued";
+      waiter.grantExpiryCount = (waiter.grantExpiryCount ?? 0) + 1;
+      if (waiter.grantExpiryCount > 1) {
+        waiter.enqueuedSequence = ++this.nextModelTurnWaiterSequence;
+        waiter.enqueuedAt = now;
+      }
       waiter.grantedAt = undefined;
       waiter.grantExpiresAt = undefined;
       events.push({ type: "model_turn_waiting", waiter: cloneModelTurnWaiter(waiter) });
@@ -887,6 +988,9 @@ export class Coordinator {
     }
     next.lastActivity = this.clock();
     this.removeModelTurnWaiter(actorId, events);
+    // An explicit end_turn is the host's definitive stopped signal for a
+    // recovered provider operation when it did not need to resume running.
+    this.removeRecoveryTurnReservation(actorId, events);
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
 
@@ -1056,6 +1160,7 @@ export class Coordinator {
     for (const child of this.agents.values()) if (child.parentId === agent.id) this.cancelSubtree(child, reason, events, cancelled);
     if (isTerminal(agent.status) && !agent.reconnectable) return;
     const next = cloneAgent(agent);
+    this.removeRecoveryTurnReservation(next.id, events);
     next.status = "cancelled";
     next.reconnectable = false;
     next.terminalAt = this.clock();
@@ -1103,7 +1208,7 @@ export class Coordinator {
     const status = args.status === undefined ? undefined : parseString(args.status, "status", 32);
     const filtered = status ? selected.filter((candidate) => candidate.status === status) : selected;
     const sorted = filtered.sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-    const after = args.after === undefined ? undefined : parseString(args.after, "after", 4096);
+    const after = args.after === undefined ? undefined : parseString(args.after, "after", 16 * 1024);
     const anchor = after === undefined ? undefined : this.agentPaginationAnchor(after);
     const start = anchor === undefined ? 0 : sorted.findIndex((candidate) => candidate.createdAt > anchor.createdAt || candidate.createdAt === anchor.createdAt && candidate.id.localeCompare(anchor.id) > 0);
     return sorted.slice(start < 0 ? sorted.length : start, (start < 0 ? sorted.length : start) + this.listLimit(args.limit)).map((candidate) => ({
@@ -1121,7 +1226,7 @@ export class Coordinator {
       assertCondition(createdAt !== undefined && createdAt === decoded.createdAt, "CURSOR_STALE", `Agent pagination cursor ${after} is stale`);
       return decoded;
     }
-    assertCondition(!after.startsWith("v1:"), "INVALID_ARGUMENT", "after contains an invalid pagination cursor");
+    assertCondition(!after.startsWith("v1:") && !after.startsWith("v2:"), "INVALID_ARGUMENT", "after contains an invalid pagination cursor");
     const hot = this.agents.get(after);
     const archived = this.archivedAgents.get(after);
     assertCondition(hot || archived, "CURSOR_STALE", `Agent pagination cursor ${after} is stale`);
@@ -1173,28 +1278,58 @@ export class Coordinator {
     return { message: result.message, request: cloneRequest(resolved) };
   }
 
-  private ackMessage(actorId: AgentId, messageId: string, rawRevision: unknown, events: CoordinatorEvent[]): AgentMessage {
+  private ackTombstoneKey(to: AgentId, messageId: MessageId, revision: number): string {
+    return `${to}\u0000${messageId}\u0000${revision}`;
+  }
+
+  private rememberAckTombstone(message: Pick<AgentMessage, "id" | "to" | "revision" | "acknowledgedAt">): MessageAckTombstone | undefined {
+    if (message.acknowledgedAt === undefined) return undefined;
+    const revision = message.revision ?? 1;
+    const tombstone: MessageAckTombstone = {
+      id: message.id,
+      to: message.to,
+      revision,
+      acknowledgedAt: message.acknowledgedAt,
+      acknowledged: true,
+    };
+    this.acknowledgedMessages.set(this.ackTombstoneKey(tombstone.to, tombstone.id, tombstone.revision), tombstone);
+    return tombstone;
+  }
+
+  private ackMessage(actorId: AgentId, messageId: string, rawRevision: unknown, events: CoordinatorEvent[]): AgentMessage | MessageAckTombstone {
+    const requestedRevision = rawRevision === undefined ? 1 : parseNumber(rawRevision, "revision", 1);
+    assertCondition(Number.isInteger(requestedRevision) && requestedRevision > 0, "INVALID_ARGUMENT", "revision must be a positive integer");
     const message = this.messages.get(messageId);
-    assertCondition(message, "MESSAGE_NOT_FOUND", `Message ${messageId} was not found`);
+    if (!message) {
+      const exact = this.acknowledgedMessages.get(this.ackTombstoneKey(actorId, messageId, requestedRevision));
+      if (exact) return { ...cloneAckTombstone(exact), alreadyAcknowledged: true };
+      const otherRevision = [...this.acknowledgedMessages.values()].find((candidate) => candidate.id === messageId && candidate.to === actorId);
+      if (otherRevision) {
+        throw new FabricError("MESSAGE_REVISION_CONFLICT", `Message ${messageId} was acknowledged at revision ${otherRevision.revision}; revision ${requestedRevision} is stale`, {
+          messageId,
+          expectedRevision: otherRevision.revision,
+          receivedRevision: requestedRevision,
+        });
+      }
+      throw new FabricError("MESSAGE_NOT_FOUND", `Message ${messageId} was not found`);
+    }
     assertCondition(message.to === actorId, "MESSAGE_NOT_VISIBLE", `Agent ${actorId} cannot acknowledge ${messageId}`);
     const currentRevision = message.revision ?? 1;
-    if (rawRevision === undefined) {
-      assertCondition(currentRevision === 1, "MESSAGE_REVISION_CONFLICT", `Message ${messageId} requires revision ${currentRevision} for acknowledgement`, {
-        messageId,
-        expectedRevision: currentRevision,
-      });
-    } else {
-      const revision = parseNumber(rawRevision, "revision", 1);
-      assertCondition(Number.isInteger(revision) && revision > 0, "INVALID_ARGUMENT", "revision must be a positive integer");
-      assertCondition(revision === currentRevision, "MESSAGE_REVISION_CONFLICT", `Message ${messageId} is at revision ${currentRevision}; revision ${revision} is stale`, {
-        messageId,
-        expectedRevision: currentRevision,
-        receivedRevision: revision,
-      });
+    assertCondition(requestedRevision === currentRevision, "MESSAGE_REVISION_CONFLICT", `Message ${messageId} is at revision ${currentRevision}; revision ${requestedRevision} is stale`, {
+      messageId,
+      expectedRevision: currentRevision,
+      receivedRevision: requestedRevision,
+    });
+    if (message.acknowledgedAt !== undefined) {
+      const key = this.ackTombstoneKey(message.to, message.id, currentRevision);
+      const hadTombstone = this.acknowledgedMessages.has(key);
+      this.rememberAckTombstone(message);
+      if (!hadTombstone) events.push({ type: "message_acknowledged", message: cloneMessage(message) });
+      return cloneMessage(message);
     }
-    if (message.acknowledgedAt !== undefined) return cloneMessage(message);
     message.acknowledgedAt = this.clock();
     if (message.deliveredAt === undefined) message.deliveredAt = message.acknowledgedAt;
+    this.rememberAckTombstone(message);
     events.push({ type: "message_acknowledged", message: cloneMessage(message) });
     this.pruneMessages(events);
     return cloneMessage(message);
@@ -1397,7 +1532,7 @@ export class Coordinator {
       .filter((task) => status === undefined || task.status === status)
       .filter((task) => owner === undefined || task.owner === owner)
       .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-    const after = args.after === undefined ? undefined : parseString(args.after, "after", 4096);
+    const after = args.after === undefined ? undefined : parseString(args.after, "after", 16 * 1024);
     const anchor = after === undefined ? undefined : this.taskPaginationAnchor(after);
     const start = anchor === undefined ? 0 : sorted.findIndex((task) => task.createdAt > anchor.createdAt || task.createdAt === anchor.createdAt && task.id.localeCompare(anchor.id) > 0);
     const offset = start < 0 ? sorted.length : start;
@@ -1416,7 +1551,7 @@ export class Coordinator {
       assertCondition(createdAt !== undefined && createdAt === decoded.createdAt, "CURSOR_STALE", `Task pagination cursor ${after} is stale`);
       return decoded;
     }
-    assertCondition(!after.startsWith("v1:"), "INVALID_ARGUMENT", "after contains an invalid pagination cursor");
+    assertCondition(!after.startsWith("v1:") && !after.startsWith("v2:"), "INVALID_ARGUMENT", "after contains an invalid pagination cursor");
     const hot = this.tasks.get(after);
     const archived = this.archivedTasks.get(after);
     assertCondition(hot || archived, "CURSOR_STALE", `Task pagination cursor ${after} is stale`);
@@ -1447,6 +1582,7 @@ export class Coordinator {
       assertCondition(existing.kind === kind && existing.parentId === parentId && (args.path === undefined || existing.path === resourcePath), "IDENTITY_CONFLICT", `Resource ${id} already has a different definition`);
       return cloneResource(existing);
     }
+    assertCondition(!this.archivedResources.has(id), "IDENTITY_CONFLICT", `Resource ${id} is a retired identity and cannot be reused`);
     if (parentId) {
       assertCondition(parentId !== id && this.resources.has(parentId), "RESOURCE_NOT_FOUND", `Parent resource ${parentId} was not found`);
       assertCondition(this.isResourceActive(this.requireResource(parentId)), "LIFECYCLE_CONFLICT", `Parent resource ${parentId} is retired`);
@@ -1487,10 +1623,14 @@ export class Coordinator {
   }
 
   private listResources(actorId: AgentId, args: Record<string, unknown>): Array<ResourceRecord & { cursor?: string }> {
-    const sorted = [...this.resources.values()]
+    const allResources = [
+      ...this.resources.values(),
+      ...[...this.archivedResources.values()].map(resourceFromTombstone),
+    ];
+    const sorted = allResources
       .filter((resource) => this.canInspectResource(actorId, resource))
       .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-    const after = args.after === undefined ? undefined : parseString(args.after, "after", 4096);
+    const after = args.after === undefined ? undefined : parseString(args.after, "after", 16 * 1024);
     const anchor = after === undefined ? undefined : this.resourcePaginationAnchor(after);
     const start = anchor === undefined ? 0 : sorted.findIndex((resource) => resource.createdAt > anchor.createdAt || resource.createdAt === anchor.createdAt && resource.id.localeCompare(anchor.id) > 0);
     const offset = start < 0 ? sorted.length : start;
@@ -1503,12 +1643,12 @@ export class Coordinator {
   private resourcePaginationAnchor(after: string): { createdAt: number; id: string } {
     const decoded = decodePaginationCursor(after);
     if (decoded) {
-      const resource = this.resources.get(decoded.id);
+      const resource = this.resources.get(decoded.id) ?? (this.archivedResources.has(decoded.id) ? resourceFromTombstone(this.archivedResources.get(decoded.id) as ResourceTombstone) : undefined);
       assertCondition(resource !== undefined && resource.createdAt === decoded.createdAt, "CURSOR_STALE", `Resource pagination cursor ${after} is stale`);
       return decoded;
     }
-    assertCondition(!after.startsWith("v1:"), "INVALID_ARGUMENT", "after contains an invalid pagination cursor");
-    const resource = this.resources.get(after);
+    assertCondition(!after.startsWith("v1:") && !after.startsWith("v2:"), "INVALID_ARGUMENT", "after contains an invalid pagination cursor");
+    const resource = this.resources.get(after) ?? (this.archivedResources.has(after) ? resourceFromTombstone(this.archivedResources.get(after) as ResourceTombstone) : undefined);
     assertCondition(resource !== undefined, "CURSOR_STALE", `Resource pagination cursor ${after} is stale`);
     return { createdAt: resource.createdAt, id: resource.id };
   }
@@ -1815,7 +1955,10 @@ export class Coordinator {
     const now = this.clock();
     const agents = [...this.agents.values()].sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
     const tasks = [...this.tasks.values()].sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-    const resources = [...this.resources.values()].sort((left, right) => {
+    const resources = [
+      ...this.resources.values(),
+      ...[...this.archivedResources.values()].map(resourceFromTombstone),
+    ].sort((left, right) => {
       const leftContention = (left.mutableHold ? 4 : 0) + (left.sharedHolds.length > 0 ? 2 : 0) + (left.waiters.length > 0 ? 1 : 0) + ((left.writeQuarantineUntil ?? 0) > now ? 2 : 0);
       const rightContention = (right.mutableHold ? 4 : 0) + (right.sharedHolds.length > 0 ? 2 : 0) + (right.waiters.length > 0 ? 1 : 0) + ((right.writeQuarantineUntil ?? 0) > now ? 2 : 0);
       return rightContention - leftContention || left.createdAt - right.createdAt || left.id.localeCompare(right.id);
@@ -1855,10 +1998,12 @@ export class Coordinator {
       }),
       activeWriteQuarantines: [...this.resources.values()].filter((resource) => this.isResourceActive(resource) && (resource.writeQuarantineUntil ?? 0) > now).length,
       pendingModelTurns: [...this.modelWaiters.values()].sort((left, right) => left.enqueuedSequence - right.enqueuedSequence).slice(0, boundedLimit).map(cloneModelTurnWaiter),
+      recoveryTurnReservations: [...this.recoveryTurnReservations.values()].slice(0, boundedLimit).map(cloneModelTurnRecoveryReservation),
       archivedCounts: {
         agents: this.archivedAgents.size,
         tasks: this.archivedTasks.size,
         requests: this.archivedRequests.size,
+        resources: this.archivedResources.size,
       },
       truncated: {
         agents: agents.length > boundedLimit,
@@ -1928,6 +2073,7 @@ export class Coordinator {
       messageRetention: this.config.messageRetention,
       historyRetentionMs: this.config.historyRetentionMs,
       maxArchivedRecords: this.config.maxArchivedRecords,
+      maxRetainedArtifacts: this.config.maxRetainedArtifacts,
       historyGcBatchSize: this.config.historyGcBatchSize,
     };
   }
@@ -2081,6 +2227,7 @@ export class Coordinator {
     const current = this.agents.get(agent.id);
     if (!current || (!this.isReservedLive(current) && current.reconnectable !== true)) return;
     const next = cloneAgent(current);
+    this.removeRecoveryTurnReservation(next.id, events);
     next.status = "cancelled";
     next.reconnectable = false;
     next.recoveryExpiredAt = this.clock();
@@ -2100,6 +2247,39 @@ export class Coordinator {
       // recovery transition, so the parent receives the ordinary failure wake.
       this.sendInternalMessage(next.id, next.parentId, "agent_failed", next.statusReason, { failedAgentId: next.id }, events);
     }
+  }
+
+  private reserveRecoveryTurn(agent: AgentRecord, now: number, events: CoordinatorEvent[]): void {
+    if (agent.status !== "running" || this.recoveryTurnReservations.has(agent.id)) return;
+    const reservation: ModelTurnRecoveryReservation = {
+      agentId: agent.id,
+      operationId: agent.activeTurnOperationId,
+      purpose: agent.activeTurnPurpose ?? "turn",
+      route: { ...agent.route },
+      capacityKey: modelRouteCapacityKey(this.config, agent.route),
+      reservedAt: now,
+      expiresAt: now + (this.config.reconnectGraceMs ?? DEFAULT_FABRIC_CONFIG.reconnectGraceMs!),
+    };
+    this.recoveryTurnReservations.set(agent.id, reservation);
+    events.push({ type: "model_turn_recovery_reserved", reservation: cloneModelTurnRecoveryReservation(reservation) });
+  }
+
+  private expireRecoveryTurnReservations(now: number, events: CoordinatorEvent[]): boolean {
+    let expired = false;
+    for (const [agentId, reservation] of [...this.recoveryTurnReservations.entries()]) {
+      if (reservation.expiresAt > now) continue;
+      this.recoveryTurnReservations.delete(agentId);
+      events.push({ type: "model_turn_recovery_resolved", agentId, operationId: reservation.operationId, state: "expired" });
+      expired = true;
+    }
+    return expired;
+  }
+
+  private removeRecoveryTurnReservation(agentId: AgentId, events: CoordinatorEvent[], state: ModelTurnRecoveryState | "expired" = "stopped"): void {
+    const reservation = this.recoveryTurnReservations.get(agentId);
+    if (!reservation) return;
+    this.recoveryTurnReservations.delete(agentId);
+    events.push({ type: "model_turn_recovery_resolved", agentId, operationId: reservation.operationId, state });
   }
 
   private archiveHistoricalRecords(now: number, events: CoordinatorEvent[]): void {
@@ -2163,6 +2343,7 @@ export class Coordinator {
           workspace: current.workspace ? { ...current.workspace } : undefined,
           retainedAt: now,
           reason: "Terminal agent artifacts were retained",
+          status: "retained",
         });
       }
       const tombstone: AgentTombstone = {
@@ -2227,7 +2408,35 @@ export class Coordinator {
         budget -= 1;
       }
     }
+
+    // Retired resources no longer participate in overlap, ownership, or
+    // waiter checks. Replace their bulky grant/hold maps with an inspectable
+    // identity tombstone once the normal history horizon has elapsed.
+    if (budget > 0) {
+      for (const resource of [...this.resources.values()].sort((left, right) => (left.retiredAt ?? left.updatedAt) - (right.retiredAt ?? right.updatedAt) || left.id.localeCompare(right.id))) {
+        if (budget <= 0 || resource.status !== "retired") continue;
+        const retiredAt = resource.retiredAt ?? resource.updatedAt;
+        if (retiredAt > cutoff) continue;
+        const tombstone: ResourceTombstone = {
+          id: resource.id,
+          kind: resource.kind,
+          parentId: resource.parentId,
+          path: resource.path,
+          owner: resource.owner,
+          version: resource.version,
+          status: "retired",
+          createdAt: resource.createdAt,
+          retiredAt,
+          updatedAt: resource.updatedAt,
+        };
+        this.resources.delete(resource.id);
+        this.archivedResources.set(resource.id, tombstone);
+        events.push({ type: "resource_archived", resource: { ...tombstone } });
+        budget -= 1;
+      }
+    }
     this.trimArchivedHistory(events);
+    this.trimRetainedArtifacts(events);
   }
 
   private trimArchivedHistory(events: CoordinatorEvent[]): void {
@@ -2264,6 +2473,7 @@ export class Coordinator {
     this.trimArchiveMap(this.archivedAgents, limit, (entry) => entry.terminalAt, (entry) => referencedAgents.has(entry.id), (id) => events.push({ type: "agent_archive_pruned", agentId: id }));
     this.trimArchiveMap(this.archivedTasks, limit, (entry) => entry.updatedAt, (entry) => referencedTasks.has(entry.id), (id) => events.push({ type: "task_archive_pruned", taskId: id }));
     this.trimArchiveMap(this.archivedRequests, limit, (entry) => entry.resolvedAt, (entry) => referencedRequests.has(entry.id), (id) => events.push({ type: "request_archive_pruned", requestId: id }));
+    this.trimArchiveMap(this.archivedResources, limit, (entry) => entry.retiredAt, () => false, (id) => events.push({ type: "resource_archive_pruned", resourceId: id }));
   }
 
   private trimArchiveMap<T extends { id: string }>(
@@ -2287,6 +2497,10 @@ export class Coordinator {
     const events: CoordinatorEvent[] = [];
     const recovered: AgentId[] = [];
     const now = this.clock();
+    // A provider call may outlive the broker process. Reserve every route slot
+    // represented by a running actor before recovery changes that actor to a
+    // reconnectable liveness state.
+    for (const agent of this.agents.values()) this.reserveRecoveryTurn(agent, now, events);
     const visited = new Set<AgentId>();
     for (const agent of [...this.agents.values()]) {
       if (!ACTIVE_STATUSES.has(agent.status) || agent.reconnectable === true) continue;
@@ -2370,7 +2584,10 @@ export class Coordinator {
       archivedAgents: [...this.archivedAgents.values()].map((agent) => ({ ...agent })),
       archivedTasks: [...this.archivedTasks.values()].map((task) => ({ ...task, dependencies: [...(task.dependencies ?? [])] })),
       archivedRequests: [...this.archivedRequests.values()].map((request) => ({ ...request })),
+      archivedResources: [...this.archivedResources.values()].map((resource) => ({ ...resource })),
       retainedArtifacts: [...this.retainedArtifacts.values()].map((artifact) => ({ ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined })),
+      acknowledgedMessages: [...this.acknowledgedMessages.values()].map(cloneAckTombstone),
+      recoveryTurnReservations: [...this.recoveryTurnReservations.values()].map(cloneModelTurnRecoveryReservation),
     };
   }
 
@@ -2386,7 +2603,10 @@ export class Coordinator {
     this.archivedAgents.clear();
     this.archivedTasks.clear();
     this.archivedRequests.clear();
+    this.archivedResources.clear();
     this.retainedArtifacts.clear();
+    this.acknowledgedMessages.clear();
+    this.recoveryTurnReservations.clear();
     this.nextMessageSequence.clear();
     this.nextBrokerSequence = state.nextBrokerSequence ?? 0;
     this.nextResourceWaiterSequence = state.nextResourceWaiterSequence ?? 0;
@@ -2417,7 +2637,10 @@ export class Coordinator {
     for (const archived of state.archivedAgents ?? []) this.archivedAgents.set(archived.id, { ...archived });
     for (const archived of state.archivedTasks ?? []) this.archivedTasks.set(archived.id, { ...archived, dependencies: [...(archived.dependencies ?? [])] });
     for (const archived of state.archivedRequests ?? []) this.archivedRequests.set(archived.id, { ...archived });
+    for (const archived of state.archivedResources ?? []) this.archivedResources.set(archived.id, { ...archived });
     for (const artifact of state.retainedArtifacts ?? []) this.retainedArtifacts.set(artifact.id, { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined });
+    for (const acknowledged of state.acknowledgedMessages ?? []) this.acknowledgedMessages.set(this.ackTombstoneKey(acknowledged.to, acknowledged.id, acknowledged.revision), { ...acknowledged, acknowledged: true });
+    for (const reservation of state.recoveryTurnReservations ?? []) this.recoveryTurnReservations.set(reservation.agentId, cloneModelTurnRecoveryReservation(reservation));
     this.idempotency.clear();
     for (const entry of state.idempotency ?? []) this.rememberIdempotencyEntry({ ...entry });
   }
@@ -2458,9 +2681,12 @@ export class Coordinator {
           if (message.clientDedupeKey) this.dedupe.set(`${message.from}\u0000${message.clientDedupeKey}`, message.id);
           break;
         }
-        case "message_acknowledged":
-          this.messages.set(event.message.id, cloneMessage(event.message));
+        case "message_acknowledged": {
+          const message = cloneMessage(event.message);
+          this.messages.set(message.id, message);
+          this.rememberAckTombstone(message);
           break;
+        }
         case "messages_pruned":
           for (const id of event.ids) {
             const message = this.messages.get(id);
@@ -2497,8 +2723,33 @@ export class Coordinator {
         case "model_turn_cancelled":
           this.modelWaiters.delete(event.waiterId);
           break;
+        case "model_turn_recovery_reserved":
+          this.recoveryTurnReservations.set(event.reservation.agentId, cloneModelTurnRecoveryReservation(event.reservation));
+          break;
+        case "model_turn_recovery_resolved":
+          this.recoveryTurnReservations.delete(event.agentId);
+          break;
         case "agent_artifacts_retained":
           this.retainedArtifacts.set(event.artifact.id, { ...event.artifact, workspace: event.artifact.workspace ? { ...event.artifact.workspace } : undefined });
+          break;
+        case "agent_artifacts_resolved": {
+          const artifact = this.retainedArtifacts.get(event.artifactId);
+          if (artifact) {
+            artifact.status = "resolved";
+            artifact.resolvedAt = event.resolvedAt;
+            artifact.resolution = event.resolution;
+          }
+          break;
+        }
+        case "agent_artifact_pruned":
+          this.retainedArtifacts.delete(event.artifactId);
+          break;
+        case "resource_archived":
+          this.resources.delete(event.resource.id);
+          this.archivedResources.set(event.resource.id, { ...event.resource });
+          break;
+        case "resource_archive_pruned":
+          this.archivedResources.delete(event.resourceId);
           break;
         case "agent_archived":
           this.agents.delete(event.agent.id);
@@ -2562,8 +2813,10 @@ export class Coordinator {
 
   private requireResource(resourceId: ResourceId): ResourceRecord {
     const resource = this.resources.get(resourceId);
-    assertCondition(resource, "RESOURCE_NOT_FOUND", `Resource ${resourceId} was not found`);
-    return resource;
+    if (resource) return resource;
+    const archived = this.archivedResources.get(resourceId);
+    if (archived) return resourceFromTombstone(archived);
+    throw new FabricError("RESOURCE_NOT_FOUND", `Resource ${resourceId} was not found`);
   }
 
   private isResourceActive(resource: ResourceRecord): boolean {
@@ -2800,6 +3053,7 @@ export class Coordinator {
   }
 
   private releaseAgentRuntime(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
+    this.removeRecoveryTurnReservation(agentId, events);
     this.releaseAgentResourceClaims(agentId, events);
     this.releaseAgentTaskOwnership(agentId, reason, events);
   }
@@ -2874,6 +3128,7 @@ export class Coordinator {
 
   private reclaimExpired(now: number, events: CoordinatorEvent[]): void {
     const expiredModelTurnGrants = this.expireModelTurnGrants(now, events);
+    const expiredRecoveryTurnReservations = this.expireRecoveryTurnReservations(now, events);
     for (const resource of this.resources.values()) {
       let changed = false;
       const before = resource.sharedHolds.length;
@@ -2909,7 +3164,7 @@ export class Coordinator {
       }
     }
     if (fencesPruned || events.some((event) => event.type === "resource_changed")) this.drainWaiters(events);
-    if (expiredModelTurnGrants) this.drainModelTurnWaiters(events);
+    if (expiredModelTurnGrants || expiredRecoveryTurnReservations) this.drainModelTurnWaiters(events);
   }
 
   private findHold(agentId: AgentId, resourceId: ResourceId, mode: BorrowMode): ResourceHold | undefined {
@@ -3062,6 +3317,11 @@ export class Coordinator {
   }
 
   private canInspectResource(agentId: AgentId, resource: ResourceRecord): boolean {
+    // Compacted retired resources intentionally keep only identity metadata;
+    // the root and the final owner retain inspectability without resurrecting
+    // the old grant/hold maps.
+    const agent = this.agents.get(agentId);
+    if (resource.status === "retired") return agent?.depth === 0 || resource.owner === agentId;
     if (this.hasPermission(resource, agentId, "read")) return true;
     return [...resource.sharedHolds, ...(resource.mutableHold ? [resource.mutableHold] : [])].some((hold) => hold.agentId === agentId);
   }
@@ -3223,7 +3483,7 @@ export class Coordinator {
   private assertRouteCapacity(route: ModelRoute, excludeAgentId?: string): void {
     const limit = this.routeCapacityLimit(route);
     if (limit !== undefined) {
-      assertCondition(this.runningRouteCount(route, excludeAgentId) + this.grantedModelTurnCount(modelRouteCapacityKey(this.config, route)) < limit, "AGENT_LIMIT_REACHED", `model route capacity reached for ${modelRouteKey(route)}`);
+      assertCondition(this.runningRouteCount(route, excludeAgentId) + this.grantedModelTurnCount(modelRouteCapacityKey(this.config, route)) + this.recoveryTurnReservationCount(modelRouteCapacityKey(this.config, route)) < limit, "AGENT_LIMIT_REACHED", `model route capacity reached for ${modelRouteKey(route)}`);
     }
   }
 
