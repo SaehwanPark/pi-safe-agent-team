@@ -697,6 +697,49 @@ test("managed child retains a broker message until its session user entry is dur
   assert.equal(ackCalls, 1);
 });
 
+test("managed child redelivers a newer coalesced revision that arrives during steering", async () => {
+  const steered: string[] = [];
+  let releaseSteer!: () => void;
+  let steerStarted!: () => void;
+  const steerDone = new Promise<void>((resolve) => { releaseSteer = resolve; });
+  const steerEntered = new Promise<void>((resolve) => { steerStarted = resolve; });
+  const child = new ManagedChild({ fabricId: "fabric" } as never, {
+    agentId: "child-revision",
+    token: "token-revision",
+    parentId: "root",
+    role: "worker",
+    route,
+    workspace: { mode: "shared", root: resolve("."), path: resolve(".") },
+    cwd: resolve("."),
+    stateDirectory: resolve("."),
+    agentDir: resolve("."),
+    endpoint: "unused",
+    model: {} as never,
+    capabilities: { maySpawn: false, mayMessagePeers: false, mayEscalate: true, mayTransferOwnership: false, mayWriteRepo: false, mayUseShell: false, peerIds: [], resourceGrants: {} },
+  });
+  (child as any).session = {
+    isStreaming: true,
+    async steer(text: string) {
+      steered.push(text);
+      steerStarted();
+      await steerDone;
+    },
+  };
+  const first: AgentMessage = { id: "message-revision", from: "root", to: "child-revision", type: "steer", body: "old state", revision: 1, senderSequence: 1, brokerSequence: 1, priority: "urgent", createdAt: 1 };
+  const second: AgentMessage = { ...first, body: "new state", revision: 2 };
+  const initial = (child as any).deliverMessage(first) as Promise<void>;
+  await steerEntered;
+  (child as any).deliverMessage(second);
+  releaseSteer();
+  await initial;
+  for (let attempt = 0; attempt < 20 && steered.length < 2; attempt += 1) await new Promise<void>((resolveWait) => setImmediate(resolveWait));
+  assert.equal(steered.length, 2);
+  assert.match(steered[0], /revision="1"/);
+  assert.match(steered[1], /revision="2"/);
+  assert.match(steered[1], /new state/);
+  await child.stop();
+});
+
 async function registerBrokerAgent(client: BrokerClient, parentId?: string, token?: string): Promise<{ token: string; agent?: AgentRecord }> {
   return client.request<{ token: string; agent?: AgentRecord }>("agent.register", {
     rootId: "fabric",

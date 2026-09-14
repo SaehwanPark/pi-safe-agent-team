@@ -4,16 +4,17 @@ Messaging is actor-style and durable. A Pi session can be busy, idle, waiting fo
 
 ## Delivery contract
 
-Each message has a broker ID, sender-local sequence, monotonic broker replay sequence, sender, recipient, typed kind, bounded body, priority, optional request/reply correlation, and optional client dedupe key.
+Each message has a broker ID, revision, sender-local sequence, monotonic broker replay sequence, sender, recipient, typed kind, bounded body, priority, optional request/reply correlation, and optional client dedupe key. A new message starts at revision 1; an in-place control-message coalesce retains its ID and increments the revision.
 
 - delivery is **at least once** until acknowledgement;
 - messages from one sender are returned FIFO;
 - no global order is promised across senders;
-- duplicate client sends with the same sender/key return the original message; broker-generated `control:*` keys instead replace the unacknowledged notification with the newest state;
+- duplicate client sends with the same sender/key return the original message; broker-generated `control:*` keys instead replace the unacknowledged notification with the newest state and increment its revision;
 - `message.send` accepts a durable `operationId`, and `agent_send` derives one from the Pi tool-call ID so an ambiguous response can be retried without creating a second message;
 - a notification is only a wake-up hint; `message.inbox` is the recovery source of truth;
-- the managed host tracks delivering, accepted, and acknowledged IDs, so a notification plus inbox/reconnect replay cannot execute one message twice in the same host process;
-- a managed child acknowledges only after its Pi `SessionManager` contains the corresponding exact `<safe-agents-message id="…"/>` receipt and the queued prompt has settled; lightweight embedding sessions without a transcript manager use prompt settlement as their only available boundary;
+- the managed host tracks delivering, accepted, and acknowledged ID/revision pairs, so a notification plus inbox/reconnect replay cannot execute one message twice in the same host process;
+- a managed child acknowledges only after its Pi `SessionManager` contains the corresponding exact `<safe-agents-message id="…" revision="…"/>` receipt and the queued prompt has settled; lightweight embedding sessions without a transcript manager use prompt settlement as their only available boundary;
+- an ACK identifies the exact broker ID and revision accepted by the Pi session. An older revision cannot acknowledge a newer coalesced payload; legacy messages at revision 1 may omit the revision field.
 - acknowledgement means the host/session durably accepted the message, not that the model obeyed it.
 
 Busy workers receive a notification while their current turn continues. The host queues a steer/follow-up or starts a later prompt and retains the broker copy until the session transcript boundary is crossed. If queueing or persistence fails, the broker message remains unacknowledged and reconnect recovery will retry it.
@@ -46,7 +47,7 @@ A root may use `/agents inbox` to inspect its pending messages. A worker can cal
 
 ## Cancellation and failures
 
-Cancellation is idempotent. It does not delete unacknowledged messages or journal history. Pending requests get a visible failed/cancelled state, runtime holds are released, and parent notifications are compact. A failed child does not block its parent indefinitely.
+Cancellation is idempotent. It does not delete unacknowledged messages or journal history. Pending requests get a visible failed/cancelled state, runtime holds are released, and parent notifications are compact. Messages addressed to a permanently terminal actor become explicitly abandoned for retention once they can no longer be delivered; this preserves the distinction between session acceptance and retention cleanup. A failed child does not block its parent indefinitely.
 
 ## Practical guidance
 

@@ -143,6 +143,50 @@ test("broker authenticates actors, journals mutations, and notifies durable mail
   }
 });
 
+test("broker skips stale-agent reclamation on the first maintenance tick after a long pause", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "safe-agents-maintenance-pause-"));
+  const now = { value: 1_000 };
+  const coordinator = new Coordinator({
+    rootId: "fabric",
+    rootAgentId: "root",
+    clock: () => now.value,
+    config: { heartbeatMs: 1_000, agentHeartbeatTimeoutMs: 100, reconnectGraceMs: 1_000 },
+  });
+  const server = new BrokerServer({ directory, coordinator, rootId: "fabric", rootAgentId: "root", maintenanceMs: 60_000, clock: () => now.value });
+  const root = new BrokerClient({ endpoint: server.endpoint, agentId: "root" });
+  let child: BrokerClient | undefined;
+  try {
+    await server.start();
+    await root.connect();
+    await root.request("agent.register", { rootId: "fabric", route, capabilities: { maySpawn: true, mayMessagePeers: true } });
+    const spawned = await root.request<{ agent: AgentRecord; token: string }>("agent.spawn", { route });
+    child = new BrokerClient({ endpoint: server.endpoint, agentId: spawned.agent.id, token: spawned.token });
+    await child.connect();
+    await child.request("agent.register", { rootId: "fabric", parentId: "root", route, token: spawned.token });
+
+    // The broker and child both stopped running while the host was suspended.
+    // The first delayed broker tick must give the child a chance to heartbeat.
+    now.value = 61_101;
+    (server as any).enqueueMaintenance();
+    await (server as any).operationTail;
+    const afterPause = await root.request<{ agents: AgentRecord[] }>("fabric.status");
+    assert.equal(afterPause.agents.find((agent) => agent.id === spawned.agent.id)?.status, "ready");
+
+    await child.request("agent.heartbeat", {});
+    await root.request("agent.heartbeat", {});
+    now.value = 61_150;
+    (server as any).enqueueMaintenance();
+    await (server as any).operationTail;
+    const afterHeartbeat = await root.request<{ agents: AgentRecord[] }>("fabric.status");
+    assert.equal(afterHeartbeat.agents.find((agent) => agent.id === spawned.agent.id)?.reconnectable, false);
+  } finally {
+    child?.close();
+    root.close();
+    await server.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("broker checkpoints the journal at the configured transaction boundary", async () => {
   const directory = await mkdtemp(join(tmpdir(), "safe-agents-broker-checkpoint-"));
   const server = new BrokerServer({

@@ -113,6 +113,8 @@ export interface AgentRecord {
   authToken?: string;
   /** True only for a liveness recovery window after a broker restart. */
   reconnectable?: boolean;
+  /** Set when broker recovery grace expires and the actor becomes permanently retired. */
+  recoveryExpiredAt?: number;
   /** Context management mode (e.g. lcm-embedded or native). */
   contextMode?: string;
   /** Bounded last context/provider diagnostic, for recovery visibility. */
@@ -147,9 +149,10 @@ export interface TaskRecord {
  * fence is active the coordinator grants no conflicting lease to another
  * actor, which shrinks the formal check→write window: a hold that lapses
  * mid-write cannot be handed to a competing writer until the fence ends or
- * expires. Fences are deliberately ephemeral in-memory records: write fencing
- * protects coordinated writes during normal broker operation, including lease
- * expiry, but is not crash-durable across an independent broker restart.
+ * expires. Fences are deliberately ephemeral in-memory records. The matched
+ * resource carries a separate journaled restart quarantine through the same
+ * expiry, so recovery retains write exclusion even though the live fence
+ * object is not restored across an independent broker restart.
  */
 export interface WriteFenceRecord {
   id: string;
@@ -191,6 +194,12 @@ export interface ResourceRecord {
   sharedHolds: ResourceHold[];
   mutableHold?: ResourceHold;
   waiters: ResourceWaiter[];
+  /** Durable restart quarantine for an in-flight guarded write. */
+  writeQuarantineUntil?: number;
+  /** Actor that started the quarantined write, when known. */
+  writeQuarantineActorId?: AgentId;
+  /** Fence identity used to clear the quarantine on a normal end_write. */
+  writeQuarantineFenceId?: string;
   createdAt: number;
   updatedAt: number;
 }
@@ -201,6 +210,8 @@ export interface AgentMessage {
   to: AgentId;
   type: MessageType;
   body: string;
+  /** Monotonic durable payload revision; coalesced messages retain their ID. */
+  revision?: number;
   /** Monotonic sequence assigned by the sender; inboxes sort by this value. */
   senderSequence: number;
   /** Monotonic broker sequence used for durable cross-sender replay ordering. */
@@ -213,6 +224,8 @@ export interface AgentMessage {
   clientDedupeKey?: string;
   deliveredAt?: number;
   acknowledgedAt?: number;
+  /** Message was retained as undeliverable after its recipient became terminal. */
+  abandonedAt?: number;
 }
 
 export type RequestStatus = "pending" | "resolved" | "failed" | "cancelled";
@@ -304,6 +317,10 @@ export interface AgentSummary {
   taskId?: TaskId;
   route: ModelRoute;
   status: AgentStatus;
+  /** A failed actor may still reconnect during its bounded recovery window. */
+  reconnectable?: boolean;
+  /** Broker timestamp at which a recovery-retired actor became terminal. */
+  recoveryExpiredAt?: number;
   workspace?: WorkspaceInfo;
   lastActivity: number;
   contextMode?: string;
@@ -329,6 +346,7 @@ export interface FabricStatus {
   config: FabricConfig;
   activeFences?: number;
   fences?: ActiveFenceSummary[];
+  activeWriteQuarantines?: number;
 }
 
 export type CoordinatorEvent =
@@ -409,6 +427,7 @@ export function cloneResource(resource: ResourceRecord): ResourceRecord {
 export function cloneMessage(message: AgentMessage): AgentMessage {
   return {
     ...message,
+    revision: Number.isInteger(message.revision) && (message.revision as number) > 0 ? message.revision : 1,
     metadata: message.metadata ? JSON.parse(JSON.stringify(message.metadata)) as Record<string, unknown> : undefined,
   };
 }

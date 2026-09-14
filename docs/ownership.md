@@ -54,9 +54,10 @@ On expiry, broker restart, agent cancellation, or terminal failure:
 - active runtime holds are released;
 - mutable release increments the resource version;
 - waiting requests are reconsidered;
+- a guarded resource retains a short restart quarantine through the write-fence expiry, so a surviving broker cannot immediately grant a conflicting writer after recovery;
 - dirty workspace artifacts remain for inspection.
 
-Lease reclamation is deterministic and idempotent. It is not a merge or content-conflict detector.
+Lease reclamation and restart-quarantine expiry are deterministic and idempotent. They are not a merge or content-conflict detector.
 
 ## Write guard
 
@@ -64,4 +65,4 @@ The fabric root participates in borrowing too. The extension intercepts the root
 
 The child-safe `read`/`grep`/`find`/`ls` tools are scoped to the managed workspace. The child-safe `edit`/`write` path is exposed only when the capability allows repository writes. The managed host passes each target path to `resource.begin_write` at the final filesystem write operation — authorization plus a write fence that is lifted after the mutation via `resource.end_write` —; the path must match a declared file resource exactly or a declared module/directory resource, and the actor must hold mutable access across the hierarchy. Ownership alone is denied. Shell access is separately gated by `mayUseShell`: shared-workspace shell is a conservative read-only allowlist whose executable arguments must stay workspace-relative (no absolute, parent, or indirect file-list paths like `file -f` or `--files0-from`), while worktree shell is an explicitly trusted isolated-workspace escape hatch and is not resource-enforced.
 
-> **Durability Boundary Note**: Write fencing protects coordinated writes during normal broker operation (including lease lapses and root writes), but fences are in-memory coordinator records and are not crash-durable across an independent broker restart. A post-v0.1 recovery quarantine will temporarily fence resources that had active mutable leases at the time of broker failure to bridge crash survivability.
+> **Durability Boundary Note**: The active write-fence object is in memory, but the matched resource records a journaled restart quarantine through the fence expiry. After an independent broker restart, that quarantine keeps a conflicting writer out until the old window expires or the authenticated original actor reconnects and closes its fence; it does not make the filesystem mutation itself atomic with coordinator state.

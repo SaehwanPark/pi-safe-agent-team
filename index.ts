@@ -10,6 +10,10 @@ import { classifyRootDelivery } from "./src/pi/delivery.ts";
 import { registerInteropProvider, unregisterInteropProvider, type FabricSnapshotRequest, type FabricStateProviderV1, type FabricStateSnapshotV1 } from "./src/pi/interop.ts";
 import { classifyAssistantMessage, classifyCompactionFailure, findFinalAssistantMessage, type ModelTurnOutcome } from "./src/pi/turn-outcome.ts";
 
+function messageRevision(message: Pick<AgentMessage, "revision">): number {
+  return Number.isInteger(message.revision) && (message.revision as number) > 0 ? message.revision as number : 1;
+}
+
 export { Coordinator } from "./src/core/coordinator.ts";
 export { FabricError } from "./src/core/errors.ts";
 export { resolveRoute, routeId } from "./src/core/routing.ts";
@@ -68,14 +72,15 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     return box;
   });
 
-  const rootDeliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
+  const rootDeliveryStates = new Map<string, { state: "delivering" | "accepted" | "acknowledged"; message: AgentMessage }>();
   let rootDeliveryTail: Promise<void> = Promise.resolve();
   let rootDeliveryEpoch = 0;
   const deferredRootMessages = new Map<string, AgentMessage>();
   const deferredRootPersisted = new Set<string>();
   const deferredRootRunMessages = new Set<string>();
   /** IDs accepted by Pi but not yet proven present in session history. */
-  const persistedRootMessageIds = new Set<string>();
+  const persistedRootMessageIds = new Map<string, number>();
+  let rootDeliveryApi: ExtensionAPI | undefined;
   const rootAckInFlight = new Map<string, Promise<void>>();
   let deferredRootWakePending = false;
   let rootContext: ExtensionContext | undefined;
@@ -106,7 +111,7 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   const updatePendingDeliveries = (): void => {
     // Accepted/deferred messages remain broker-unacknowledged until Pi has
     // crossed the session boundary, so they must keep root quiescence closed.
-    const count = [...rootDeliveryStates.values()].filter((s) => s !== "acknowledged").length;
+    const count = [...rootDeliveryStates.values()].filter((s) => s.state !== "acknowledged").length;
     runtime.setPendingRootDeliveriesCount(count);
   };
 
@@ -124,21 +129,29 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   };
 
   const rootDelivery = (api: ExtensionAPI, deliveryEpoch = rootDeliveryEpoch) => (message: AgentMessage): void => {
+    rootDeliveryApi = api;
     const epoch = deliveryEpoch;
-    const state = rootDeliveryStates.get(message.id);
-    if (state === "acknowledged" || state === "delivering") return;
-    if (state === "accepted") {
-      if (epoch !== rootDeliveryEpoch) return;
-      void acknowledgePersistedRootMessage(message.id);
+    const current = rootDeliveryStates.get(message.id);
+    if (current && messageRevision(message) <= messageRevision(current.message)) {
+      if (current.state === "accepted" && epoch === rootDeliveryEpoch) void acknowledgePersistedRootMessage(message.id, current.message);
       return;
     }
-    if (hasPersistedRootMessage(message.id)) {
-      rootDeliveryStates.set(message.id, "accepted");
-      persistedRootMessageIds.add(message.id);
-      void acknowledgePersistedRootMessage(message.id);
+    if (current && messageRevision(message) > messageRevision(current.message)) {
+      current.message = message;
+      deferredRootMessages.delete(message.id);
+      deferredRootPersisted.delete(message.id);
+      deferredRootRunMessages.delete(message.id);
+      if (current.state === "delivering") return;
+      if (current.state === "acknowledged") rootDeliveryStates.delete(message.id);
+      else current.state = "delivering";
+    }
+    if (hasPersistedRootMessage(message)) {
+      rootDeliveryStates.set(message.id, { state: "accepted", message });
+      persistedRootMessageIds.set(message.id, messageRevision(message));
+      void acknowledgePersistedRootMessage(message.id, message);
       return;
     }
-    rootDeliveryStates.set(message.id, "delivering");
+    rootDeliveryStates.set(message.id, { state: "delivering", message });
     updatePendingDeliveries();
 
     // Preserve broker order at the host boundary too. In particular, two
@@ -147,33 +160,42 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     rootDeliveryTail = rootDeliveryTail.then(async () => {
       try {
         if (epoch !== rootDeliveryEpoch) return;
-        const content = `[${message.type} from ${message.from}]\n${message.body}`;
-        const decision = classifyRootDelivery(message, {
-          rootCompactionInFlight: runtime.isRootCompactionInFlight,
-          rootContextHealth: runtime.rootHealth,
-        });
-        await api.sendMessage({
-          customType: "safe-agents.message",
-          content,
-          display: decision.display,
-          // Keep a structured exact receipt alongside the legacy AgentMessage
-          // details object. Durable ACKs must never rely on text substring
-          // matching or an unrelated quoted message ID.
-          details: { ...message, fabricMessageId: message.id },
-        }, {
-          triggerTurn: decision.triggerTurn,
-          deliverAs: decision.deliverAs,
-        });
-        if (epoch !== rootDeliveryEpoch) return;
-        rememberRootMessage(message.id, "accepted");
-        if (decision.deliverAs === "nextTurn") {
-          // Pi only persists nextTurn messages when a real prompt starts. Keep
-          // the broker copy unacknowledged until the resulting agent_end has
-          // crossed that session-history boundary.
-          deferredRootMessages.set(message.id, message);
+        let currentMessage = rootDeliveryStates.get(message.id)?.message ?? message;
+        while (true) {
+          const content = `[${currentMessage.type} from ${currentMessage.from}]\n${currentMessage.body}`;
+          const decision = classifyRootDelivery(currentMessage, {
+            rootCompactionInFlight: runtime.isRootCompactionInFlight,
+            rootContextHealth: runtime.rootHealth,
+          });
+          await api.sendMessage({
+            customType: "safe-agents.message",
+            content,
+            display: decision.display,
+            // Keep a structured exact receipt alongside the legacy AgentMessage
+            // details object. Durable ACKs must never rely on text substring
+            // matching or an unrelated quoted message ID.
+            details: { ...currentMessage, fabricMessageId: currentMessage.id, fabricMessageRevision: messageRevision(currentMessage) },
+          }, {
+            triggerTurn: decision.triggerTurn,
+            deliverAs: decision.deliverAs,
+          });
+          if (epoch !== rootDeliveryEpoch) return;
+          const latest = rootDeliveryStates.get(currentMessage.id)?.message;
+          if (latest && messageRevision(latest) > messageRevision(currentMessage)) {
+            currentMessage = latest;
+            continue;
+          }
+          rememberRootMessage(currentMessage, "accepted");
+          if (decision.deliverAs === "nextTurn") {
+            // Pi only persists nextTurn messages when a real prompt starts. Keep
+            // the broker copy unacknowledged until the resulting agent_end has
+            // crossed that session-history boundary.
+            deferredRootMessages.set(currentMessage.id, currentMessage);
+            return;
+          }
+          await acknowledgePersistedRootMessage(currentMessage.id, currentMessage);
           return;
         }
-        await acknowledgePersistedRootMessage(message.id);
       } catch {
         rootDeliveryStates.delete(message.id);
       } finally {
@@ -183,22 +205,23 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
     }).catch(() => undefined);
   };
 
-  function rememberRootMessage(messageId: string, state: "accepted" | "acknowledged"): void {
-    rootDeliveryStates.set(messageId, state);
+  function rememberRootMessage(message: AgentMessage, state: "accepted" | "acknowledged"): void {
+    rootDeliveryStates.set(message.id, { state, message });
     updatePendingDeliveries();
     while (rootDeliveryStates.size > 2048) {
-      const removable = [...rootDeliveryStates.entries()].find(([, current]) => current === "acknowledged")?.[0];
+      const removable = [...rootDeliveryStates.entries()].find(([, current]) => current.state === "acknowledged")?.[0];
       if (!removable) break;
       rootDeliveryStates.delete(removable);
     }
   }
 
-  function hasPersistedRootMessage(messageId: string): boolean {
+  function hasPersistedRootMessage(message: Pick<AgentMessage, "id" | "revision">): boolean {
     try {
       const manager = rootContext?.sessionManager as unknown as { getEntries?: () => readonly unknown[] } | undefined;
       const entries = typeof manager?.getEntries === "function" ? manager.getEntries() : [];
       return entries.some((entry: any) => entry?.type === "custom_message" && entry?.customType === "safe-agents.message" && (
-        entry?.details?.fabricMessageId === messageId || entry?.details?.id === messageId
+        (entry?.details?.fabricMessageId === message.id || entry?.details?.id === message.id) &&
+        (entry?.details?.fabricMessageRevision ?? entry?.details?.revision ?? 1) === messageRevision(message)
       ));
     } catch {
       return false;
@@ -210,36 +233,52 @@ export default function safeAgentsTeam(pi: ExtensionAPI): void {
   }
 
   async function acknowledgePersistedRootMessages(): Promise<void> {
-    for (const [messageId, state] of rootDeliveryStates) {
-      if (state !== "accepted") continue;
-      await acknowledgePersistedRootMessage(messageId);
+    for (const [messageId, delivery] of rootDeliveryStates) {
+      if (delivery.state !== "accepted") continue;
+      await acknowledgePersistedRootMessage(messageId, delivery.message);
     }
   }
 
-  async function acknowledgePersistedRootMessage(messageId: string): Promise<void> {
-    const message = deferredRootMessages.get(messageId);
-    if (message && !deferredRootRunMessages.has(messageId) && !deferredRootPersisted.has(messageId)) return;
-    if (!persistedRootMessageIds.has(messageId)) {
-      if (!hasPersistedRootMessage(messageId)) return;
-      persistedRootMessageIds.add(messageId);
-      if (message) deferredRootPersisted.add(messageId);
+  async function acknowledgePersistedRootMessage(messageId: string, suppliedMessage?: AgentMessage): Promise<void> {
+    const deferredMessage = deferredRootMessages.get(messageId);
+    const message = suppliedMessage ?? deferredMessage ?? rootDeliveryStates.get(messageId)?.message;
+    if (!message) return;
+    const revision = messageRevision(message);
+    if (deferredMessage && !deferredRootRunMessages.has(messageId) && !deferredRootPersisted.has(messageId)) return;
+    if (persistedRootMessageIds.get(messageId) !== revision) {
+      if (!hasPersistedRootMessage(message)) return;
+      persistedRootMessageIds.set(messageId, revision);
+      if (deferredMessage) deferredRootPersisted.add(messageId);
     }
-    const inFlight = rootAckInFlight.get(messageId);
+    const ackKey = `${messageId}\u0000${revision}`;
+    const inFlight = rootAckInFlight.get(ackKey);
     if (inFlight) return inFlight;
-    const operation = runtime.request("message.ack", { messageId }, FabricRuntime.shutdownRpcTimeoutMs)
+    const operation = runtime.request("message.ack", { messageId, revision }, FabricRuntime.shutdownRpcTimeoutMs)
       .then(() => {
-        if (message) {
+        const current = rootDeliveryStates.get(messageId);
+        if (current && messageRevision(current.message) > revision) {
+          current.state = "delivering";
+          if (rootDeliveryApi) rootDelivery(rootDeliveryApi, rootDeliveryEpoch)(current.message);
+          return;
+        }
+        if (deferredMessage) {
           deferredRootMessages.delete(messageId);
           deferredRootPersisted.delete(messageId);
           deferredRootRunMessages.delete(messageId);
         }
-        rememberRootMessage(messageId, "acknowledged");
+        persistedRootMessageIds.delete(messageId);
+        rememberRootMessage(message, "acknowledged");
       })
-      .catch(() => undefined)
+      .catch((error) => {
+        const current = rootDeliveryStates.get(messageId)?.message;
+        if (error instanceof FabricError && error.code === "MESSAGE_REVISION_CONFLICT" && current && messageRevision(current) > revision && rootDeliveryApi) {
+          rootDelivery(rootDeliveryApi, rootDeliveryEpoch)(current);
+        }
+      })
       .finally(() => {
-        if (rootAckInFlight.get(messageId) === operation) rootAckInFlight.delete(messageId);
+        if (rootAckInFlight.get(ackKey) === operation) rootAckInFlight.delete(ackKey);
       });
-    rootAckInFlight.set(messageId, operation);
+    rootAckInFlight.set(ackKey, operation);
     return operation;
   }
 

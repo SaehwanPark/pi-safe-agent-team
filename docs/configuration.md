@@ -81,7 +81,7 @@ Current defaults:
 | `agentHeartbeatTimeoutMs` | 3 minutes | Time without an actor heartbeat before the broker marks it failed/reconnectable and releases runtime claims. |
 | `reconnectGraceMs` | 10 minutes | How long a stale reconnectable actor keeps its `maxTotalAgents` slot before retirement; unfinished tasks return to `ready`. |
 | `messageRetention` | 2048 recent records |
-| `fenceMs` (per `resource.begin_write`) | 30s, clamped 1s-120s | Lifetime of a guarded-write fence. Not a config field: passed per call by the guarded host. Fences are ephemeral and are never journaled. |
+| `fenceMs` (per `resource.begin_write`) | 30s, clamped 1s-120s | Lifetime of a guarded-write fence. Not a config field: passed per call by the guarded host. The active fence map is ephemeral, while the matched resource carries a journaled restart quarantine through this expiry. |
 | `caseInsensitivePaths` | auto | Fold policy keys so differently-cased spellings share one resource. Undefined = probe the broker volume at startup (always true on Windows). Set `false` to keep keys case-sensitive. |
 
 Model-runtime coordination is configured independently from the global agent count:
@@ -132,11 +132,11 @@ The authority fields are coordinator state. Role prompt text is guidance only.
 
 ## Workspace policy
 
-Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Clean worktrees are reclaimed after a completed child shutdown; dirty or uncertain artifacts are retained for inspection and require user confirmation/force through a future cleanup command.
+Use `shared` for read-only investigations or when all work is intentionally serialized by resources. Use `worktree` for independent coding children. In either mode, managed `edit`/`write` requires a declared workspace-relative file/module resource and a current mutable borrow; ownership alone is not sufficient. Worktree creation fails if the base checkout is dirty or has no usable `HEAD`. Clean worktrees are reclaimed after a completed child shutdown or a later startup GC pass once the actor's recovery grace has expired and no live/reconnectable actor references the path; dirty or uncertain artifacts are retained for inspection and require user confirmation/force through a future cleanup command.
 
 ## Broker startup
 
-Normally the first root extension instance starts the local broker; later instances join the locked fabric. The runtime uses a stable per-session root identity and stores its reconnect credential in `root.token` with mode `0600`. A broker restart permits one matching-token reattach for live actors; completed, failed, and cancelled semantic terminal actors remain terminal. A stale lock can be removed only when its recorded PID is no longer alive. The endpoint is local-user scoped. The broker is one writer for `events.jsonl`.
+Normally the first root extension instance starts the local broker; later instances join the locked fabric. The runtime uses a stable per-session root identity and stores its reconnect credential in `root.token` with mode `0600`. A broker restart permits one matching-token reattach for live actors and recovery-fences their live descendants; completed, failed, and cancelled semantic terminal actors remain terminal. If the broker maintenance timer was suspended past a liveness interval, its first resumed pass skips stale-agent reclamation so heartbeats can re-establish liveness. A stale lock can be removed only when its recorded PID is no longer alive. The endpoint is local-user scoped. The broker is one writer for `events.jsonl`.
 
 ## Diagnostics
 

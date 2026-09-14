@@ -261,7 +261,7 @@ export class Coordinator {
       case "message.reply":
         return this.withEvents(events, this.replyToRequest(parseString(actorId, "agentId"), args, events));
       case "message.ack":
-        return this.withEvents(events, this.ackMessage(this.requireActor(actorId).id, parseString(args.messageId, "messageId"), events));
+        return this.withEvents(events, this.ackMessage(this.requireActor(actorId).id, parseString(args.messageId, "messageId"), args.revision, events));
       case "message.inbox":
         return this.withEvents(events, this.inbox(this.requireActor(actorId).id, args.limit, args.afterBrokerSequence), events);
       case "message.list":
@@ -298,7 +298,7 @@ export class Coordinator {
       case "resource.check_write":
         return this.withEvents(events, this.checkWrite(this.requireActor(actorId).id, args), events);
       case "resource.begin_write":
-        return this.withEvents(events, this.beginWrite(this.requireActor(actorId).id, args), events);
+        return this.withEvents(events, this.beginWrite(this.requireActor(actorId).id, args, events), events);
       case "resource.end_write":
         return this.withEvents(events, this.endWrite(this.requireActor(actorId).id, args, events));
       case "fabric.status":
@@ -390,13 +390,27 @@ export class Coordinator {
       if (rootId !== this.rootId) {
         throw new FabricError("IDENTITY_CONFLICT", `Agent ${id} belongs to another fabric`);
       }
-      assertCondition(!isTerminal(existing.status) || existing.reconnectable === true, "LIFECYCLE_CONFLICT", `Agent ${id} is terminal and cannot reconnect`);
+      const reconnecting = existing.reconnectable === true;
+      assertCondition(!isTerminal(existing.status) || reconnecting, "LIFECYCLE_CONFLICT", `Agent ${id} is terminal and cannot reconnect`);
+      if (reconnecting) {
+        assertCondition(existing.status === "failed", "LIFECYCLE_CONFLICT", `Agent ${id} has an invalid recovery state`);
+        const reconnectParent = existing.parentId ? this.requireAgent(existing.parentId) : undefined;
+        if (reconnectParent) {
+          assertCondition(this.isReservedLive(reconnectParent) && reconnectParent.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${id} cannot reconnect beneath inactive parent ${reconnectParent.id}`);
+          this.assertChildCapacity(reconnectParent, id, false);
+          assertCondition(existing.depth === reconnectParent.depth + 1, "IDENTITY_CONFLICT", "Recovered child depth no longer matches its parent");
+        } else {
+          assertCondition(existing.depth === 0, "IDENTITY_CONFLICT", "A recovered non-root agent must retain its parent");
+        }
+        assertCondition(existing.depth >= 0 && existing.depth <= this.config.maxDepth, "AGENT_LIMIT_REACHED", `Agent depth ${existing.depth} exceeds maxDepth ${this.config.maxDepth}`);
+      }
       const next = cloneAgent(existing);
       if (!next.authToken) next.authToken = token ?? this.idFactory("token");
       if (next.reconnectable) {
         assertCondition(next.status === "failed", "LIFECYCLE_CONFLICT", `Agent ${id} has an invalid recovery state`);
         next.status = "ready";
         next.reconnectable = false;
+        next.recoveryExpiredAt = undefined;
       } else if (next.status === "starting") {
         next.status = "ready";
       }
@@ -440,6 +454,7 @@ export class Coordinator {
     assertCondition(this.reservedAgentCount() < this.config.maxTotalAgents, "AGENT_LIMIT_REACHED", "The fabric has reached maxTotalAgents (slots awaiting reconnecting agents stay reserved)");
     if (parent) {
       assertCondition(parent.rootId === this.rootId, "IDENTITY_CONFLICT", "Parent belongs to another fabric");
+      assertCondition(ACTIVE_STATUSES.has(parent.status) && parent.status !== "draining", "LIFECYCLE_CONFLICT", `Parent ${parent.id} is not active for a new child`);
       this.assertChildCapacity(parent);
       assertCondition(depth === parent.depth + 1, "IDENTITY_CONFLICT", "Child depth must be parent depth plus one");
     }
@@ -624,6 +639,7 @@ export class Coordinator {
     let task = agent.taskId ? cloneTask(this.requireTask(agent.taskId)) : undefined;
     if (isTerminal(effectiveStatus)) {
       this.cancelRequestsFor(actorId, effectiveStatus === "cancelled" ? "cancelled" : "failed", `Agent ${actorId} became ${effectiveStatus}`, events);
+      this.markMessagesUndeliverable(actorId, events);
       // Every terminal state releases runtime claims. Successful task facts
       // remain durable, but a completed worker must not keep a lease alive.
       this.releaseAgentRuntime(actorId, effectiveStatus === "cancelled" ? "cancelled" : "released", events);
@@ -761,7 +777,7 @@ export class Coordinator {
   }
 
   private assertNoLiveDescendants(agentId: AgentId): void {
-    const live = [...this.agents.values()].filter((candidate) => !isTerminal(candidate.status) && this.isAncestorAgent(agentId, candidate.id));
+    const live = [...this.agents.values()].filter((candidate) => this.isReservedLive(candidate) && this.isAncestorAgent(agentId, candidate.id));
     assertCondition(live.length === 0, "LIFECYCLE_CONFLICT", `Agent ${agentId} cannot complete with ${live.length} live descendant${live.length === 1 ? "" : "s"}; drain or cancel them first`);
   }
 
@@ -784,6 +800,7 @@ export class Coordinator {
     this.agents.set(next.id, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
     this.cancelRequestsFor(next.id, "cancelled", "Agent was cancelled", events);
+    this.markMessagesUndeliverable(next.id, events);
     this.releaseAgentRuntime(next.id, "cancelled", events);
     cancelled.push(next.id);
   }
@@ -859,10 +876,25 @@ export class Coordinator {
     return { message: result.message, request: cloneRequest(resolved) };
   }
 
-  private ackMessage(actorId: AgentId, messageId: string, events: CoordinatorEvent[]): AgentMessage {
+  private ackMessage(actorId: AgentId, messageId: string, rawRevision: unknown, events: CoordinatorEvent[]): AgentMessage {
     const message = this.messages.get(messageId);
     assertCondition(message, "MESSAGE_NOT_FOUND", `Message ${messageId} was not found`);
     assertCondition(message.to === actorId, "MESSAGE_NOT_VISIBLE", `Agent ${actorId} cannot acknowledge ${messageId}`);
+    const currentRevision = message.revision ?? 1;
+    if (rawRevision === undefined) {
+      assertCondition(currentRevision === 1, "MESSAGE_REVISION_CONFLICT", `Message ${messageId} requires revision ${currentRevision} for acknowledgement`, {
+        messageId,
+        expectedRevision: currentRevision,
+      });
+    } else {
+      const revision = parseNumber(rawRevision, "revision", 1);
+      assertCondition(Number.isInteger(revision) && revision > 0, "INVALID_ARGUMENT", "revision must be a positive integer");
+      assertCondition(revision === currentRevision, "MESSAGE_REVISION_CONFLICT", `Message ${messageId} is at revision ${currentRevision}; revision ${revision} is stale`, {
+        messageId,
+        expectedRevision: currentRevision,
+        receivedRevision: revision,
+      });
+    }
     if (message.acknowledgedAt !== undefined) return cloneMessage(message);
     message.acknowledgedAt = this.clock();
     if (message.deliveredAt === undefined) message.deliveredAt = message.acknowledgedAt;
@@ -875,7 +907,7 @@ export class Coordinator {
     const max = Math.max(1, Math.min(100, Math.floor(parseNumber(limit, "limit", 50))));
     const after = afterBrokerSequence === undefined ? undefined : parseNumber(afterBrokerSequence, "afterBrokerSequence", 0);
     const pending = [...this.messages.values()]
-      .filter((message) => message.to === actorId && message.acknowledgedAt === undefined)
+      .filter((message) => message.to === actorId && message.acknowledgedAt === undefined && message.abandonedAt === undefined)
       .filter((message) => after === undefined || (message.brokerSequence ?? 0) > after);
     if (after !== undefined) {
       return pending
@@ -1292,6 +1324,14 @@ export class Coordinator {
         reason: `An in-flight write prevents writing ${requestedPath ?? fenced.id}`,
       };
     }
+    const quarantined = candidates.find((resource) => this.activeForeignWriteQuarantine(resource, actorId));
+    if (quarantined) {
+      return {
+        allowed: false,
+        resourceId: quarantined.id,
+        reason: `A broker-restart write quarantine prevents writing ${requestedPath ?? quarantined.id}`,
+      };
+    }
     const conflicting = requestedPath === undefined ? undefined : candidates.find((resource) => resource.sharedHolds.length > 0 || resource.mutableHold && resource.mutableHold.agentId !== actorId);
     if (conflicting) {
       return { allowed: false, resourceId: conflicting.id, reason: `A conflicting runtime hold prevents writing ${requestedPath}` };
@@ -1314,7 +1354,7 @@ export class Coordinator {
    * competing writer. Undeclared paths (root host-guard freedom) stay allowed
    * with no fence because there is no resource to protect.
    */
-  private beginWrite(actorId: AgentId, args: Record<string, unknown>): { allowed: boolean; reason?: string; resourceId?: string; fenceId?: string; expiresAt?: number } {
+  private beginWrite(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): { allowed: boolean; reason?: string; resourceId?: string; fenceId?: string; expiresAt?: number } {
     const decision = this.checkWrite(actorId, args);
     if (!decision.allowed || decision.resourceId === undefined) return decision;
     const fenceMs = Math.max(1_000, Math.min(120_000, Math.floor(parseNumber(args.fenceMs, "fenceMs", 30_000))));
@@ -1327,6 +1367,14 @@ export class Coordinator {
       expiresAt: now + fenceMs,
     };
     this.fences.set(fence.id, fence);
+    const resource = this.resources.get(decision.resourceId);
+    if (resource) {
+      resource.writeQuarantineUntil = fence.expiresAt;
+      resource.writeQuarantineActorId = actorId;
+      resource.writeQuarantineFenceId = fence.id;
+      resource.updatedAt = now;
+      events.push({ type: "resource_changed", resource: cloneResource(resource) });
+    }
     return { ...decision, fenceId: fence.id, expiresAt: fence.expiresAt };
   }
 
@@ -1338,8 +1386,24 @@ export class Coordinator {
     const fenceId = parseString(args.fenceId, "fenceId", 512);
     const fence = this.fences.get(fenceId);
     const released = fence !== undefined && fence.actorId === actorId && this.fences.delete(fenceId);
-    if (released) this.drainWaiters(events);
-    return { released: Boolean(released) };
+    // A fence object is intentionally not restored across broker restart, but
+    // the original authenticated actor may still complete its old write after
+    // reconnecting. Let that end_write clear the durable quarantine even when
+    // the in-memory fence record is already gone.
+    const now = this.clock();
+    const quarantined = !released
+      ? [...this.resources.values()].find((resource) => resource.writeQuarantineFenceId === fenceId && resource.writeQuarantineActorId === actorId && (resource.writeQuarantineUntil ?? 0) > now)
+      : undefined;
+    const resource = released ? this.resources.get(fence.resourceId) : quarantined;
+    if ((released || quarantined) && resource?.writeQuarantineFenceId === fenceId) {
+      resource.writeQuarantineUntil = undefined;
+      resource.writeQuarantineActorId = undefined;
+      resource.writeQuarantineFenceId = undefined;
+      resource.updatedAt = now;
+      events.push({ type: "resource_changed", resource: cloneResource(resource) });
+    }
+    if (released || quarantined) this.drainWaiters(events);
+    return { released: Boolean(released || quarantined) };
   }
 
   private activeForeignFence(resource: ResourceRecord, actorId: AgentId): boolean {
@@ -1351,9 +1415,19 @@ export class Coordinator {
     return false;
   }
 
+  private activeForeignWriteQuarantine(resource: ResourceRecord, actorId: AgentId): boolean {
+    const now = this.clock();
+    for (const candidate of this.resources.values()) {
+      if ((candidate.writeQuarantineUntil ?? 0) <= now || candidate.writeQuarantineActorId === actorId) continue;
+      if (this.overlaps(candidate.id, resource.id)) return true;
+    }
+    return false;
+  }
+
   private status(actorId: AgentId, args: Record<string, unknown>): FabricStatus {
     const actor = this.requireActor(actorId);
     assertCondition(actor.depth === 0, "CAPABILITY_DENIED", "Only a fabric root may request full status");
+    const now = this.clock();
     const allMessages = [...this.messages.values()].sort((left, right) => (right.brokerSequence ?? 0) - (left.brokerSequence ?? 0) || right.createdAt - left.createdAt).slice(0, 100).map(cloneMessage);
     return {
       rootId: this.rootId,
@@ -1364,9 +1438,9 @@ export class Coordinator {
       recentMessages: allMessages,
       runningChildren: this.runningAgentCount(),
       config: cloneConfig(this.config),
-      activeFences: [...this.fences.values()].filter((candidate) => candidate.expiresAt > this.clock()).length,
+      activeFences: [...this.fences.values()].filter((candidate) => candidate.expiresAt > now).length,
       fences: [...this.fences.values()]
-        .filter((candidate) => candidate.expiresAt > this.clock())
+        .filter((candidate) => candidate.expiresAt > now)
         .map((fence) => {
           const res = this.resources.get(fence.resourceId);
           return {
@@ -1376,15 +1450,16 @@ export class Coordinator {
             actorId: fence.actorId,
           };
         }),
+      activeWriteQuarantines: [...this.resources.values()].filter((resource) => (resource.writeQuarantineUntil ?? 0) > now).length,
     };
   }
 
   /** Run the time-based maintenance transition without requiring an actor request. */
-  maintenance(): DispatchResult<null> {
+  maintenance(options: { skipStaleAgents?: boolean } = {}): DispatchResult<null> {
     const events: CoordinatorEvent[] = [];
     const now = this.clock();
     this.reclaimExpired(now, events);
-    this.reclaimStaleAgents(now, events);
+    this.reclaimStaleAgents(now, events, options.skipStaleAgents !== true);
     return { value: null, events };
   }
 
@@ -1395,24 +1470,15 @@ export class Coordinator {
    * and return unfinished tasks to the ready pool so capacity cannot remain
    * reserved forever.
    */
-  private reclaimStaleAgents(now: number, events: CoordinatorEvent[]): void {
+  private reclaimStaleAgents(now: number, events: CoordinatorEvent[], allowNewStale = true): void {
     const heartbeatTimeout = this.config.agentHeartbeatTimeoutMs ?? this.config.heartbeatMs * 3;
     const reconnectGrace = this.config.reconnectGraceMs ?? heartbeatTimeout * 2;
-    for (const agent of [...this.agents.values()]) {
-      if (isTerminal(agent.status) || agent.reconnectable === true) continue;
-      if (now - agent.lastActivity < heartbeatTimeout) continue;
-      const next = cloneAgent(agent);
-      next.status = "failed";
-      next.statusReason = "Agent heartbeat expired before the host reconnected";
-      next.reconnectable = true;
-      next.lastActivity = now;
-      this.agents.set(next.id, next);
-      events.push({ type: "agent_updated", agent: cloneAgent(next) });
-      // Preserve the durable task link for a reconnecting runtime, but release
-      // resources and make the task available if the grace window expires.
-      this.releaseAgentRuntime(next.id, "broker-recovery", events);
-      if (next.parentId && this.agents.has(next.parentId)) {
-        this.sendInternalMessage("broker", next.parentId, "agent_failed", next.statusReason, { failedAgentId: next.id }, events);
+    if (allowNewStale) {
+      const visited = new Set<AgentId>();
+      for (const agent of [...this.agents.values()]) {
+        if (!ACTIVE_STATUSES.has(agent.status) || agent.reconnectable === true) continue;
+        if (now - agent.lastActivity < heartbeatTimeout) continue;
+        this.markReconnectableSubtree(agent.id, "Agent heartbeat expired before the host reconnected", now, events, visited);
       }
     }
 
@@ -1425,18 +1491,20 @@ export class Coordinator {
 
   private retireReconnectableSubtree(agent: AgentRecord, events: CoordinatorEvent[]): void {
     for (const child of [...this.agents.values()]) {
-      if (child.parentId === agent.id && child.reconnectable === true) this.retireReconnectableSubtree(child, events);
+      if (child.parentId === agent.id && (this.isReservedLive(child) || child.reconnectable === true)) this.retireReconnectableSubtree(child, events);
     }
     const current = this.agents.get(agent.id);
-    if (!current || current.status !== "failed" || current.reconnectable !== true) return;
+    if (!current || (!this.isReservedLive(current) && current.reconnectable !== true)) return;
     const next = cloneAgent(current);
     next.status = "cancelled";
     next.reconnectable = false;
+    next.recoveryExpiredAt = this.clock();
     next.statusReason = "Reconnect grace expired; unfinished work returned to the task pool";
-    next.lastActivity = this.clock();
+    next.lastActivity = next.recoveryExpiredAt;
     this.agents.set(next.id, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
     this.cancelRequestsFor(next.id, "cancelled", "Agent reconnect grace expired", events);
+    this.markMessagesUndeliverable(next.id, events);
     this.releaseAgentRuntime(next.id, "reconnect-expired", events);
   }
 
@@ -1444,22 +1512,51 @@ export class Coordinator {
   recover(): DispatchResult<{ recovered: AgentId[] }> {
     const events: CoordinatorEvent[] = [];
     const recovered: AgentId[] = [];
+    const now = this.clock();
+    const visited = new Set<AgentId>();
     for (const agent of [...this.agents.values()]) {
-      if (!ACTIVE_STATUSES.has(agent.status)) continue;
-      const next = cloneAgent(agent);
-      next.status = "failed";
-      next.statusReason = "Broker restarted before the agent reconnected";
-      next.reconnectable = true;
-      next.lastActivity = this.clock();
-      this.agents.set(next.id, next);
-      events.push({ type: "agent_updated", agent: cloneAgent(next) });
-      // A restart only proves that transport liveness was interrupted. Keep
-      // semantic requests pending until an actor explicitly resolves or fails
-      // them; a reconnecting host may still be waiting on the reply.
-      this.releaseAgentRuntime(next.id, "broker-recovery", events);
-      recovered.push(next.id);
+      if (!ACTIVE_STATUSES.has(agent.status) || agent.reconnectable === true) continue;
+      this.markReconnectableSubtree(agent.id, "Broker restarted before the agent reconnected", now, events, visited, recovered);
     }
     return { value: { recovered }, events };
+  }
+
+  /**
+   * Fence a stale actor's complete live subtree as one recovery unit. A parent
+   * may not become recoverable while a descendant remains active because the
+   * reconnect window can later make that descendant live again.
+   */
+  private markReconnectableSubtree(
+    agentId: AgentId,
+    reason: string,
+    now: number,
+    events: CoordinatorEvent[],
+    visited: Set<AgentId>,
+    recovered?: AgentId[],
+  ): void {
+    if (visited.has(agentId)) return;
+    visited.add(agentId);
+    for (const child of [...this.agents.values()]) {
+      if (child.parentId === agentId && (this.isReservedLive(child) || child.reconnectable === true)) {
+        this.markReconnectableSubtree(child.id, reason, now, events, visited, recovered);
+      }
+    }
+    const current = this.agents.get(agentId);
+    if (!current || !this.isReservedLive(current) || current.reconnectable === true) return;
+    const next = cloneAgent(current);
+    next.status = "failed";
+    next.statusReason = reason;
+    next.reconnectable = true;
+    next.lastActivity = now;
+    this.agents.set(next.id, next);
+    events.push({ type: "agent_updated", agent: cloneAgent(next) });
+    // Preserve the durable task link for a reconnecting runtime, but release
+    // resources and make the task available if the grace window expires.
+    this.releaseAgentRuntime(next.id, "broker-recovery", events);
+    if (next.parentId && this.agents.has(next.parentId)) {
+      this.sendInternalMessage("broker", next.parentId, "agent_failed", next.statusReason, { failedAgentId: next.id }, events);
+    }
+    recovered?.push(next.id);
   }
 
   getAgent(agentId: AgentId): Omit<AgentRecord, "authToken"> | undefined {
@@ -1678,8 +1775,10 @@ export class Coordinator {
             const updated: AgentMessage = {
               ...cloneMessage(existing),
               body,
+              revision: (existing.revision ?? 1) + 1,
               priority: options.priority ?? existing.priority,
               metadata: parseMetadata(options.metadata),
+              abandonedAt: undefined,
             };
             this.messages.set(existing.id, updated);
             events.push({ type: "message_updated", message: cloneMessage(updated) });
@@ -1709,6 +1808,7 @@ export class Coordinator {
       to: recipient.id,
       type,
       body,
+      revision: 1,
       senderSequence: sequence,
       brokerSequence,
       requestId: options.requestId,
@@ -1741,7 +1841,7 @@ export class Coordinator {
   private pruneMessages(events: CoordinatorEvent[]): void {
     if (this.messages.size <= this.config.messageRetention) return;
     const candidates = [...this.messages.values()]
-      .filter((message) => message.acknowledgedAt !== undefined)
+      .filter((message) => message.acknowledgedAt !== undefined || message.abandonedAt !== undefined)
       .sort((left, right) => (left.brokerSequence ?? 0) - (right.brokerSequence ?? 0) || left.createdAt - right.createdAt || left.id.localeCompare(right.id));
     const ids: string[] = [];
     let remaining = this.messages.size;
@@ -1755,9 +1855,19 @@ export class Coordinator {
     if (ids.length > 0) events.push({ type: "messages_pruned", ids });
   }
 
+  private markMessagesUndeliverable(recipientId: AgentId, events: CoordinatorEvent[]): void {
+    const abandonedAt = this.clock();
+    for (const message of this.messages.values()) {
+      if (message.to !== recipientId || message.acknowledgedAt !== undefined || message.abandonedAt !== undefined) continue;
+      message.abandonedAt = abandonedAt;
+      events.push({ type: "message_updated", message: cloneMessage(message) });
+    }
+    this.pruneMessages(events);
+  }
+
   private sendInternalMessage(fromId: AgentId, toId: AgentId, type: MessageType, body: string, metadata: Record<string, unknown>, events: CoordinatorEvent[]): void {
     const to = this.requireAgent(toId);
-    if (isTerminal(to.status)) return;
+    if (isTerminal(to.status) && to.reconnectable !== true) return;
     const from = fromId === "broker" ? this.brokerActor() : this.requireAgent(fromId);
     try {
       const entity = metadata.requestId ?? metadata.taskId ?? metadata.failedAgentId ?? metadata.resourceId ?? stableStringify(metadata);
@@ -1918,6 +2028,12 @@ export class Coordinator {
         resource.version += 1;
         changed = true;
       }
+      if ((resource.writeQuarantineUntil ?? 0) <= now && resource.writeQuarantineUntil !== undefined) {
+        resource.writeQuarantineUntil = undefined;
+        resource.writeQuarantineActorId = undefined;
+        resource.writeQuarantineFenceId = undefined;
+        changed = true;
+      }
       if (changed) {
         resource.updatedAt = now;
         events.push({ type: "resource_changed", resource: cloneResource(resource) });
@@ -1957,6 +2073,7 @@ export class Coordinator {
     // guarded write is in flight, so it excludes conflicting grants even in
     // the gap where the writer's own lease has just lapsed.
     if (this.activeForeignFence(resource, agentId)) return false;
+    if (this.activeForeignWriteQuarantine(resource, agentId)) return false;
     for (const overlap of this.overlappingResources(resource.id)) {
       // A holder cannot downgrade/upgrade itself behind the coordinator's
       // back: shared and mutable holds for one actor are still conflicting.
@@ -2171,16 +2288,20 @@ export class Coordinator {
    * resolves its turn, or is cancelled.
    */
   private reservedAgentCount(): number {
-    return [...this.agents.values()].filter((agent) => ACTIVE_STATUSES.has(agent.status) || agent.reconnectable === true).length;
+    return [...this.agents.values()].filter((agent) => this.isReservedLive(agent)).length;
   }
 
-  private liveChildrenCount(parentId: AgentId): number {
-    return [...this.agents.values()].filter((agent) => agent.parentId === parentId && !isTerminal(agent.status)).length;
+  private isReservedLive(agent: AgentRecord): boolean {
+    return ACTIVE_STATUSES.has(agent.status) || agent.reconnectable === true;
   }
 
-  private assertChildCapacity(parent: AgentRecord): void {
-    assertCondition(this.liveChildrenCount(parent.id) < this.config.maxChildrenPerAgent, "AGENT_LIMIT_REACHED", `Agent ${parent.id} reached maxChildrenPerAgent live-child limit`);
-    if (this.config.maxChildrenCreatedPerAgent !== undefined) {
+  private liveChildrenCount(parentId: AgentId, excludeAgentId?: AgentId): number {
+    return [...this.agents.values()].filter((agent) => agent.id !== excludeAgentId && agent.parentId === parentId && this.isReservedLive(agent)).length;
+  }
+
+  private assertChildCapacity(parent: AgentRecord, excludeAgentId?: AgentId, checkCreationLimit = true): void {
+    assertCondition(this.liveChildrenCount(parent.id, excludeAgentId) < this.config.maxChildrenPerAgent, "AGENT_LIMIT_REACHED", `Agent ${parent.id} reached maxChildrenPerAgent live-child limit`);
+    if (checkCreationLimit && this.config.maxChildrenCreatedPerAgent !== undefined) {
       assertCondition(parent.childrenCreated < this.config.maxChildrenCreatedPerAgent, "AGENT_LIMIT_REACHED", `Agent ${parent.id} reached maxChildrenCreatedPerAgent`);
     }
   }
@@ -2227,6 +2348,8 @@ export class Coordinator {
       taskId: agent.taskId,
       route: { ...agent.route },
       status: agent.status,
+      reconnectable: agent.reconnectable,
+      recoveryExpiredAt: agent.recoveryExpiredAt,
       workspace: agent.workspace ? { ...agent.workspace } : undefined,
       lastActivity: agent.lastActivity,
       contextMode: agent.contextMode,

@@ -92,9 +92,76 @@ test("fabric-state: separates the fabric identity from the attached root agent i
 
   const snapshot = await runtime.getFabricStateSnapshot({ cwd: "/test/repo" });
   assert.ok(snapshot);
-  assert.equal(snapshot.quiescent, true);
-  assert.deepEqual(snapshot.quiescenceReasons, []);
-  assert.equal(snapshot.unresolvedChildTasks, 0);
+  assert.equal(snapshot.quiescent, false);
+  assert.deepEqual(snapshot.quiescenceReasons, ["unresolved_child_tasks"]);
+  assert.equal(snapshot.unresolvedChildTasks, 1);
+  assert.equal(snapshot.unownedUnresolvedTasks, 0);
+});
+
+test("fabric-state: recovery reservations, unowned tasks, both-way root requests, and quarantines block replacement", async () => {
+  const runtime = new FabricRuntime({ cwd: "/test/repo", startBroker: false });
+  (runtime as any).root = {
+    agentId: "root-1",
+    ctx: { cwd: "/test/repo", sessionId: "sess-1" },
+  };
+  (runtime as any).status = async () => makeMockStatus({
+    agents: [
+      {
+        id: "root-1",
+        depth: 0,
+        role: "root",
+        route: { provider: "openai", model: "gpt-5.6-sol", thinking: "high" },
+        status: "ready",
+        lastActivity: Date.now(),
+      },
+      {
+        id: "recovering-1",
+        parentId: "root-1",
+        depth: 1,
+        role: "worker",
+        route: { provider: "openai", model: "gpt-5.6-sol", thinking: "high" },
+        status: "failed",
+        reconnectable: true,
+        lastActivity: Date.now(),
+      },
+    ],
+    tasks: [
+      {
+        id: "unowned-task",
+        creator: "root-1",
+        description: "recovery work",
+        status: "ready",
+        dependencies: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ],
+    pendingRequests: [
+      {
+        id: "root-request",
+        messageId: "root-message",
+        from: "root-1",
+        to: "recovering-1",
+        status: "pending",
+        createdAt: Date.now(),
+      },
+    ],
+    activeWriteQuarantines: 1,
+  });
+
+  const snapshot = await runtime.getFabricStateSnapshot({ cwd: "/test/repo" });
+  assert.ok(snapshot);
+  assert.equal(snapshot.quiescent, false);
+  assert.equal(snapshot.sessionReplacementSafe, false);
+  assert.equal(snapshot.recoveringAgents, 1);
+  assert.equal(snapshot.unresolvedChildTasks, 1);
+  assert.equal(snapshot.unownedUnresolvedTasks, 1);
+  assert.equal(snapshot.pendingRootRequests, 1);
+  assert.equal(snapshot.activeWriteQuarantines, 1);
+  assert.ok(snapshot.quiescenceReasons.includes("recovering_agents"));
+  assert.ok(snapshot.quiescenceReasons.includes("unowned_unresolved_tasks"));
+  assert.ok(snapshot.quiescenceReasons.includes("active_write_quarantines"));
+  assert.ok(snapshot.quiescenceReasons.includes("pending_root_requests"));
 });
 
 test("fabric-state: running child -> non-quiescent", async () => {

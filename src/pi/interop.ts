@@ -103,9 +103,15 @@ export interface FabricStateSnapshotV1 {
   cwd?: string;
 
   runningChildren: number;
+  /** Actors in the bounded broker-recovery window. */
+  recoveringAgents: number;
   unresolvedChildTasks: number;
+  /** Unfinished tasks whose owner has been released or was never assigned. */
+  unownedUnresolvedTasks: number;
   mutableHolds: number;
   activeWriteFences: number;
+  /** Durable restart quarantine for a write that may have crossed broker loss. */
+  activeWriteQuarantines: number;
   pendingRootRequests: number;
   pendingRootDeliveries: number;
   /** True while Pi is performing manual/automatic root compaction. */

@@ -67,7 +67,8 @@ Actionable work is tracked here with checkboxes. Checked items mean the behavior
 
 ## Hardening / v1.x
 
-- [x] Write fencing for guarded writes: `resource.begin_write` authorizes and fences the target; no conflicting lease is granted while the fence exists, even if the writer's hold lapses mid-write; `resource.end_write` (or expiry) lifts it and drains waiters. Remaining honesty: the filesystem mutation itself still cannot be atomic with coordinator state without cooperative file locking, which stays out of scope.
+- [x] Write fencing for guarded writes: `resource.begin_write` authorizes and fences the target; no conflicting lease is granted while the fence exists, even if the writer's hold lapses mid-write; `resource.end_write` (or expiry) lifts it and drains waiters. A journaled resource quarantine carries the exclusion across broker restart through the fence expiry. Remaining honesty: the filesystem mutation itself still cannot be atomic with coordinator state without cooperative file locking, which stays out of scope.
+- [x] Round-six recovery convergence: reconnectable actors remain reserved/live for topology, subtree shutdown, child capacity, and quiescence; stale recovery is subtree-aware and pause-safe; exact message revisions protect coalesced delivery; notices, local durable state, terminal mailbox retention, startup artifact cleanup, and root receipt markers converge across restart and host races.
 - [ ] Add explicit broker health diagnostics and safe stale-lock cleanup.
 - [ ] Add journal compaction/checkpointing without losing audit metadata.
 - [ ] Add user-confirmed worktree cleanup with fresh Git safety checks.

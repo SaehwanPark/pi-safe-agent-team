@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type AgentSession, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -108,15 +108,24 @@ function hashIdentity(value: string): string {
  * intentionally does not use substring matching: quoted IDs in ordinary
  * model text cannot satisfy this exact receipt grammar.
  */
-function childMessageReceipt(messageId: string): string {
-  return `<safe-agents-message id="${messageId}"/>`;
+function messageRevision(message: Pick<AgentMessage, "revision">): number {
+  return Number.isInteger(message.revision) && (message.revision as number) > 0 ? message.revision as number : 1;
+}
+
+interface ChildMessageReceipt {
+  id: string;
+  revision: number;
+}
+
+function childMessageReceipt(message: Pick<AgentMessage, "id" | "revision">): string {
+  return `<safe-agents-message id="${message.id}" revision="${messageRevision(message)}"/>`;
 }
 
 function childMessagePrompt(message: AgentMessage): string {
-  return `${childMessageReceipt(message.id)}\n[Fabric message from ${message.from} | ${message.type} | ${message.id}]\n${message.body}`;
+  return `${childMessageReceipt(message)}\n[Fabric message from ${message.from} | ${message.type} | ${message.id} revision ${messageRevision(message)}]\n${message.body}`;
 }
 
-function extractChildMessageReceipt(content: unknown): string | undefined {
+function extractChildMessageReceipt(content: unknown): ChildMessageReceipt | undefined {
   const text = typeof content === "string"
     ? content
     : Array.isArray(content)
@@ -124,15 +133,17 @@ function extractChildMessageReceipt(content: unknown): string | undefined {
       : "";
   if (typeof text !== "string") return undefined;
   const firstLine = text.split(/\r?\n/, 1)[0]?.trim();
-  const structured = /^<safe-agents-message id="([^"]+)"\/>$/.exec(firstLine ?? "");
-  if (structured) return structured[1];
+  const structured = /^<safe-agents-message id="([^"]+)" revision="([0-9]+)"\/>$/.exec(firstLine ?? "");
+  if (structured) return { id: structured[1], revision: Number(structured[2]) };
+  const legacyStructured = /^<safe-agents-message id="([^"]+)"\/>$/.exec(firstLine ?? "");
+  if (legacyStructured) return { id: legacyStructured[1], revision: 1 };
   // Read transcripts created before the structured receipt was introduced,
   // but still require the complete canonical header rather than includes().
   const legacy = /^\[Fabric message from [^|\]]+ \| [^|\]]+ \| ([^\]]+)\]$/.exec(firstLine ?? "");
-  if (legacy) return legacy[1];
+  if (legacy) return { id: legacy[1], revision: 1 };
   // Very early test/host adapters only retained the compact receipt line.
   const compact = /^\[Fabric message ([^\]]+)\]$/.exec(firstLine ?? "");
-  return compact?.[1];
+  return compact ? { id: compact[1], revision: 1 } : undefined;
 }
 
 function canonicalWorkspacePath(value: string): string {
@@ -183,6 +194,7 @@ export class FabricRuntime {
   private rootCloseUnsubscribe?: () => void;
   private rootHeartbeatTimer?: NodeJS.Timeout;
   private rootReconnectPromise?: Promise<void>;
+  private cleanupPromise?: Promise<void>;
   private stopped = false;
   private rootDelivery?: (message: AgentMessage) => void;
   private caseInsensitivePaths?: boolean;
@@ -476,6 +488,7 @@ export class FabricRuntime {
         this.rootToken = refreshed.token;
         this.root.client.setIdentity(this.root.agentId, refreshed.token);
       }
+      await this.cleanupAbandonedAgentArtifacts().catch(() => undefined);
       if (this.rootDelivery) {
         const inbox = await this.drainRootInbox();
         for (const message of inbox) this.rootDelivery(message);
@@ -511,8 +524,14 @@ export class FabricRuntime {
     await this.saveRootToken(result.token);
     client.setIdentity(agentId, result.token);
     this.root = { api, ctx, agentId, client };
+    await this.cleanupAbandonedAgentArtifacts().catch(() => undefined);
     this.rootHeartbeatTimer = setInterval(() => {
-      void client.request("agent.heartbeat", {}).catch(() => undefined);
+      void client.request("agent.heartbeat", {}).catch(() => {
+        // A live socket can survive broker-side liveness reclamation or an
+        // event-loop pause. Re-register on lifecycle errors so a managed root
+        // does not remain silently failed until the recovery grace expires.
+        void this.reconnectRoot();
+      });
     }, Math.max(1000, this.config?.heartbeatMs ?? 60_000));
     this.rootHeartbeatTimer.unref();
     this.rootEventUnsubscribe = client.onEvent((event) => this.handleRootEvent(event));
@@ -639,9 +658,12 @@ export class FabricRuntime {
         rootSessionId,
         cwd: this.cwd,
         runningChildren: 0,
+        recoveringAgents: 0,
         unresolvedChildTasks: 0,
+        unownedUnresolvedTasks: 0,
         mutableHolds: 0,
         activeWriteFences: 0,
+        activeWriteQuarantines: 0,
         pendingRootRequests: 0,
         pendingRootDeliveries: 0,
         rootCompactionInFlight: this.isRootCompactionInFlight,
@@ -669,24 +691,33 @@ export class FabricRuntime {
       const runningChildren = status.agents.filter(
         (a) => a.depth > 0 && (a.status === "starting" || a.status === "running" || a.status === "draining"),
       ).length;
+      const recoveringAgents = status.agents.filter((a) => a.reconnectable === true).length;
+      const unresolvedStatuses = ["pending", "ready", "active", "waiting", "blocked"];
       const unresolvedChildTasks = status.tasks.filter(
-        (t) => t.owner && t.owner !== rootAgentId && ["pending", "ready", "active", "waiting", "blocked"].includes(t.status),
+        (t) => unresolvedStatuses.includes(t.status),
+      ).length;
+      const unownedUnresolvedTasks = status.tasks.filter(
+        (t) => !t.owner && unresolvedStatuses.includes(t.status),
       ).length;
       const mutableHolds = status.resources.filter((r) => r.mutableHold !== undefined).length;
       const pendingRootRequests = status.pendingRequests.filter(
-        (r) => r.to === rootAgentId && r.status === "pending",
+        (r) => (r.to === rootAgentId || r.from === rootAgentId) && r.status === "pending",
       ).length;
       const pendingRootDeliveries = this.pendingRootDeliveriesCount;
       const activeWriteFences = status.activeFences ?? 0;
+      const activeWriteQuarantines = status.activeWriteQuarantines ?? status.resources.filter((resource) => (resource.writeQuarantineUntil ?? 0) > now).length;
 
       const quiescenceReasons: string[] = [];
       if (this.draining) quiescenceReasons.push("fabric_draining");
       if (this.isRootCompactionInFlight) quiescenceReasons.push("root_compaction_in_flight");
       if (rootBusy) quiescenceReasons.push("root_agent_active_or_running");
       if (runningChildren > 0) quiescenceReasons.push("running_children_active");
+      if (recoveringAgents > 0) quiescenceReasons.push("recovering_agents");
       if (unresolvedChildTasks > 0) quiescenceReasons.push("unresolved_child_tasks");
+      if (unownedUnresolvedTasks > 0) quiescenceReasons.push("unowned_unresolved_tasks");
       if (mutableHolds > 0) quiescenceReasons.push("active_mutable_holds");
       if (activeWriteFences > 0) quiescenceReasons.push("active_write_fences");
+      if (activeWriteQuarantines > 0) quiescenceReasons.push("active_write_quarantines");
       if (pendingRootRequests > 0) quiescenceReasons.push("pending_root_requests");
       if (pendingRootDeliveries > 0) quiescenceReasons.push("pending_root_deliveries");
 
@@ -694,7 +725,7 @@ export class FabricRuntime {
       const sessionReplacementSafe = quiescent;
 
       const activeTasks = status.tasks
-        .filter((t) => ["pending", "ready", "active", "waiting", "blocked"].includes(t.status))
+        .filter((t) => unresolvedStatuses.includes(t.status))
         .slice(0, 50)
         .map((t) => ({
           id: t.id,
@@ -722,9 +753,12 @@ export class FabricRuntime {
         rootSessionId,
         cwd: this.cwd,
         runningChildren,
+        recoveringAgents,
         unresolvedChildTasks,
+        unownedUnresolvedTasks,
         mutableHolds,
         activeWriteFences,
+        activeWriteQuarantines,
         pendingRootRequests,
         pendingRootDeliveries,
         rootCompactionInFlight: this.isRootCompactionInFlight,
@@ -745,9 +779,12 @@ export class FabricRuntime {
         rootSessionId,
         cwd: this.cwd,
         runningChildren: 0,
+        recoveringAgents: 0,
         unresolvedChildTasks: 0,
+        unownedUnresolvedTasks: 0,
         mutableHolds: 0,
         activeWriteFences: 0,
+        activeWriteQuarantines: 0,
         pendingRootRequests: 0,
         pendingRootDeliveries: this.pendingRootDeliveriesCount,
         rootCompactionInFlight: this.isRootCompactionInFlight,
@@ -898,7 +935,7 @@ export class FabricRuntime {
       }
     }
     return status.agents
-      .filter((agent) => agent.depth > 0 && !["completed", "failed", "cancelled"].includes(agent.status))
+      .filter((agent) => agent.depth > 0 && (!["completed", "failed", "cancelled"].includes(agent.status) || agent.reconnectable === true))
       .map((agent) => ({
         agentId: agent.id,
         parentId: agent.parentId,
@@ -916,7 +953,7 @@ export class FabricRuntime {
   }
 
   private captureLocalHandoffSnapshots(reason: string): HandoffSnapshot[] {
-    return [...this.children.values()].filter((child) => !["completed", "failed", "cancelled"].includes(child.record.status)).map((child) => ({
+    return [...this.children.values()].filter((child) => (!["completed", "failed", "cancelled"].includes(child.record.status) || child.record.reconnectable === true)).map((child) => ({
       agentId: child.agentId,
       parentId: child.parentId,
       role: child.role,
@@ -1124,6 +1161,7 @@ export class FabricRuntime {
           });
           this.rootToken = refreshed.token;
           this.root.client.setIdentity(this.root.agentId, refreshed.token);
+          await this.cleanupAbandonedAgentArtifacts().catch(() => undefined);
           const inbox = await this.drainRootInbox();
           for (const message of inbox) this.rootDelivery?.(message);
           return;
@@ -1159,6 +1197,57 @@ export class FabricRuntime {
       await Promise.resolve();
     }
     return messages;
+  }
+
+  /**
+   * Reclaim artifacts left by actors whose broker recovery window expired.
+   * Workspace strategies decide whether a worktree is clean; a failed cleanup
+   * therefore preserves the worktree and its session history for inspection.
+   */
+  private cleanupAbandonedAgentArtifacts(status?: FabricStatus): Promise<void> {
+    if (this.cleanupPromise) return this.cleanupPromise;
+    const operation = (async () => {
+      if (!this.root || this.stopped) return;
+      const durable = status ?? (await this.status() as FabricStatus);
+      const now = Date.now();
+      const grace = this.config.reconnectGraceMs ?? DEFAULT_FABRIC_CONFIG.reconnectGraceMs ?? 0;
+      const caseFold = process.platform === "win32" || this.caseInsensitivePaths === true;
+      const pathKey = (path: string): string => {
+        const canonical = canonicalWorkspacePath(path);
+        return caseFold ? canonical.toLowerCase() : canonical;
+      };
+      const protectedPaths = new Set(
+        durable.agents
+          .filter((agent) => !["completed", "failed", "cancelled"].includes(agent.status) || agent.reconnectable === true)
+          .map((agent) => agent.workspace?.path)
+          .filter((path): path is string => Boolean(path))
+          .map(pathKey),
+      );
+      const candidates = durable.agents.filter((agent) => {
+        if (agent.depth === 0 || !agent.workspace || !["completed", "failed", "cancelled"].includes(agent.status) || agent.reconnectable === true) return false;
+        if (agent.recoveryExpiredAt !== undefined) return agent.recoveryExpiredAt <= now;
+        return now - agent.lastActivity >= grace;
+      });
+      for (const agent of candidates) {
+        const workspace = agent.workspace;
+        if (!workspace || protectedPaths.has(pathKey(workspace.path))) continue;
+        try {
+          await this.workspaceStrategy.cleanup(workspace);
+        } catch {
+          // A dirty worktree is intentionally retained as a recovery artifact.
+          continue;
+        }
+        const sessionsRoot = resolve(this.stateDirectory, "sessions");
+        const sessionPath = resolve(sessionsRoot, agent.id);
+        if (sessionPath === sessionsRoot || !sessionPath.startsWith(`${sessionsRoot}${sep}`)) continue;
+        await fs.rm(sessionPath, { recursive: true, force: true }).catch(() => undefined);
+      }
+    })();
+    const cleanupPromise = operation.finally(() => {
+      if (this.cleanupPromise === cleanupPromise) this.cleanupPromise = undefined;
+    });
+    this.cleanupPromise = cleanupPromise;
+    return cleanupPromise;
   }
 
   private booleanCapabilities(input: SpawnToolInput): Record<string, boolean> {
@@ -1200,15 +1289,15 @@ export class ManagedChild {
 
   private readonly pendingMessages: AgentMessage[] = [];
   private readonly pendingMessageIds = new Set<string>();
-  private readonly deliveryStates = new Map<string, "delivering" | "accepted" | "acknowledged">();
+  private readonly deliveryStates = new Map<string, { state: "delivering" | "accepted" | "acknowledged"; message: AgentMessage }>();
   /** Messages accepted by Pi but waiting for a durable session transcript boundary. */
   private readonly pendingChildAcks = new Map<string, AgentMessage>();
   /** Prevent duplicate ACK RPCs when prompt completion and agent_settled race. */
   private readonly childAckInFlight = new Map<string, Promise<void>>();
-  /** Set only after a prompt/settlement boundary has completed for this ID. */
-  private readonly persistedChildMessageIds = new Set<string>();
+  /** Set only after a prompt/settlement boundary has completed for this ID/revision. */
+  private readonly persistedChildMessageIds = new Map<string, number>();
   /** Steered messages use the surrounding agent_settled event as their boundary. */
-  private readonly steeredChildMessageIds = new Set<string>();
+  private readonly steeredChildMessageIds = new Map<string, number>();
   private eventUnsubscribe?: () => void;
   private sessionEventUnsubscribe?: () => void;
   private closeUnsubscribe?: () => void;
@@ -1489,10 +1578,16 @@ export class ManagedChild {
       contextDiagnostic: this.lastDiagnostic,
     })).agent;
     this.taskId = this.record.taskId;
-    await this.reconcileRecoveryGate(this.record);
+    await this.reconcileDurableAgentState(this.record);
     this.started = true;
     this.heartbeatTimer = setInterval(() => {
-      void this.client.request("agent.heartbeat", {}).catch(() => undefined);
+      void this.client.request("agent.heartbeat", {}).catch(() => {
+        // Heartbeat failures can mean that maintenance reclaimed this actor
+        // while the host was suspended. Re-register through the normal
+        // credentialed recovery path instead of swallowing the lifecycle
+        // error and letting the recovery window expire.
+        void this.reconnect();
+      });
     }, Math.max(1000, this.runtime.config?.heartbeatMs ?? 60_000));
     this.heartbeatTimer.unref();
     this.closeUnsubscribe = this.client.onClose(() => {
@@ -1501,8 +1596,16 @@ export class ManagedChild {
     const pending = this.pendingMessages.splice(0);
     for (const message of pending) this.pendingMessageIds.delete(message.id);
     const inbox = await this.drainInbox();
-    const seen = new Set(pending.map((message) => message.id));
-    for (const message of [...pending, ...inbox.filter((message) => !seen.has(message.id))]) void this.deliverMessage(message);
+    // A coalesced notification may have advanced between the event that was
+    // buffered before session startup and the inbox scan. Merge by logical ID
+    // and keep the highest revision so startup cannot re-deliver an old body
+    // and then get stuck on a stale-revision ACK without seeing the update.
+    const recovered = new Map<string, AgentMessage>();
+    for (const message of [...pending, ...inbox]) {
+      const existing = recovered.get(message.id);
+      if (!existing || messageRevision(existing) < messageRevision(message)) recovered.set(message.id, message);
+    }
+    for (const message of [...recovered.values()].sort((left, right) => (left.brokerSequence ?? 0) - (right.brokerSequence ?? 0))) void this.deliverMessage(message);
     this.enqueuePrompt(this.bootstrapPrompt());
   }
 
@@ -1595,9 +1698,11 @@ export class ManagedChild {
             contextMode: this.contextMode,
             contextDiagnostic: this.lastDiagnostic,
           });
-          this.record = registered.agent;
-          this.taskId = registered.agent.taskId;
-          await this.reconcileRecoveryGate(this.record);
+          const durable = await this.reconcileDurableAgentState(registered.agent);
+          if (["completed", "cancelled"].includes(durable.status) || durable.status === "failed" && durable.reconnectable !== true) {
+            await this.stop();
+            return;
+          }
           const inbox = await this.drainInbox();
           for (const message of inbox) void this.deliverMessage(message);
           if (!this.blockedByOutcome && !this.recoveryWakePending && this.taskId && this.session && !this.session.isStreaming) {
@@ -1627,6 +1732,14 @@ export class ManagedChild {
    * missed. Clearing first also lets an explicit task reopen release a stale
    * in-memory gate before inbox delivery resumes.
    */
+  private async reconcileDurableAgentState(agent?: AgentRecord): Promise<AgentRecord> {
+    const durable = agent ?? await this.client.request<AgentRecord>("agent.status", {});
+    this.record = durable;
+    this.taskId = durable.taskId;
+    await this.reconcileRecoveryGate(durable);
+    return durable;
+  }
+
   private async reconcileRecoveryGate(agent: AgentRecord): Promise<void> {
     const previousGate = this.blockedByOutcome;
     let task: TaskRecord | undefined;
@@ -1695,7 +1808,7 @@ export class ManagedChild {
       // commit. Reconcile durable status first; never blindly apply a second
       // failure transition to an operation that may already have ended ready,
       // blocked, or terminal.
-      const current = await this.client.request<AgentRecord>("agent.status", {}).catch(() => undefined);
+      const current = await this.reconcileDurableAgentState().catch(() => undefined);
       let terminalized = false;
       if (current && ["starting", "running", "waiting"].includes(current.status)) {
         const ended = await this.requestLifecycle<{ agent?: AgentRecord }>("agent.end_turn", {
@@ -1703,6 +1816,9 @@ export class ManagedChild {
           statusReason: error instanceof Error ? error.message : String(error),
         }, `recovery-${this.operationNonce}-${this.turnSequence++}-end`).catch(() => undefined);
         terminalized = Boolean(ended?.agent && ["completed", "failed", "cancelled"].includes(ended.agent.status));
+      }
+      if (current && (current.status === "completed" || current.status === "cancelled" || current.status === "failed" && current.reconnectable !== true)) {
+        terminalized = true;
       }
       // Once the coordinator has committed failure, no later queued message
       // may be delivered into a terminal session. If transport is unavailable,
@@ -1739,7 +1855,8 @@ export class ManagedChild {
           : "";
       if (typeof messageText === "string") {
         for (const message of this.pendingChildAcks.values()) {
-          if (extractChildMessageReceipt(messageText) === message.id) this.persistedChildMessageIds.add(message.id);
+          const receipt = extractChildMessageReceipt(messageText);
+          if (receipt?.id === message.id && receipt.revision === messageRevision(message)) this.persistedChildMessageIds.set(message.id, messageRevision(message));
         }
       }
       return;
@@ -1914,19 +2031,14 @@ export class ManagedChild {
       const agent = (event.data as { agent?: AgentRecord }).agent;
       if (agent?.id === this.agentId) {
         this.record = agent;
-        if (agent.status === "blocked") {
-          this.blockedByOutcome ??= classifyCompactionFailure(agent.contextDiagnostic ?? "Agent remains blocked pending explicit task recovery");
-        }
-        if (agent.status === "ready" && this.blockedByOutcome) {
-          // A ready agent event alone does not prove that its assigned task
-          // was reopened. Reconcile the task before releasing the local gate;
-          // otherwise a stale heartbeat/register event can race a blocked
-          // task and resume provider work prematurely.
-          void this.reconcileRecoveryGate(agent).then(() => {
-            if (!this.blockedByOutcome) this.drainPendingMessages();
-          }).catch(() => undefined);
-        }
-        if (agent.status === "completed" || agent.status === "cancelled" || agent.status === "failed" && agent.reconnectable !== true) void this.stop();
+        this.taskId = agent.taskId;
+        void this.reconcileDurableAgentState(agent).then((durable) => {
+          if (durable.status === "completed" || durable.status === "cancelled" || durable.status === "failed" && durable.reconnectable !== true) {
+            void this.stop();
+          } else if (durable.status !== "failed" && !this.blockedByOutcome) {
+            this.drainPendingMessages();
+          }
+        }).catch(() => undefined);
       }
       return;
     }
@@ -1947,38 +2059,77 @@ export class ManagedChild {
     const message = (event.data as { message?: AgentMessage }).message;
     if (!message || message.to !== this.agentId) return;
     if (!this.session) {
-      if (!this.pendingMessageIds.has(message.id)) {
-        this.pendingMessageIds.add(message.id);
-        this.pendingMessages.push(message);
-      }
+      this.rememberPendingMessage(message);
       return;
     }
     void this.deliverMessage(message);
   }
 
-  private deliverMessage(message: AgentMessage): Promise<void> {
-    const state = this.deliveryStates.get(message.id);
-    if (state === "acknowledged") return Promise.resolve();
-    if (state === "delivering") return this.deliveryTail;
-    if (state === "accepted") {
-      return this.acknowledgePersistedChildMessage(message);
+  private rememberPendingMessage(message: AgentMessage): void {
+    this.pendingMessageIds.add(message.id);
+    const existing = this.pendingMessages.findIndex((candidate) => candidate.id === message.id);
+    if (existing >= 0) {
+      if (messageRevision(this.pendingMessages[existing]) < messageRevision(message)) this.pendingMessages[existing] = message;
+      return;
     }
+    this.pendingMessages.push(message);
+  }
+
+  private deliverMessage(message: AgentMessage): Promise<void> {
+    const current = this.deliveryStates.get(message.id);
+    if (current && messageRevision(message) <= messageRevision(current.message)) {
+      if (current.state === "accepted") return this.acknowledgePersistedChildMessage(current.message);
+      return Promise.resolve();
+    }
+    if (!this.session || this.stopping) {
+      this.rememberPendingMessage(message);
+      return Promise.resolve();
+    }
+
+    if (current?.state === "delivering") {
+      current.message = message;
+      this.pendingChildAcks.set(message.id, message);
+      return this.deliveryTail;
+    }
+
+    // A coalesced control message keeps its logical ID but receives a new
+    // revision. Re-enter delivery for the new revision even if the older
+    // payload was already accepted by Pi; its ACK must never acknowledge the
+    // newer broker state.
+    this.deliveryStates.set(message.id, { state: "delivering", message });
+    this.pendingChildAcks.set(message.id, message);
 
     // Serialize acceptance itself, including steer calls. The broker's
     // senderSequence is durable, but concurrent model-session calls could
     // otherwise reorder two notifications before promptTail gets involved.
-    this.deliveryStates.set(message.id, "delivering");
+    return this.enqueueMessageDelivery(message);
+  }
+
+  private enqueueMessageDelivery(message: AgentMessage): Promise<void> {
     this.deliveryTail = this.deliveryTail.then(() => this.acceptMessage(message)).catch(() => undefined);
     return this.deliveryTail;
   }
 
+  private queueNewerMessage(message: AgentMessage): void {
+    const current = this.deliveryStates.get(message.id);
+    if (!current || messageRevision(current.message) < messageRevision(message)) {
+      this.deliveryStates.set(message.id, { state: "delivering", message });
+      this.pendingChildAcks.set(message.id, message);
+    } else {
+      current.state = "delivering";
+      current.message = message;
+      this.pendingChildAcks.set(message.id, message);
+    }
+    void this.enqueueMessageDelivery(message);
+  }
+
   private async acceptMessage(message: AgentMessage): Promise<void> {
+    const current = this.deliveryStates.get(message.id);
+    if (current && messageRevision(current.message) > messageRevision(message)) message = current.message;
+    if (current?.state === "acknowledged") return;
     if (this.blockedByOutcome) {
       this.deliveryStates.delete(message.id);
-      if (!this.pendingMessageIds.has(message.id)) {
-        this.pendingMessageIds.add(message.id);
-        this.pendingMessages.push(message);
-      }
+      this.rememberPendingMessage(message);
       return;
     }
     const text = childMessagePrompt(message);
@@ -1988,29 +2139,36 @@ export class ManagedChild {
       // A reconnect can observe an unacknowledged broker message whose Pi user
       // entry was already flushed before the process died. Acknowledge that
       // durable copy without injecting a duplicate prompt.
-      if (this.hasPersistedChildMessage(message.id)) {
+      if (this.hasPersistedChildMessage(message)) {
         accepted = true;
-        this.deliveryStates.set(message.id, "accepted");
+        this.deliveryStates.set(message.id, { state: "accepted", message });
         this.pendingChildAcks.set(message.id, message);
-        this.persistedChildMessageIds.add(message.id);
+        this.persistedChildMessageIds.set(message.id, messageRevision(message));
         await this.acknowledgePersistedChildMessage(message, true);
         return;
       }
       if (this.session.isStreaming) {
         await this.session.steer(text);
-        this.steeredChildMessageIds.add(message.id);
+        const latest = this.deliveryStates.get(message.id)?.message;
+        if (latest && messageRevision(latest) > messageRevision(message)) {
+          this.queueNewerMessage(latest);
+          return;
+        }
+        this.steeredChildMessageIds.set(message.id, messageRevision(message));
       } else {
         const promptCompletion = this.enqueuePrompt(text);
         accepted = true;
         if (message.type === "response" && message.requestId) this.pendingReplyIds.delete(message.requestId);
-        this.deliveryStates.set(message.id, "accepted");
+        this.deliveryStates.set(message.id, { state: "accepted", message });
         this.pendingChildAcks.set(message.id, message);
         void promptCompletion.then((completed) => {
           if (!completed) return;
           const manager = (this.session as any)?.sessionManager as { getEntries?: () => readonly any[] } | undefined;
-          if (!this.persistedChildMessageIds.has(message.id)) {
-            if (typeof manager?.getEntries === "function" && !this.hasPersistedChildMessage(message.id)) return;
-            this.persistedChildMessageIds.add(message.id);
+          const latest = this.deliveryStates.get(message.id)?.message;
+          if (latest && messageRevision(latest) > messageRevision(message)) return;
+          if (this.persistedChildMessageIds.get(message.id) !== messageRevision(message)) {
+            if (typeof manager?.getEntries === "function" && !this.hasPersistedChildMessage(message)) return;
+            this.persistedChildMessageIds.set(message.id, messageRevision(message));
           }
           return this.acknowledgePersistedChildMessage(message, true);
         });
@@ -2018,35 +2176,45 @@ export class ManagedChild {
       }
       accepted = true;
       if (message.type === "response" && message.requestId) this.pendingReplyIds.delete(message.requestId);
-      this.deliveryStates.set(message.id, "accepted");
+      this.deliveryStates.set(message.id, { state: "accepted", message });
       this.pendingChildAcks.set(message.id, message);
       // Steered messages are persisted with the surrounding turn. The
       // agent_settled listener supplies the durable boundary for their ACK.
     } catch {
-      if (accepted) this.deliveryStates.set(message.id, "accepted");
+      const latest = this.deliveryStates.get(message.id)?.message;
+      if (latest && messageRevision(latest) > messageRevision(message)) {
+        this.queueNewerMessage(latest);
+      } else if (accepted) this.deliveryStates.set(message.id, { state: "accepted", message });
       else this.deliveryStates.delete(message.id);
       // Leave unacknowledged so inbox recovery can retry after reconnect.
     }
   }
 
-  private markMessageAcknowledged(messageId: string): void {
+  private markMessageAcknowledged(message: AgentMessage): void {
+    const messageId = message.id;
+    const current = this.deliveryStates.get(messageId);
+    if (current && messageRevision(current.message) > messageRevision(message)) {
+      current.state = "delivering";
+      void this.deliverMessage(current.message);
+      return;
+    }
     this.pendingChildAcks.delete(messageId);
     this.persistedChildMessageIds.delete(messageId);
     this.steeredChildMessageIds.delete(messageId);
-    this.deliveryStates.set(messageId, "acknowledged");
+    this.deliveryStates.set(messageId, { state: "acknowledged", message });
     while (this.deliveryStates.size > 2048) {
-      const removable = [...this.deliveryStates.entries()].find(([, current]) => current === "acknowledged")?.[0];
+      const removable = [...this.deliveryStates.entries()].find(([, current]) => current.state === "acknowledged")?.[0];
       if (!removable) break;
       this.deliveryStates.delete(removable);
     }
     while (this.persistedChildMessageIds.size > 2048) {
-      const removable = this.persistedChildMessageIds.values().next().value as string | undefined;
+      const removable = this.persistedChildMessageIds.keys().next().value as string | undefined;
       if (!removable) break;
       this.persistedChildMessageIds.delete(removable);
     }
   }
 
-  private hasPersistedChildMessage(messageId: string): boolean {
+  private hasPersistedChildMessage(message: Pick<AgentMessage, "id" | "revision">): boolean {
     try {
       const manager = (this.session as any)?.sessionManager as { getEntries?: () => readonly any[] } | undefined;
       const entries = typeof manager?.getEntries === "function" ? manager.getEntries() : [];
@@ -2058,7 +2226,8 @@ export class ManagedChild {
           : Array.isArray(content)
             ? content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n")
             : "";
-        return extractChildMessageReceipt(text) === messageId;
+        const receipt = extractChildMessageReceipt(text);
+        return receipt?.id === message.id && receipt.revision === messageRevision(message);
       });
     } catch {
       return false;
@@ -2070,37 +2239,48 @@ export class ManagedChild {
     // reconnect scan of an existing transcript entry. Once that boundary is
     // observed, a later compaction may legitimately remove the original user
     // entry, so do not require a second transcript scan before ACKing.
-    const inFlight = this.childAckInFlight.get(message.id);
+    const latest = this.deliveryStates.get(message.id)?.message;
+    if (latest && messageRevision(latest) > messageRevision(message)) return this.deliverMessage(latest);
+    const revision = messageRevision(message);
+    const ackKey = `${message.id}\u0000${revision}`;
+    const inFlight = this.childAckInFlight.get(ackKey);
     if (inFlight) return inFlight;
     const manager = (this.session as any)?.sessionManager as { getEntries?: () => readonly any[] } | undefined;
-    let durableBoundary = boundary || this.persistedChildMessageIds.has(message.id);
-    if (!durableBoundary && typeof manager?.getEntries === "function" && this.hasPersistedChildMessage(message.id)) {
-      this.persistedChildMessageIds.add(message.id);
+    let durableBoundary = boundary || this.persistedChildMessageIds.get(message.id) === revision;
+    if (!durableBoundary && typeof manager?.getEntries === "function" && this.hasPersistedChildMessage(message)) {
+      this.persistedChildMessageIds.set(message.id, revision);
       durableBoundary = true;
     }
     if (!durableBoundary) return Promise.resolve();
     // Once a prior completion/settlement boundary recorded the ID, a later
     // compaction may legitimately remove that transcript entry. Do not make a
     // broker ACK retry depend on the entry still being present.
-    const operation = this.client.request("message.ack", { messageId: message.id })
-      .then(() => this.markMessageAcknowledged(message.id))
-      .catch(() => {
+    const operation = this.client.request("message.ack", { messageId: message.id, revision })
+      .then(() => this.markMessageAcknowledged(message))
+      .catch((error) => {
+        // The broker may have coalesced a newer payload before this ACK
+        // arrived. Keep the logical message pending and schedule the current
+        // revision for delivery.
+        if (error instanceof FabricError && error.code === "MESSAGE_REVISION_CONFLICT") {
+          const currentMessage = this.deliveryStates.get(message.id)?.message;
+          if (currentMessage && messageRevision(currentMessage) > revision) void this.deliverMessage(currentMessage);
+        }
         // Keep the accepted marker and broker copy for a later settlement or
         // reconnect retry. A lost ACK must never turn into message loss.
       })
       .finally(() => {
-        if (this.childAckInFlight.get(message.id) === operation) this.childAckInFlight.delete(message.id);
+        if (this.childAckInFlight.get(ackKey) === operation) this.childAckInFlight.delete(ackKey);
       });
-    this.childAckInFlight.set(message.id, operation);
+    this.childAckInFlight.set(ackKey, operation);
     return operation;
   }
 
   private async acknowledgePersistedChildMessages(): Promise<void> {
     for (const message of [...this.pendingChildAcks.values()]) {
-      if (!this.steeredChildMessageIds.has(message.id)) continue;
+      if (this.steeredChildMessageIds.get(message.id) !== messageRevision(message)) continue;
       const manager = (this.session as any)?.sessionManager as { getEntries?: () => readonly any[] } | undefined;
-      if (!this.persistedChildMessageIds.has(message.id) && typeof manager?.getEntries === "function" && !this.hasPersistedChildMessage(message.id)) continue;
-      this.persistedChildMessageIds.add(message.id);
+      if (this.persistedChildMessageIds.get(message.id) !== messageRevision(message) && typeof manager?.getEntries === "function" && !this.hasPersistedChildMessage(message)) continue;
+      this.persistedChildMessageIds.set(message.id, messageRevision(message));
       await this.acknowledgePersistedChildMessage(message, true);
     }
   }

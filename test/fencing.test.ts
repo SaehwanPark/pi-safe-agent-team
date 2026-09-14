@@ -173,3 +173,26 @@ test("foreign write fences protect against root host guard writes after the writ
   assert.equal(rootAllowed.allowed, true);
   assert.equal(rootAllowed.resourceId, "file:m.ts");
 });
+
+test("write quarantine survives coordinator restart until the old fence window expires", () => {
+  const { coordinator, now } = makeCoordinator();
+  setupWriterPair(coordinator);
+  coordinator.dispatch("writer", "resource.borrow", { resourceId: "file:a.ts", mode: "mutable", leaseMs: 1_000 });
+  const fence = coordinator.dispatch("writer", "resource.begin_write", { path: "a.ts", fenceMs: 20_000 }).value as WriteDecision;
+  const persisted = coordinator.exportState();
+  const restored = new Coordinator({ rootId: "fabric", clock: () => now.value });
+  restored.restoreState(persisted);
+
+  now.value = 6_001;
+  assert.throws(
+    () => restored.dispatch("other", "resource.borrow", { resourceId: "file:a.ts", mode: "mutable" }),
+    (error: unknown) => (error as { code?: string }).code === "RESOURCE_CONFLICT",
+  );
+  const inspected = restored.dispatch("root", "resource.inspect", { resourceId: "file:a.ts" }).value as { writeQuarantineUntil?: number };
+  assert.equal(inspected.writeQuarantineUntil, 21_000);
+
+  now.value = 21_001;
+  const granted = restored.dispatch("other", "resource.borrow", { resourceId: "file:a.ts", mode: "mutable" }).value as { status: string };
+  assert.equal(granted.status, "granted");
+  assert.equal(typeof fence.fenceId, "string");
+});
