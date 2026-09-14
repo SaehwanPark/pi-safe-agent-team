@@ -131,7 +131,7 @@ test("maintenance stales actors, releases claims, and expires reconnect reservat
   assert.equal(stale.status, "failed");
   assert.equal(stale.reconnectable, true);
   assert.equal(stale.taskId, spawned.taskId);
-  assert.equal(coordinator.dispatch("root", "task.show", { taskId: spawned.taskId }).value.owner, undefined);
+  assert.equal(coordinator.dispatch("root", "task.show", { taskId: spawned.taskId }).value.owner, spawned.agent.id);
   now.value = 1_302;
   coordinator.dispatch("root", "agent.heartbeat", {});
   coordinator.maintenance();
@@ -201,7 +201,7 @@ test("stale parent recovery fences and retires its complete descendant subtree",
   assert.equal(typeof retiredChild.recoveryExpiredAt, "number");
 });
 
-test("reconnectable parents retain broker failure notices from recovered children", () => {
+test("semantic child failures retain broker failure notices after recovery", () => {
   const now = { value: 1_000 };
   const coordinator = makeCoordinator({ maxTotalAgents: 8, agentHeartbeatTimeoutMs: 100, reconnectGraceMs: 500 }, now);
   registerRoot(coordinator);
@@ -210,6 +210,7 @@ test("reconnectable parents retain broker failure notices from recovered childre
 
   now.value = 1_101;
   coordinator.dispatch("root", "agent.heartbeat", {});
+  coordinator.dispatch(parent.agent.id, "agent.heartbeat", {});
   coordinator.maintenance();
   coordinator.dispatch(child.agent.id, "agent.register", {
     rootId: "fabric",

@@ -78,9 +78,7 @@ test("fresh root attachment drains messages left unacknowledged by the prior ses
     const secondMessages: Array<{ id: string; type: string }> = [];
     try {
       await secondRuntime.ensureRoot({} as ExtensionAPI, runtimeContext(directory, "session-2"), (message) => secondMessages.push({ id: message.id, type: message.type }));
-      assert.deepEqual(secondMessages.slice(0, firstMessages.length), firstMessages);
-      assert.equal(secondMessages.length, firstMessages.length + 1);
-      assert.equal(secondMessages.at(-1)?.type, "agent_failed");
+      assert.deepEqual(secondMessages, firstMessages);
     } finally {
       await secondRuntime.stop();
     }
@@ -160,7 +158,8 @@ test("a child reconnects with its credential and recovers an unacknowledged inbo
   try {
     await server1.start();
     await root.connect();
-    await root.request("agent.register", { rootId: "fabric", route, capabilities: { maySpawn: true, mayMessagePeers: true } });
+    const rootRegistration = await root.request<{ agent: AgentRecord; token: string }>("agent.register", { rootId: "fabric", route, capabilities: { maySpawn: true, mayMessagePeers: true } });
+    root.setIdentity("root", rootRegistration.token);
     const spawned = await root.request<{ agent: AgentRecord; token: string }>("agent.spawn", { route });
     child = new BrokerClient({ endpoint: server1.endpoint, agentId: spawned.agent.id, token: spawned.token });
     await child.connect();
@@ -169,6 +168,8 @@ test("a child reconnects with its credential and recovers an unacknowledged inbo
     await server1.stop();
     server2 = new BrokerServer({ directory, rootId: "fabric", maintenanceMs: 60_000 });
     await server2.start();
+    await root.reconnect();
+    await root.request("agent.register", { rootId: "fabric", route, token: rootRegistration.token });
     await child.reconnect();
     await child.request("agent.register", { rootId: "fabric", parentId: "root", route, token: spawned.token });
     const inbox = await child.request<Array<{ body: string }>>("message.inbox", {});
@@ -191,7 +192,8 @@ test("broker recovery reattaches a previously assigned task", async () => {
   try {
     await server1.start();
     await root.connect();
-    await root.request("agent.register", { rootId: "fabric", route, capabilities: { maySpawn: true, mayMessagePeers: true } });
+    const rootRegistration = await root.request<{ agent: AgentRecord; token: string }>("agent.register", { rootId: "fabric", route, capabilities: { maySpawn: true, mayMessagePeers: true } });
+    root.setIdentity("root", rootRegistration.token);
     const spawned = await root.request<{ agent: AgentRecord; token: string; taskId?: string }>("agent.spawn", { route, taskDescription: "recover this task" });
     assert.ok(spawned.taskId);
     child = new BrokerClient({ endpoint: server1.endpoint, agentId: spawned.agent.id, token: spawned.token });
@@ -200,6 +202,8 @@ test("broker recovery reattaches a previously assigned task", async () => {
     await server1.stop();
     server2 = new BrokerServer({ directory, rootId: "fabric", maintenanceMs: 60_000 });
     await server2.start();
+    await root.reconnect();
+    await root.request("agent.register", { rootId: "fabric", route, token: rootRegistration.token });
     await child.reconnect();
     const registered = await child.request<{ agent: AgentRecord }>("agent.register", { rootId: "fabric", parentId: "root", route, token: spawned.token });
     assert.equal(registered.agent.taskId, spawned.taskId);

@@ -70,7 +70,7 @@ A reconnecting actor may re-register only with the matching token/session identi
 
 The public tool/command layer maps to these operation families:
 
-- `agent.register`, `agent.update`, `agent.configure_child`, `agent.begin_turn`, `agent.end_turn`, `agent.finish_turn`, `agent.drain`, `agent.heartbeat`, `agent.cancel`, `agent.status`;
+- `agent.register`, `agent.update`, `agent.configure_child`, `agent.mark_artifacts_cleaned`, `agent.begin_turn`, `agent.end_turn`, `agent.finish_turn`, `agent.drain`, `agent.heartbeat`, `agent.cancel`, `agent.status`;
 - `agent.spawn`;
 - `message.send`, `message.reply`, `message.ack`, `message.inbox`, `message.list`;
 - `discover.agents`;
@@ -91,12 +91,12 @@ The broker may add internal operations, but unknown operations fail closed.
 
 ## Idempotent durable writes
 
-`agent.spawn` and `task.create` accept an optional `operationId` (a bounded, non-empty string, at most 128 characters, no NUL). It lets a client safely retry a write whose response was lost to an ambiguous transport failure, so a socket error after the broker already applied the mutation cannot silently produce a second child or task.
+`agent.spawn`, `task.create`, and `message.ack` accept an optional `operationId` (a bounded, non-empty string, at most 128 characters, no NUL). It lets a client safely retry a write whose response was lost to an ambiguous transport failure, so a socket error after the broker already applied the mutation cannot silently produce a second child, task, or acknowledgement.
 
 - The key is `(actor, operationId)`: one key addresses one logical request per actor, independent of the operation. Two actors may reuse the same `operationId` without collision.
 - A replay of the same actor + `operationId` + arguments returns the original response with `replayed: true` and creates nothing new.
 - Reusing an `operationId` for different arguments (or, for one actor, a different operation) raises `IDEMPOTENCY_CONFLICT`; it never returns the mismatched original response.
-- `operationId` is rejected with `INVALID_ARGUMENT` on any other operation, which are already deduplicated by message dedupe keys or are reads/claims with their own atomicity.
+- `operationId` is rejected with `INVALID_ARGUMENT` on any other operation, which are already deduplicated by message dedupe keys or are reads/claims with their own atomicity. A capacity-blocked `agent.begin_turn` is different: it journals a FIFO waiter and deliberately does not cache its provisional `started: false` response, so the same retry can observe a later grant.
 - The record is journaled atomically with the transaction that applied it and is restored on replay and checkpointing, within a bounded per-coordinator window (oldest records evicted first). A legacy committed transaction with no record is not deduplicated.
 - An ambiguous client failure (`BROKER_UNAVAILABLE`/`PERSISTENCE_FAILURE`) may be retried once under the same `operationId`; deterministic business errors are never retried.
 
@@ -120,7 +120,7 @@ Guarantees:
 - **no global ordering**: messages from different senders may interleave;
 - **request/reply correlation**: a request has one request ID and at most one accepted response;
 - **busy safety**: notification delivery is separate from the durable inbox, so an active model turn cannot discard a message; the host tracks in-flight/accepted ID/revision pairs so duplicate notifications do not execute a message twice;
-- **exact acknowledgement**: a new client acknowledges `(messageId, revision)`. The broker rejects a stale revision, so a host that persisted an older coalesced payload cannot acknowledge the newer payload accidentally. An omitted revision remains accepted only for revision-1 legacy records;
+- **exact acknowledgement**: a new client acknowledges `(messageId, revision)`. The broker rejects a stale revision, so a host that persisted an older coalesced payload cannot acknowledge the newer payload accidentally. An omitted revision remains accepted only for revision-1 legacy records; an ACK with a stable `operationId` replays its original success even if acknowledgement pruning removed the message before a retry;
 - **bounded retention**: the broker keeps recent message metadata/body within configured limits and reports truncation/retention in status. Messages addressed to permanently terminal actors become `abandonedAt` retention candidates without being presented as acknowledged.
 
 Acknowledgement means the Pi host accepted the exact `(messageId, revision)` payload into its session queue. It does not mean the model read or followed it. A model response is not a broker acknowledgement. Hosts should preserve the revision in their durable receipt and ACK payload.
@@ -179,11 +179,11 @@ Parent/child messages are always allowed when the actor retains the required cap
 
 An explicit `peerIds` entry is a narrow exception for that exact recipient and may be used without the broad peer capability. Descendant `peerIds` entries are intersected with the parent's explicit list; an empty list means no explicit exceptions, never a wildcard.
 
-`discover.agents(scope)` returns public metadata only: ID, role, task, route, status, and activity timestamps. It never returns a transcript.
+`discover.agents(scope)` returns public metadata only: ID, role, task, route, status, and activity timestamps. It accepts bounded `status`, `limit`, and `after` filters for pagination and never returns a transcript.
 
 ## Tasks
 
-Task claims are exclusive and atomic. A claim succeeds only if the task is ready and unowned (or already owned by the same actor). Dependencies must be completed. Completion stores a bounded structured result; child session output is not treated as an implicit task fact until the host submits it.
+Task claims are exclusive and atomic. A claim succeeds only if the task is ready and unowned (or already owned by the same actor); a reconnectable actor retains its task owner through recovery grace, so reassignment cannot race an uncertain session. Dependencies must be completed, including dependencies represented by retained task tombstones. Completion stores a bounded structured result; child session output is not treated as an implicit task fact until the host submits it.
 
 Cancellation releases active claims back to `pending` unless a caller explicitly marks the task failed. A task result is sent as a compact `task_result` message to the parent/creator. A model turn ending, assistant text, or session output never completes an assigned task; the worker must submit `task.update(action=complete, result=...)` explicitly. At turn end, durable task state maps to lifecycle (`completed`/`failed`/`cancelled`/`blocked`), otherwise the worker is merely `ready` or `waiting`.
 
@@ -219,15 +219,15 @@ starting -> ready -> running -> ready
                     +-> completed | failed | cancelled
 ```
 
-Terminal states are idempotent and permanently terminal. Only the explicit broker-recovery window is reconnectable: a broker restart marks live actors as reconnectable liveness failures, and a matching token may reattach them once. A reconnectable actor remains reserved/live for descendant completion, direct-child capacity, and parent topology until it reconnects or its grace expires; registration revalidates the parent, depth, and reserved child capacity. A cancelled/completed/non-recoverable failed actor cannot be revived by registration. `agent.drain` enters a restrictive shutdown phase without releasing claims; `agent.cancel` then terminalizes the target subtree child-first. Failed, cancelled, and stale-recovery parent transitions cascade across the complete descendant subtree, and completion is rejected while any reserved-live descendant remains. Cancellation releases task/resource runtime claims and is safe to repeat.
+Terminal states are idempotent and permanently terminal. Only the explicit broker-recovery window is reconnectable: a broker restart marks live actors as reconnectable liveness failures, and a matching token may reattach them once. A reconnectable actor remains reserved/live for descendant completion, direct-child capacity, and parent topology until it reconnects or its grace expires; registration revalidates the parent, depth, and reserved child capacity, and a descendant may reconnect only after every parent is active and non-recovering. A cancelled/completed/non-recoverable failed actor cannot be revived by registration. `agent.drain` enters a restrictive shutdown phase without releasing claims; `agent.cancel` then terminalizes the target subtree child-first. Failed, cancelled, and stale-recovery parent transitions cascade across the complete descendant subtree, and completion is rejected while any reserved-live descendant remains. Cancellation releases runtime resource claims and is safe to repeat; semantic task ownership survives temporary recovery and is released only at terminal retirement.
 
 ## Persistence and recovery
 
-Only the broker writes `events.jsonl`. Mutations are transaction-framed. Recovery applies committed transactions and ignores a partial trailing transaction. Broker restart marks previously live sessions as liveness-unknown/reconnectable, recovery-fences each complete live descendant subtree, releases runtime claims and requeues non-terminal task claims, and permits matching session identities to re-register once in parent-to-child topology. The broker skips new stale-agent reclamation on the first maintenance tick after a detected maintenance pause longer than the liveness window, giving managed hosts a heartbeat opportunity after laptop sleep or event-loop suspension. It does not fail pending clarification records. No model transcript is replicated in the broker journal.
+Only the broker writes `events.jsonl`. Mutations are transaction-framed. Recovery applies committed transactions and ignores a partial trailing transaction. Broker restart marks previously live sessions as liveness-unknown/reconnectable, recovery-fences each complete live descendant subtree, releases runtime claims while retaining non-terminal task ownership, and permits matching session identities to re-register only in active-parent-first topology. Temporary recovery is not a semantic `agent_failed` notice; grace expiry performs the terminal retirement and emits that notice. The broker skips new stale-agent reclamation on the first maintenance tick after a detected maintenance pause longer than the liveness window, giving managed hosts a heartbeat opportunity after laptop sleep or event-loop suspension. It does not fail pending clarification records. No model transcript is replicated in the broker journal.
 
-A reconnectable actor keeps its `maxTotalAgents` slot reserved while its reconnect window is open: new registrations and spawns are refused rather than allowed to evict an expected reconnection, and the reservation is released when the actor reconnects, resolves its turn, or is cancelled. `maxConcurrentAgents` bounds concurrently running turns and is deliberately not reserved; a turn start that finds the fabric full is retryable and reports a structured limit error.
+A reconnectable actor keeps its `maxTotalAgents` slot reserved while its reconnect window is open: new registrations and spawns are refused rather than allowed to evict an expected reconnection, and the reservation is released when the actor reconnects, resolves its turn, or is cancelled. `maxConcurrentAgents` and route capacities are enforced by durable FIFO model-turn tickets; a full turn start returns `queued: true`, and a targeted `slot_available` wake replaces 100 ms polling. The ticket is restored with the journal/checkpoint and is cancelled if its actor recovers or terminates.
 
-When recovery grace expires, the broker recursively retires the complete reserved subtree, marks unfinished messages to those actors as undeliverable (`abandonedAt`), and releases runtime claims. On a later runtime startup, terminal child workspaces whose recovery retirement has expired are offered to the configured workspace strategy for clean-only cleanup; dirty worktrees and their session history remain available as recovery artifacts.
+When recovery grace expires, the broker recursively retires the complete reserved subtree, releases unfinished task ownership, marks unfinished messages to those actors as undeliverable (`abandonedAt`), and emits semantic `agent_failed` notices. On a later runtime startup, terminal child workspaces whose recovery retirement has expired are offered to the configured workspace strategy only when clean and still at their recorded base commit; committed child branches and dirty worktrees remain available as recovery artifacts. A durable `artifactsCleanedAt` marker prevents already-handled workspace/session artifacts from being revisited.
 
 `agent.finish_turn` is the atomic recovery transition used by managed hosts for a
 provider/compaction outcome. It may update the assigned task (`taskAction: "block"`

@@ -14,7 +14,8 @@ Each message has a broker ID, revision, sender-local sequence, monotonic broker 
 - a notification is only a wake-up hint; `message.inbox` is the recovery source of truth;
 - the managed host tracks delivering, accepted, and acknowledged ID/revision pairs, so a notification plus inbox/reconnect replay cannot execute one message twice in the same host process;
 - a managed child acknowledges only after its Pi `SessionManager` contains the corresponding exact `<safe-agents-message id="…" revision="…"/>` receipt and the queued prompt has settled; lightweight embedding sessions without a transcript manager use prompt settlement as their only available boundary;
-- an ACK identifies the exact broker ID and revision accepted by the Pi session. An older revision cannot acknowledge a newer coalesced payload; legacy messages at revision 1 may omit the revision field.
+- an ACK identifies the exact broker ID and revision accepted by the Pi session. An older revision cannot acknowledge a newer coalesced payload; legacy messages at revision 1 may omit the revision field;
+- ACKs may carry a stable per-recipient `operationId` (`ack:<recipient>:<messageId>:<revision>`). The broker journals the acknowledgement and its replay response, so a lost ACK response remains retryable after message retention prunes the acknowledged record;
 - acknowledgement means the host/session durably accepted the message, not that the model obeyed it.
 
 Busy workers receive a notification while their current turn continues. The host queues a steer/follow-up or starts a later prompt and retains the broker copy until the session transcript boundary is crossed. If queueing or persistence fails, the broker message remains unacknowledged and reconnect recovery will retry it.
@@ -43,11 +44,11 @@ The coordinator never awaits the parent or child model. The request record stays
 
 Parent/child messages are always available to the relationship. Peer messages require `mayMessagePeers` plus a scoped relationship: siblings, common task ancestry, or root authorization; a narrow explicit `peerIds` exception can authorize one exact peer. Child `peerIds` are intersected with the parent's explicit list and an empty list means none. `message.list` is conversation-private for workers (`from == self` or `to == self`); only a root's explicit `scope=all` request is an audit projection. Discovery returns metadata only and never copies a transcript.
 
-A root may use `/agents inbox` to inspect its pending messages. A worker can call `agent_inbox` and `agent_ack`; the child host also delivers broker notifications into the Pi session automatically.
+A root may use `/agents inbox` to inspect its pending messages. A worker can call `agent_inbox` and `agent_ack(messageId, revision)`; the child host also delivers broker notifications into the Pi session automatically. Inbox/discovery/task projections are bounded and support cursors where a long-lived fabric has more records than one response.
 
 ## Cancellation and failures
 
-Cancellation is idempotent. It does not delete unacknowledged messages or journal history. Pending requests get a visible failed/cancelled state, runtime holds are released, and parent notifications are compact. Messages addressed to a permanently terminal actor become explicitly abandoned for retention once they can no longer be delivered; this preserves the distinction between session acceptance and retention cleanup. A failed child does not block its parent indefinitely.
+Cancellation is idempotent. It does not delete unacknowledged messages or journal history. Pending requests get a visible failed/cancelled state, runtime holds are released, and parent notifications are compact. Messages addressed to a permanently terminal actor become explicitly abandoned for retention once they can no longer be delivered; this preserves the distinction between session acceptance and retention cleanup. Terminal agents, tasks, and resolved requests are later compacted into bounded tombstones. A failed child does not block its parent indefinitely.
 
 ## Practical guidance
 

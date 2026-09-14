@@ -355,7 +355,10 @@ export class BrokerServer {
     if (!actorId) {
       return { id: request.id, version: PROTOCOL_VERSION, ok: false, error: new FabricError("IDENTITY_CONFLICT", "connection is not authenticated").toJSON() };
     }
-    const before = this.coordinator.exportState();
+    // Coordinator read projections are immutable and need no rollback copy.
+    // For mutations this is the single snapshot shared with dispatch(), which
+    // avoids cloning the complete fabric twice for one broker request.
+    const before = Coordinator.isReadOnlyOperation(request.op) ? undefined : this.coordinator.exportState();
     let response: ResponseFrame;
     try {
       if (request.args !== undefined && (!request.args || typeof request.args !== "object" || Array.isArray(request.args))) {
@@ -364,7 +367,7 @@ export class BrokerServer {
       if (request.op === "agent.register" && request.args?.parentId && !this.coordinator.getAgent(actorId)) {
         throw new FabricError("IDENTITY_CONFLICT", "child registration requires a coordinator-issued identity and reconnect credential");
       }
-      const result = this.coordinator.dispatch(actorId, request.op, request.args ?? {});
+      const result = this.coordinator.dispatch(actorId, request.op, request.args ?? {}, before);
       if (result.events.length > 0 || result.idempotency !== undefined) {
         await this.journal.append(result.events, result.idempotency);
         this.transactionsSinceCheckpoint += 1;
@@ -373,7 +376,7 @@ export class BrokerServer {
       response = { id: request.id, version: PROTOCOL_VERSION, ok: true, result: result.value };
       this.broadcast(result.events);
     } catch (error) {
-      this.coordinator.restoreState(before);
+      if (before) this.coordinator.restoreState(before);
       response = { id: request.id, version: PROTOCOL_VERSION, ok: false, error: asFabricError(error, "PERSISTENCE_FAILURE").toJSON() };
     }
     this.cacheResponse(cacheKey, response);
@@ -450,6 +453,18 @@ export class BrokerServer {
         return observer.depth === 0 || event.agent.id === actorId || event.agent.parentId === actorId || observer.parentId === event.agent.id;
       case "slot_available":
         return event.agentId === actorId;
+      case "model_turn_waiting":
+        return event.waiter.agentId === actorId;
+      case "model_turn_granted":
+      case "model_turn_cancelled":
+        return event.agentId === actorId;
+      case "agent_archived":
+      case "task_archived":
+      case "request_archived":
+      case "agent_archive_pruned":
+      case "task_archive_pruned":
+      case "request_archive_pruned":
+        return observer.depth === 0;
       case "diagnostic":
         return observer.depth === 0;
     }

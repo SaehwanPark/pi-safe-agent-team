@@ -48,7 +48,8 @@
     "smoke:pi:with-lcm": "bash scripts/smoke-isolated-pi.sh with-lcm",
     "smoke:pi:integration": "bash scripts/smoke-isolated-pi.sh integration",
     "example:core": "node --experimental-strip-types examples/core-demo.ts",
-    "example:broker": "node --experimental-strip-types examples/broker-demo.ts"
+    "example:broker": "node --experimental-strip-types examples/broker-demo.ts",
+    "bench:r7": "node --experimental-strip-types bench/r7-long-run.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": ">=0.85.0",

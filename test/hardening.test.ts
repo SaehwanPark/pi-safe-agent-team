@@ -224,6 +224,7 @@ test("failed task owners are released while completed task ownership remains dur
 test("terminal agents cannot reconnect, while the explicit broker-recovery window can", () => {
   const coordinator = makeCoordinator();
   registerRoot(coordinator);
+  const rootToken = coordinator.exportState().agents.find((agent) => agent.id === "root")?.authToken;
   const completed = registerChildWithToken(coordinator, "completed");
   coordinator.dispatch(completed.agent.id, "agent.begin_turn", {});
   coordinator.dispatch(completed.agent.id, "agent.end_turn", { status: "completed" });
@@ -241,6 +242,7 @@ test("terminal agents cannot reconnect, while the explicit broker-recovery windo
 
   const recoverable = registerChildWithToken(coordinator, "recoverable");
   coordinator.recover();
+  coordinator.dispatch("root", "agent.register", { rootId: "fabric", route, token: rootToken });
   assert.equal(coordinator.dispatch(recoverable.agent.id, "agent.register", { rootId: "fabric", parentId: "root", route, token: recoverable.token }).value.agent.status, "ready");
 });
 

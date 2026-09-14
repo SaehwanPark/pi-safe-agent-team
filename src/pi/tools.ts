@@ -127,17 +127,30 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
     {
       name: "agent_ack",
       label: "Agent acknowledge",
-      description: "Acknowledge a message after accepting it into the agent's work queue.",
-      parameters: Type.Object({ messageId: Type.String() }),
+      description: "Acknowledge a message after accepting it into the agent's work queue. Echo the exact messageId and revision returned by agent_inbox.",
+      parameters: Type.Object({
+        messageId: Type.String(),
+        revision: Type.Optional(Type.Number({ description: "Exact payload revision returned by agent_inbox; required for coalesced revisions" })),
+      }),
       async execute(_toolCallId, params: any): Promise<AgentToolResult<unknown>> {
-        return textResult(await client.request("message.ack", params));
+        const revision = params.revision === undefined ? 1 : params.revision;
+        const args = { ...params, ...(params.revision === undefined ? {} : { revision }) };
+        const operationId = `ack:${params.messageId}:${revision}`;
+        if (typeof client.requestIdempotent === "function") {
+          try {
+            return textResult(await client.requestIdempotent("message.ack", args, operationId));
+          } catch (error) {
+            if (!(error instanceof FabricError) || error.code !== "INVALID_ARGUMENT" || !/operationId.*supported/i.test(error.message)) throw error;
+          }
+        }
+        return textResult(await client.request("message.ack", args));
       },
     },
     {
       name: "agent_discover",
       label: "Agent discover",
-      description: "Inspect bounded metadata for the parent, children, siblings, task peers, or authorized agents.",
-      parameters: Type.Object({ scope: Type.Optional(Type.String()) }),
+      description: "Inspect bounded metadata for the parent, children, siblings, task peers, or authorized agents. Use limit/after to page through large fabrics.",
+      parameters: Type.Object({ scope: Type.Optional(Type.String()), status: Type.Optional(Type.String()), limit: Type.Optional(Type.Number()), after: Type.Optional(Type.String()) }),
       async execute(_toolCallId, params: any): Promise<AgentToolResult<unknown>> {
         return textResult(await client.request("discover.agents", params));
       },
@@ -163,7 +176,7 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
     {
       name: "agent_task",
       label: "Agent task",
-      description: "Create, claim, inspect, complete, block, reopen, cancel, or list deterministic task-board records.",
+      description: "Create, claim, inspect, complete, block, reopen, cancel, or page through deterministic task-board records.",
       parameters: Type.Object({
         action: Type.String(),
         taskId: Type.Optional(Type.String()),
@@ -171,6 +184,9 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
         owner: Type.Optional(Type.String()),
         parentTaskId: Type.Optional(Type.String()),
         dependencies: Type.Optional(Type.Array(Type.String())),
+        status: Type.Optional(Type.String()),
+        limit: Type.Optional(Type.Number()),
+        after: Type.Optional(Type.String()),
         reason: Type.Optional(Type.String()),
         result: Type.Optional(Type.Object({ summary: Type.Optional(Type.String()), output: Type.Optional(Type.String()) })),
         scope: Type.Optional(Type.String()),

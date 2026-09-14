@@ -30,6 +30,8 @@ const CONFIG_KEYS = new Set<keyof FabricConfig>([
   "agentHeartbeatTimeoutMs",
   "reconnectGraceMs",
   "messageRetention",
+  "historyRetentionMs",
+  "maxArchivedRecords",
   "modelRouteCapacity",
   "modelRoutePolicies",
   "modelRouteCapacities",

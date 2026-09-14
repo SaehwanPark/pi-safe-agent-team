@@ -48,7 +48,7 @@ Pi root extension / managed child sessions
 
 `src/core/coordinator.ts` is synchronous and owns all mutable coordination state. The broker invokes one operation at a time, so a task claim, resource acquisition, transfer, or message send is an atomic state transition. It returns a result plus internal events; it never trusts an agent-supplied sender field. The class remains a single transaction boundary intentionally: splitting the maps across services would reintroduce cross-component locking; transport, policy, and Pi-operation guards are kept outside it instead.
 
-The coordinator uses plain serializable state internally. `exportState()`/`restoreState()` are used for the broker's transaction rollback path, journal recovery, and tests; active in-memory fence records are intentionally recreated empty, while their resource restart quarantines are serializable. Public records are defensive copies. Capability ceilings are intersections: explicit peer/resource grants cannot be widened by a child, and an empty explicit peer list means no exception.
+The coordinator uses plain serializable state internally. `exportState()`/`restoreState()` are used for the broker's transaction rollback path, journal recovery, and tests; active in-memory fence records are intentionally recreated empty, while their resource restart quarantines are serializable. Public records are defensive copies. Pure read projections skip rollback snapshots; broker mutations pass one shared snapshot into the coordinator rather than cloning the world twice. Terminal agents, tasks, and resolved requests move to bounded compact tombstones after the configured retention horizon, preserving identity/dependency safety without growing hot state forever. Capability ceilings are intersections: explicit peer/resource grants cannot be widened by a child, and an empty explicit peer list means no exception.
 
 ### `BrokerServer` and `FabricClient`
 
@@ -63,7 +63,7 @@ event(txId, ...)
 commit(txId)
 ```
 
-Recovery replays only committed transactions and ignores an incomplete final transaction. When an `event` record carries a write-idempotency record, its dedup entry is restored on commit alongside the events, so an ambiguous client retry after restart still resolves to the original response. The broker is the sole journal writer; agents never edit state files.
+Recovery replays only committed transactions and ignores an incomplete final transaction. When an `event` record carries a write-idempotency record, its dedup entry is restored on commit alongside the events, so an ambiguous client retry after restart still resolves to the original response. ACKs use the same bounded durable replay path, including after the acknowledged message has been pruned. Capacity-blocked model turns persist FIFO tickets and receive a targeted wake when a slot is granted. The broker is the sole journal writer; agents never edit state files.
 
 ### `FabricRuntime` and `AgentHandle`
 
@@ -97,7 +97,7 @@ Root capabilities such as web access, browser automation, MCP tools, and compute
 ### Extension interop and embedded context
 
 A process-local interop registry via `Symbol.for("pi.extension-interop.v1")` allows safe cooperation between extensions without hard dependencies:
-- **`safe-agent-team.fabric-state.v1`**: The fabric runtime exports a deterministic and conservative state snapshot (`quiescent: boolean`, `state: "known" | "uncertain"`, `sessionReplacementSafe: boolean`, active tasks, unowned tasks, reconnecting agents, mutable holds, write fences, restart quarantines, pending requests in either root direction, `rootCompactionInFlight`, and root context health/diagnostic). Root manual/automatic/embedded compaction keeps replacement unsafe until its terminal hook; root session replacement (`session_shutdown`) cancels managed child agents. Companion context managers consume this to defer destructive compaction, semantic resets, or root session rewinds until `sessionReplacementSafe === true`.
+- **`safe-agent-team.fabric-state.v1`**: The fabric runtime exports a deterministic and conservative state snapshot (`quiescent: boolean`, `state: "known" | "uncertain"`, `sessionReplacementSafe: boolean`, active tasks, unowned tasks, reconnecting agents, pending model-turn admissions, mutable holds, write fences, restart quarantines, pending requests in either root direction, `rootCompactionInFlight`, and root context health/diagnostic). Root manual/automatic/embedded compaction keeps replacement unsafe until its terminal hook; root session replacement (`session_shutdown`) cancels managed child agents. Companion context managers consume this to defer destructive compaction, semantic resets, or root session rewinds until `sessionReplacementSafe === true`.
 - **`pi-local-context-manager.embedded-context.v1`** (legacy alias `local-context-manager.embedded-context.v1`): When present, `ManagedChild` obtains an embedded context controller. It applies adaptive output reduction and turn compaction to child tool outputs while retaining `noExtensions: true`. Options distinguish `logicalContextWindow` from an optional effective prefill budget, and compaction instructions are delegated as `string | undefined` to upstream Pi's `AgentSession.compact(customInstructions?: string)`. Any provider failure deactivates the controller while retaining its reference and manager-owned recovery files, synchronizes to the coordinator with `agent.update({ contextMode: "native" })`, and exposes a bounded diagnostic; final child shutdown calls `dispose()` for cleanup.
 
 ### Model-route capacity and turn outcomes
@@ -106,8 +106,9 @@ The coordinator's global `maxConcurrentAgents` limit is not a proxy for model-ru
 memory. `modelRoutePolicies` therefore add a provider/model capacity and optional
 effective prefill budget. The process-local FIFO `ModelRouteCapacityArbiter` gates
 managed-child generations and compaction on the same route; the coordinator enforces
-the durable route slot for cross-process state. Local providers default to one heavy
-operation. Pi terminal responses are classified by `src/pi/turn-outcome.ts`, keeping
+the durable route slot for cross-process state and retains FIFO tickets when a slot is full. A
+slot grant emits a targeted wake, so hosts do not poll every 100 ms. Local providers
+default to one heavy operation. Pi terminal responses are classified by `src/pi/turn-outcome.ts`, keeping
 logical context overflow separate from structured prefill/KV pressure and runtime
 memory pressure. Capacity gets one bounded retry; exhausted or failed recovery blocks
 the task with a parent-visible diagnostic and preserves the session for explicit
@@ -148,7 +149,7 @@ Guarded Pi writes participate in borrowing and fencing. Root shell remains a tru
 
 ### Workspaces
 
-`src/workspace.ts` is a small pluggable strategy boundary. `shared` uses the caller's cwd. Explicit `worktree` mode requires a clean Git checkout and creates a detached managed worktree from a safe base ref. Worktree paths and branches are recorded in agent metadata. Child shutdown reclaims a worktree only when it is clean and the session abort completes; dirty or uncertain artifacts remain inspectable and require explicit cleanup. On a later root startup, the runtime asks the strategy to clean workspaces belonging to recovery-retired terminal children after their grace window, while preserving any workspace for which the strategy reports a dirty or uncertain state and removing the matching child session directory only after workspace cleanup succeeds.
+`src/workspace.ts` is a small pluggable strategy boundary. `shared` uses the caller's cwd. Explicit `worktree` mode requires a clean Git checkout and creates a managed worktree from a resolved base commit. Worktree paths and branches are recorded in agent metadata. Child shutdown reclaims a worktree only when it is clean **and** `HEAD === baseRef` after the session abort completes; a clean branch containing child commits, dirty state, or uncertainty remains inspectable and requires explicit cleanup. On a later root startup, the runtime asks the strategy to clean workspaces belonging to recovery-retired terminal children after their grace window, while preserving any workspace for which the strategy reports a dirty, divergent, or uncertain state and removing the matching child session directory only after workspace cleanup succeeds. A durable `artifactsCleanedAt` marker prevents successful cleanup from being revisited.
 
 ## State and data flow
 
@@ -164,11 +165,11 @@ Guarded Pi writes participate in borrowing and fencing. Root shell remains a tru
 - model lookup/auth/session creation failure: child spawn fails and the coordinator-created identity is cancelled/released;
 - broker failure: clients report a structured unavailable error and reconnect; only `agent.spawn`/`task.create` retry automatically, once, under the same `operationId`, so an ambiguous failure replays instead of duplicating; a broker restart recovery-fences each live subtree, preserves pending semantic requests, marks actors reconnectable for one matching-token reattach, and keeps their capacity slots reserved until they reconnect, resolve, or are cancelled; a delayed maintenance tick after a detected event-loop pause skips new stale transitions once so live hosts can heartbeat;
 - malformed journal tail: committed transactions before the tail remain usable; the tail is ignored and surfaced in diagnostics;
-- child crash: host marks it failed, releases task/resource runtime state, and sends a compact `agent_failed` notice to its parent; notices to a reconnectable parent remain durable until that parent reconnects or its recovery window expires;
+- child crash: a semantic provider/session failure marks it failed, releases task/resource runtime state, and sends a compact `agent_failed` notice to its parent; transport loss or broker recovery is represented as reconnectable liveness state without a semantic failure notice, while grace expiry emits the failure notice when the actor is actually retired;
 - parent shutdown: the managed subtree is cancelled, leases are released, and the broker retains bounded audit metadata;
 - cancellation: idempotently drains and aborts the Pi session, releases task/resource/mailbox waits, and cascades across the descendant tree;
 - limits: spawn returns a structured limit error; it never recursively retries or silently creates an unbounded worker.
-- recovery cleanup: grace expiry recursively retires a stale subtree, marks messages to permanently terminal actors as undeliverable for retention, and lets a fresh runtime reclaim clean abandoned worktrees and session directories when no live or recovering actor references them.
+- recovery cleanup: grace expiry recursively retires a stale subtree, releases unfinished task ownership only at that terminal boundary, marks messages to permanently terminal actors as undeliverable for retention, and lets a fresh runtime reclaim only clean-at-base abandoned worktrees and session directories when no live or recovering actor references them.
 
 ## Pi-native integration decisions
 
@@ -189,13 +190,13 @@ Guarded Pi writes participate in borrowing and fencing. Root shell remains a tru
 7. Per-sender message sequence is FIFO; no global ordering is promised.
 8. Asking for a reply changes agent state to `waiting`; it never blocks the broker or parent turn, and broker restart does not discard the pending request.
 9. Expired/dead agent leases are reclaimable and cannot permanently lock resources; broker-recovery liveness failures are reconnectable once, while semantic terminal states are not; a reconnectable actor is reserved/live for subtree completion, parent topology, and child capacity until its recovery right ends, and its `maxTotalAgents` slot stays reserved during the window so new agents cannot evict it.
-10. Cancellation is idempotent and releases runtime-owned task/resource state.
+10. Cancellation is idempotent and releases runtime-owned resource state; a reconnectable actor retains semantic task ownership until its recovery grace expires or it reconnects.
 11. A child cannot exceed depth, child-count, total-agent, or capability limits.
 12. An explicit model route wins over role/default/inheritance and never silently changes provider.
 13. Model-generated payloads cannot set `from`, capabilities, ownership, or task authorship.
-14. Incoming messages are retained until the exact payload revision is accepted and acknowledged; busy receivers do not drop them, coalesced updates cannot be acknowledged by an older receipt, and same-sender inbox replay is ordered by `senderSequence` rather than timestamps or random IDs. Messages to permanently terminal actors become explicitly undeliverable and remain retention-eligible without being mislabeled as accepted.
-15. Root status is a bounded projection and does not copy unrelated transcripts into model context.
-16. `agent.spawn`/`task.create` carrying an `operationId` apply at most once per `(actor, operationId)`; a matching retry replays the original response, a mismatch fails `IDEMPOTENCY_CONFLICT`, and the record is journaled with its transaction (bounded window, oldest evicted).
+14. Incoming messages are retained until the exact payload revision is accepted and acknowledged; busy receivers do not drop them, coalesced updates cannot be acknowledged by an older receipt, ACK commit/retry is replay-safe even after pruning, and same-sender inbox replay is ordered by `senderSequence` rather than timestamps or random IDs. Messages to permanently terminal actors become explicitly undeliverable and remain retention-eligible without being mislabeled as accepted.
+15. Root status is a bounded projection and does not copy unrelated transcripts into model context; task/discovery lists support bounded filtering and pagination, and terminal history is archived into bounded tombstones.
+16. `agent.spawn`/`task.create`/`message.ack` carrying an `operationId` apply at most once per `(actor, operationId)`; a matching retry replays the original response, a mismatch fails `IDEMPOTENCY_CONFLICT`, and the record is journaled with its transaction (bounded window, oldest evicted). A queued `agent.begin_turn` keeps its durable ticket rather than pinning a provisional false response.
 17. The idempotency window is bounded and durability-scoped: it is restored on replay/checkpoint within the window, but it never reconstructs pre-hardening committed transactions that lack a record.
 18. Enforced path identity is the resolved filesystem path: guarded write boundaries resolve symlinks, junctions, and alternate spellings (nearest-existing-ancestor realpath, Windows case-folding in policy keys) before asking `resource.check_write`, so one writer cannot sidestep another actor's hold through an alias. The broker itself stays filesystem-agnostic; unresolvable targets fail closed, and an alias that escapes the workspace is simply not fabric-coordinated for the root while always denied for managed children.
 

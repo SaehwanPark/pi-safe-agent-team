@@ -114,6 +114,8 @@ export interface FabricStateSnapshotV1 {
   activeWriteQuarantines: number;
   pendingRootRequests: number;
   pendingRootDeliveries: number;
+  /** Model turns waiting for durable global/route capacity admission. */
+  pendingModelTurns?: number;
   /** True while Pi is performing manual/automatic root compaction. */
   rootCompactionInFlight?: boolean;
   /** Root provider health gate after an exhausted model/context outcome. */
