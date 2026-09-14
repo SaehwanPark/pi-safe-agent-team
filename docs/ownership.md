@@ -19,6 +19,8 @@ Two resources overlap when they are equal or one is an ancestor of the other; de
 
 A parent grant applies to descendants. A child may inspect a resource only with a read grant, ownership, or a current hold.
 
+Resources have an explicit lifecycle. A fabric root may call `resource.retire` only after the resource has no shared/mutable holds, waiters, write quarantine, active fence, or active child resources. Retirement is durable and keeps the record inspectable for audit/version references, but rejects new grants, claims, borrows, transfers, and child definitions.
+
 ## Typical flow
 
 ```text
@@ -31,7 +33,7 @@ child: resource.borrow(module:parser, mutable, wait=true)
 child: edit/write(path=src/parser.ts)  # host checks the mutable hold at write time
 ```
 
-If a mutable request conflicts, the broker returns `waiting` plus a request ID. It does not pretend that a write succeeded. Waiters are FIFO by enqueue time and receive a durable `resource_granted` message when a release or lease expiry makes the request grantable.
+If a mutable request conflicts, the broker returns `waiting` plus a request ID. It does not pretend that a write succeeded. Waiters are FIFO by enqueue time and receive a durable `resource_granted` message when a release or lease expiry makes the request grantable. Model-turn capacity uses the same distinction: a durable grant reserves a slot while the host remains `ready`, and only the matching host retry changes the actor to `running`.
 
 ## Transfer and handoff
 

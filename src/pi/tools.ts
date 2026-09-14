@@ -58,6 +58,8 @@ const sharedResourceFields = {
   version: Type.Optional(Type.Number()),
   leaseId: Type.Optional(Type.String({ description: "Lease returned by resource.borrow; the precise selector for resource.release" })),
   all: Type.Optional(Type.Boolean({ description: "resource.release only: release every hold this actor currently has (exactly one selector is required)" })),
+  limit: Type.Optional(Type.Number({ description: "List operations only: maximum records to return" })),
+  after: Type.Optional(Type.String({ description: "List operations only: stable cursor returned by a prior page" })),
 };
 
 export function createCoordinationTools(options: CoordinationToolOptions): ToolDefinition[] {
@@ -205,11 +207,11 @@ export function createCoordinationTools(options: CoordinationToolOptions): ToolD
     {
       name: "agent_resource",
       label: "Agent resource",
-      description: "Define, inspect, snapshot, claim, borrow, transfer, grant, release, or check a hierarchical resource.",
+      description: "Define, inspect, snapshot, retire, claim, borrow, transfer, grant, release, or check a hierarchical resource.",
       parameters: Type.Object({ action: Type.String(), ...sharedResourceFields }),
       async execute(_toolCallId, params: any): Promise<AgentToolResult<unknown>> {
         const { action, ...rest } = params;
-        const operation = action === "define" ? "resource.define" : action === "inspect" ? "resource.inspect" : action === "snapshot" ? "resource.snapshot" : action === "grant" ? "resource.grant" : action === "claim" || action === "own" ? "resource.claim" : action === "borrow" ? "resource.borrow" : action === "transfer" ? "resource.transfer" : action === "release" ? "resource.release" : action === "check_write" ? "resource.check_write" : action === "list" ? "resource.list" : undefined;
+        const operation = action === "define" ? "resource.define" : action === "inspect" ? "resource.inspect" : action === "snapshot" ? "resource.snapshot" : action === "retire" ? "resource.retire" : action === "grant" ? "resource.grant" : action === "claim" || action === "own" ? "resource.claim" : action === "borrow" ? "resource.borrow" : action === "transfer" ? "resource.transfer" : action === "release" ? "resource.release" : action === "check_write" ? "resource.check_write" : action === "list" ? "resource.list" : undefined;
         if (!operation) throw new FabricError("INVALID_ARGUMENT", `Unknown resource action ${action}`);
         return textResult(await client.request(operation, rest));
       },

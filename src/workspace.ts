@@ -18,6 +18,8 @@ export interface WorkspaceRequest {
 export interface WorkspaceStrategy {
   create(request: WorkspaceRequest): Promise<WorkspaceInfo>;
   cleanup(info: WorkspaceInfo, force?: boolean): Promise<void>;
+  /** Optional metadata probe used when useful external artifacts are retained. */
+  describe?(info: WorkspaceInfo): Promise<{ headRef?: string }>;
 }
 
 function safeSegment(value: string): string {
@@ -64,6 +66,15 @@ export class GitWorkspaceStrategy implements WorkspaceStrategy {
       throw error;
     }
     return { mode: "worktree", root, path, baseRef, branch };
+  }
+
+  async describe(info: WorkspaceInfo): Promise<{ headRef?: string }> {
+    if (info.mode !== "worktree") return {};
+    try {
+      return { headRef: await git(info.path, ["rev-parse", "HEAD"]) };
+    } catch {
+      return {};
+    }
   }
 
   async cleanup(info: WorkspaceInfo, force = false): Promise<void> {
