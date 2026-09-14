@@ -7,6 +7,7 @@ import { FabricError, asFabricError } from "../core/errors.ts";
 import { Coordinator } from "../core/coordinator.ts";
 import type { CoordinatorEvent, FabricConfig } from "../core/types.ts";
 import { Journal } from "./journal.ts";
+import { AckProofStore } from "./ack-proof-store.ts";
 import { RetainedArtifactStore } from "./artifact-store.ts";
 
 export const PROTOCOL_VERSION = 1;
@@ -180,6 +181,7 @@ export class BrokerServer {
   readonly endpoint: string;
   readonly coordinator: Coordinator;
   readonly journal: Journal;
+  readonly ackProofStore: AckProofStore;
   readonly retainedArtifactStore: RetainedArtifactStore;
 
   private readonly server = net.createServer((socket) => this.accept(socket));
@@ -195,12 +197,14 @@ export class BrokerServer {
   private stopping = false;
   private readonly rawConfig?: Partial<FabricConfig>;
   private readonly autoCoordinator: boolean;
+  private readonly initialAckProofs: ReturnType<Coordinator["exportAckProofs"]>;
   private readonly checkpointTransactions: number;
   private readonly checkpointBytes: number;
   private readonly wallClock: () => number;
   private transactionsSinceCheckpoint = 0;
   private lastMaintenanceTickAt?: number;
   private retainedArtifactManifestDirty = false;
+  private ackProofStoreDirty = false;
 
   constructor(options: BrokerServerOptions) {
     this.directory = options.directory;
@@ -208,7 +212,10 @@ export class BrokerServer {
     this.endpoint = options.endpoint ?? defaultEndpoint(options.directory);
     this.rawConfig = options.config;
     this.autoCoordinator = options.coordinator === undefined;
-    this.coordinator = options.coordinator ?? new Coordinator({ rootId: options.rootId, rootAgentId: options.rootAgentId, config: resolveBrokerConfig(options) });
+    this.ackProofStore = new AckProofStore({ directory: options.directory });
+    this.initialAckProofs = options.coordinator?.exportAckProofs() ?? [];
+    this.coordinator = options.coordinator ?? new Coordinator({ rootId: options.rootId, rootAgentId: options.rootAgentId, config: resolveBrokerConfig(options), ackProofs: this.ackProofStore });
+    if (options.coordinator) this.coordinator.setAckProofs(this.ackProofStore);
     this.journal = options.journal ?? new Journal({ directory: options.directory });
     this.retainedArtifactStore = new RetainedArtifactStore({ directory: options.directory });
     const requestedMaintenanceMs = options.maintenanceMs ?? this.coordinator.config.heartbeatMs;
@@ -229,15 +236,27 @@ export class BrokerServer {
       this.coordinator.setCaseInsensitivePaths(detectCaseInsensitivePaths(this.policyRoot));
     }
     try {
+      await this.ackProofStore.open();
+      this.ackProofStore.queue(this.initialAckProofs);
       await this.retainedArtifactStore.open();
       this.coordinator.restoreRetainedArtifacts(this.retainedArtifactStore.records());
-      await this.journal.replay(this.coordinator);
+      const replay = await this.journal.replay(this.coordinator, {
+        onCheckpoint: (state) => this.ackProofStore.queue(state.acknowledgedMessages ?? []),
+        onCommittedEvents: (events) => this.ackProofStore.queueFromEvents(events),
+      });
+      await this.flushAckProofStoreOrThrow();
       await this.syncRetainedArtifactManifest();
       this.transactionsSinceCheckpoint = 0;
       const recovery = this.coordinator.recover();
       if (recovery.events.length > 0) {
         await this.journal.append(recovery.events);
         this.transactionsSinceCheckpoint += 1;
+      }
+      // A v0.2.x checkpoint is explicitly migrated in memory and replaced by a
+      // v2 checkpoint before this broker exposes the state to new clients.
+      if (replay.migrated && !this.ackProofStoreDirty && !this.retainedArtifactManifestDirty) {
+        await this.journal.checkpoint(this.coordinator.exportState({ includeRetainedArtifacts: false }));
+        this.transactionsSinceCheckpoint = 0;
       }
       if (platform() !== "win32") {
         try {
@@ -288,8 +307,9 @@ export class BrokerServer {
     // replace the journal with an artifact-omitting checkpoint while the cold
     // manifest is dirty; replay must retain the event until the manifest write
     // succeeds.
+    await this.syncAckProofStore();
     await this.syncRetainedArtifactManifest();
-    if (!this.retainedArtifactManifestDirty) {
+    if (!this.ackProofStoreDirty && !this.retainedArtifactManifestDirty) {
       await this.journal.checkpoint(this.coordinator.exportState({ includeRetainedArtifacts: false })).catch(() => undefined);
     }
     this.transactionsSinceCheckpoint = 0;
@@ -395,6 +415,10 @@ export class BrokerServer {
         await this.journal.append(result.events, result.idempotency);
         this.transactionsSinceCheckpoint += 1;
         if (hasRetainedArtifactEvents(result.events) || this.retainedArtifactManifestDirty) await this.syncRetainedArtifactManifest();
+        if (hasAckProofEvents(result.events) || this.ackProofStoreDirty) {
+          this.ackProofStore.queueFromEvents(result.events);
+          await this.syncAckProofStore();
+        }
         await this.maybeCheckpoint();
       }
       response = { id: request.id, version: PROTOCOL_VERSION, ok: true, result: result.value };
@@ -427,6 +451,10 @@ export class BrokerServer {
         await this.journal.append(result.events);
         this.transactionsSinceCheckpoint += 1;
         if (hasRetainedArtifactEvents(result.events) || this.retainedArtifactManifestDirty) await this.syncRetainedArtifactManifest();
+        if (hasAckProofEvents(result.events) || this.ackProofStoreDirty) {
+          this.ackProofStore.queueFromEvents(result.events);
+          await this.syncAckProofStore();
+        }
         await this.maybeCheckpoint();
         this.broadcast(result.events);
       }
@@ -434,6 +462,24 @@ export class BrokerServer {
       this.coordinator.restoreState(before);
       this.coordinator.restoreRetainedArtifacts(retainedArtifactsBefore);
     }
+  }
+
+  private async syncAckProofStore(): Promise<void> {
+    try {
+      await this.ackProofStore.flush();
+      this.ackProofStoreDirty = this.ackProofStore.hasPending();
+    } catch {
+      // The committed journal event is authoritative. Keep its proof queued,
+      // suppress checkpoints until the cold append lands, and let replay
+      // reconstruct it if this broker exits before a retry.
+      this.ackProofStoreDirty = true;
+    }
+  }
+
+  private async flushAckProofStoreOrThrow(): Promise<void> {
+    await this.ackProofStore.flush();
+    this.ackProofStoreDirty = this.ackProofStore.hasPending();
+    if (this.ackProofStoreDirty) throw new FabricError("PERSISTENCE_FAILURE", "ACK proof store did not flush");
   }
 
   private async syncRetainedArtifactManifest(): Promise<void> {
@@ -449,7 +495,7 @@ export class BrokerServer {
   }
 
   private async maybeCheckpoint(): Promise<void> {
-    if (this.retainedArtifactManifestDirty) return;
+    if (this.retainedArtifactManifestDirty || this.ackProofStoreDirty) return;
     if (this.transactionsSinceCheckpoint < this.checkpointTransactions && await this.journal.size() < this.checkpointBytes) return;
     try {
       await this.journal.checkpoint(this.coordinator.exportState({ includeRetainedArtifacts: false }));
@@ -585,6 +631,10 @@ export class BrokerServer {
 
 function hasRetainedArtifactEvents(events: readonly CoordinatorEvent[]): boolean {
   return events.some((event) => event.type === "agent_artifacts_retained" || event.type === "agent_artifacts_resolved" || event.type === "agent_artifact_pruned");
+}
+
+function hasAckProofEvents(events: readonly CoordinatorEvent[]): boolean {
+  return events.some((event) => event.type === "message_acknowledged");
 }
 
 function isRetainedArtifactMutation(operation: string): boolean {

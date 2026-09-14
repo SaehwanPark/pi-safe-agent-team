@@ -16,6 +16,13 @@ export interface JournalOptions {
   filename?: string;
 }
 
+export interface JournalReplayOptions {
+  /** Observe committed events before the next record is replayed. */
+  onCommittedEvents?: (events: readonly CoordinatorEvent[]) => void | Promise<void>;
+  /** Observe checkpoint input so external cold stores can migrate legacy state. */
+  onCheckpoint?: (state: PersistedCoordinatorState) => void | Promise<void>;
+}
+
 /**
  * Append-only, transaction-framed local journal. It intentionally stores
  * coordinator events rather than model transcripts or arbitrary client data.
@@ -91,10 +98,10 @@ export class Journal {
     }
   }
 
-  async replay(coordinator: Coordinator): Promise<{ committedTransactions: number; ignoredTail: boolean; checkpoints: number }> {
+  async replay(coordinator: Coordinator, options: JournalReplayOptions = {}): Promise<{ committedTransactions: number; ignoredTail: boolean; checkpoints: number; migrated: boolean }> {
     await this.open();
     const content = await fs.readFile(this.filePath, "utf8");
-    if (!content) return { committedTransactions: 0, ignoredTail: false, checkpoints: 0 };
+    if (!content) return { committedTransactions: 0, ignoredTail: false, checkpoints: 0, migrated: false };
     const lines = content.split("\n");
     const hasTrailingNewline = content.endsWith("\n");
     if (hasTrailingNewline) lines.pop();
@@ -102,6 +109,7 @@ export class Journal {
     let committedTransactions = 0;
     let checkpoints = 0;
     let ignoredTail = false;
+    let migrated = false;
 
     for (let index = 0; index < lines.length; index += 1) {
       const raw = lines[index];
@@ -120,6 +128,8 @@ export class Journal {
         // Retained artifact metadata lives in the broker's separate cold
         // manifest. Keep that cache while replaying a checkpoint; subsequent
         // artifact events still apply in journal order.
+        if (record.state.version === 1) migrated = true;
+        await options.onCheckpoint?.(record.state);
         coordinator.restoreState(record.state, { preserveExternalRetainedArtifacts: true });
         pending.clear();
         checkpoints += 1;
@@ -135,6 +145,7 @@ export class Journal {
         if (!transaction) throw new Error(`Journal commit record ${record.txId} has no begin`);
         coordinator.applyEvents(transaction.events);
         if (transaction.idempotency) coordinator.restoreIdempotency(transaction.idempotency);
+        await options.onCommittedEvents?.(transaction.events);
         pending.delete(record.txId);
         committedTransactions += 1;
       } else {
@@ -143,7 +154,7 @@ export class Journal {
     }
     // Any transaction left in pending has no commit marker and is deliberately ignored.
     if (pending.size > 0) ignoredTail = true;
-    return { committedTransactions, ignoredTail, checkpoints };
+    return { committedTransactions, ignoredTail, checkpoints, migrated };
   }
 
   private async enqueueWrite(records: JournalRecord[]): Promise<void> {

@@ -27,6 +27,7 @@ import {
   type FabricStatus,
   type IdempotencyRecord,
   type IdempotencyStateEntry,
+  type MessageAckProofLookup,
   type MessageAckTombstone,
   type MessageId,
   type MessagePriority,
@@ -36,6 +37,7 @@ import {
   type MessageType,
   type ModelRoute,
   type PersistedCoordinatorState,
+  type PersistedCoordinatorStateV2,
   type RequestId,
   type RequestRecord,
   type RequestStatus,
@@ -94,6 +96,8 @@ export interface CoordinatorOptions {
   config?: Partial<FabricConfig>;
   clock?: () => number;
   idFactory?: (prefix: string) => string;
+  /** Optional cold ACK proof index used by a broker; standalone coordinators keep a fallback cache. */
+  ackProofs?: MessageAckProofLookup;
 }
 
 export interface RegisterAgentArgs {
@@ -186,6 +190,7 @@ export class Coordinator {
 
   private readonly clock: () => number;
   private readonly idFactory: (prefix: string) => string;
+  private ackProofs?: MessageAckProofLookup;
   private agents = new Map<AgentId, AgentRecord>();
   private tasks = new Map<TaskId, TaskRecord>();
   private resources = new Map<ResourceId, ResourceRecord>();
@@ -218,6 +223,7 @@ export class Coordinator {
     this.rootAgentId = options.rootAgentId === undefined ? undefined : parseString(options.rootAgentId, "rootAgentId");
     this.clock = options.clock ?? (() => Date.now());
     this.idFactory = options.idFactory ?? ((prefix) => `${prefix}-${randomUUID()}`);
+    this.ackProofs = options.ackProofs;
     this.config = {
       ...DEFAULT_FABRIC_CONFIG,
       ...(options.config ?? {}),
@@ -276,6 +282,12 @@ export class Coordinator {
   setCaseInsensitivePaths(caseInsensitive: boolean): void {
     this.caseFoldPaths = caseInsensitive;
     this.config.caseInsensitivePaths = caseInsensitive;
+  }
+
+  /** Attach the broker-owned cold ACK proof index after construction. */
+  setAckProofs(ackProofs: MessageAckProofLookup | undefined): void {
+    this.ackProofs = ackProofs;
+    if (ackProofs) this.acknowledgedMessages.clear();
   }
 
   /** Apply a protocol operation as one synchronous, atomic state transition. */
@@ -676,7 +688,7 @@ export class Coordinator {
     assertCondition(input.sessionRetained === undefined || typeof input.sessionRetained === "boolean", "INVALID_ARGUMENT", "artifact.sessionRetained must be boolean");
     assertCondition(!existing || existing.status !== "resolved", "LIFECYCLE_CONFLICT", `Artifact ${existing?.id ?? target.retainedArtifactId} has already been resolved`);
     if (!existing) {
-      this.trimRetainedArtifacts(events);
+      this.trimRetainedArtifacts(events, true);
       assertCondition(this.retainedArtifacts.size < (this.config.maxRetainedArtifacts ?? DEFAULT_FABRIC_CONFIG.maxRetainedArtifacts!), "AGENT_LIMIT_REACHED", "retained artifact limit reached; resolve an existing artifact before retaining another");
     }
     const keepWorkspace = input.workspaceRetained === undefined ? true : input.workspaceRetained;
@@ -704,14 +716,17 @@ export class Coordinator {
     return publicAgent(next);
   }
 
-  private trimRetainedArtifacts(events: CoordinatorEvent[]): void {
+  private trimRetainedArtifacts(events: CoordinatorEvent[], reserveSlot = false): void {
     const limit = this.config.maxRetainedArtifacts ?? DEFAULT_FABRIC_CONFIG.maxRetainedArtifacts!;
-    if (this.retainedArtifacts.size <= limit) return;
+    // Admission happens before insertion, so a full collection must make one
+    // slot available when the caller is about to retain a new artifact.
+    const target = reserveSlot ? limit - 1 : limit;
+    if (this.retainedArtifacts.size <= target) return;
     const resolved = [...this.retainedArtifacts.values()]
       .filter((artifact) => artifact.status === "resolved")
       .sort((left, right) => (left.resolvedAt ?? 0) - (right.resolvedAt ?? 0) || left.id.localeCompare(right.id));
     for (const artifact of resolved) {
-      if (this.retainedArtifacts.size <= limit) break;
+      if (this.retainedArtifacts.size <= target) break;
       this.retainedArtifacts.delete(artifact.id);
       events.push({ type: "agent_artifact_pruned", artifactId: artifact.id });
     }
@@ -1317,7 +1332,10 @@ export class Coordinator {
       acknowledgedAt: message.acknowledgedAt,
       acknowledged: true,
     };
-    this.acknowledgedMessages.set(this.ackTombstoneKey(tombstone.to, tombstone.id, tombstone.revision), tombstone);
+    // Brokered coordinators consult the external cold store instead of keeping
+    // an unbounded proof map in every rollback image. The local map remains a
+    // compatibility fallback for direct/unit coordinators.
+    if (!this.ackProofs) this.acknowledgedMessages.set(this.ackTombstoneKey(tombstone.to, tombstone.id, tombstone.revision), tombstone);
     return tombstone;
   }
 
@@ -1326,9 +1344,11 @@ export class Coordinator {
     assertCondition(Number.isInteger(requestedRevision) && requestedRevision > 0, "INVALID_ARGUMENT", "revision must be a positive integer");
     const message = this.messages.get(messageId);
     if (!message) {
-      const exact = this.acknowledgedMessages.get(this.ackTombstoneKey(actorId, messageId, requestedRevision));
+      const exact = this.ackProofs?.findExact(actorId, messageId, requestedRevision)
+        ?? this.acknowledgedMessages.get(this.ackTombstoneKey(actorId, messageId, requestedRevision));
       if (exact) return { ...cloneAckTombstone(exact), alreadyAcknowledged: true };
-      const otherRevision = [...this.acknowledgedMessages.values()].find((candidate) => candidate.id === messageId && candidate.to === actorId);
+      const otherRevision = this.ackProofs?.findMessage(actorId, messageId)
+        ?? [...this.acknowledgedMessages.values()].find((candidate) => candidate.id === messageId && candidate.to === actorId);
       if (otherRevision) {
         throw new FabricError("MESSAGE_REVISION_CONFLICT", `Message ${messageId} was acknowledged at revision ${otherRevision.revision}; revision ${requestedRevision} is stale`, {
           messageId,
@@ -1617,6 +1637,7 @@ export class Coordinator {
     const now = this.clock();
     const resource: ResourceRecord = {
       id,
+      incarnation: this.idFactory("resource-incarnation"),
       kind,
       parentId,
       path: resourcePath,
@@ -1641,10 +1662,16 @@ export class Coordinator {
     return { ...cloneResource(resource), stale: requestedVersion !== undefined && requestedVersion !== resource.version };
   }
 
-  private resourceSnapshot(actorId: AgentId, resourceId: ResourceId): { resourceId: ResourceId; version: number; token: string } {
+  private resourceSnapshot(actorId: AgentId, resourceId: ResourceId): { resourceId: ResourceId; incarnation: string; version: number; token: string } {
     const resource = this.requireResource(resourceId);
     assertCondition(this.canInspectResource(actorId, resource), "CAPABILITY_DENIED", `Agent ${actorId} cannot inspect ${resourceId}`);
-    return { resourceId, version: resource.version, token: `${resourceId}@${resource.version}` };
+    const incarnation = this.resourceIncarnation(resource);
+    return {
+      resourceId,
+      incarnation,
+      version: resource.version,
+      token: `${resourceId}@${incarnation}@${resource.version}`,
+    };
   }
 
   private listResources(actorId: AgentId, args: Record<string, unknown>): Array<ResourceRecord & { cursor?: string }> {
@@ -2160,6 +2187,7 @@ export class Coordinator {
     });
     return {
       id: resource.id,
+      incarnation: this.resourceIncarnation(resource),
       kind: resource.kind,
       parentId: resource.parentId,
       path: resource.path?.slice(0, 1024),
@@ -2361,7 +2389,7 @@ export class Coordinator {
       }
       let retainedArtifactId = current.retainedArtifactId;
       if (current.artifactDisposition === "retained" && !retainedArtifactId) {
-        this.trimRetainedArtifacts(events);
+        this.trimRetainedArtifacts(events, true);
         if (this.retainedArtifacts.size >= (this.config.maxRetainedArtifacts ?? DEFAULT_FABRIC_CONFIG.maxRetainedArtifacts!)) continue;
         retainedArtifactId = this.idFactory("retained-artifact");
         const artifact: RetainedArtifactRecord = {
@@ -2450,6 +2478,7 @@ export class Coordinator {
         if (retiredAt > cutoff) continue;
         const tombstone: ResourceTombstone = {
           id: resource.id,
+          incarnation: resource.incarnation,
           kind: resource.kind,
           parentId: resource.parentId,
           path: resource.path,
@@ -2597,10 +2626,10 @@ export class Coordinator {
     return Boolean(agent.authToken && token !== undefined && token === agent.authToken);
   }
 
-  exportState(options: { includeRetainedArtifacts?: boolean } = {}): PersistedCoordinatorState {
+  exportState(options: { includeRetainedArtifacts?: boolean } = {}): PersistedCoordinatorStateV2 {
     const includeRetainedArtifacts = options.includeRetainedArtifacts !== false;
     return {
-      version: 1,
+      version: 2,
       nextMessageSequence: Object.fromEntries(this.nextMessageSequence),
       agents: [...this.agents.values()].map(cloneAgent),
       tasks: [...this.tasks.values()].map(cloneTask),
@@ -2616,13 +2645,17 @@ export class Coordinator {
       archivedAgents: [...this.archivedAgents.values()].map((agent) => ({ ...agent })),
       archivedTasks: [...this.archivedTasks.values()].map((task) => ({ ...task, dependencies: [...(task.dependencies ?? [])] })),
       archivedRequests: [...this.archivedRequests.values()].map((request) => ({ ...request })),
-      archivedResources: [...this.archivedResources.values()].map((resource) => ({ ...resource })),
+      archivedResources: [...this.archivedResources.values()].map((resource) => ({ ...resource, incarnation: this.resourceIncarnation(resource) })),
       ...(includeRetainedArtifacts
         ? { retainedArtifacts: [...this.retainedArtifacts.values()].map((artifact) => ({ ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined })) }
         : { retainedArtifactIds: [...this.retainedArtifacts.keys()] }),
-      acknowledgedMessages: [...this.acknowledgedMessages.values()].map(cloneAckTombstone),
+      ...(!this.ackProofs ? { acknowledgedMessages: [...this.acknowledgedMessages.values()].map(cloneAckTombstone) } : {}),
       recoveryTurnReservations: [...this.recoveryTurnReservations.values()].map(cloneModelTurnRecoveryReservation),
     };
+  }
+
+  exportAckProofs(): MessageAckTombstone[] {
+    return [...this.acknowledgedMessages.values()].map(cloneAckTombstone);
   }
 
   exportRetainedArtifacts(): RetainedArtifactRecord[] {
@@ -2636,7 +2669,7 @@ export class Coordinator {
   }
 
   restoreState(state: PersistedCoordinatorState, options: { preserveExternalRetainedArtifacts?: boolean } = {}): void {
-    assertCondition(state.version === 1, "PROTOCOL_VERSION_UNSUPPORTED", `Unsupported coordinator state version ${state.version}`);
+    const migrated = this.migratePersistedState(state);
     this.agents.clear();
     this.tasks.clear();
     this.resources.clear();
@@ -2648,48 +2681,68 @@ export class Coordinator {
     this.archivedTasks.clear();
     this.archivedRequests.clear();
     this.archivedResources.clear();
-    if (!options.preserveExternalRetainedArtifacts && state.retainedArtifacts !== undefined) this.retainedArtifacts.clear();
+    if (!options.preserveExternalRetainedArtifacts && migrated.retainedArtifacts !== undefined) this.retainedArtifacts.clear();
     this.acknowledgedMessages.clear();
     this.recoveryTurnReservations.clear();
     this.nextMessageSequence.clear();
-    this.nextBrokerSequence = state.nextBrokerSequence ?? 0;
-    this.nextResourceWaiterSequence = state.nextResourceWaiterSequence ?? 0;
-    this.nextModelTurnWaiterSequence = state.nextModelTurnWaiterSequence ?? 0;
-    for (const agent of state.agents) {
+    this.nextBrokerSequence = migrated.nextBrokerSequence ?? 0;
+    this.nextResourceWaiterSequence = migrated.nextResourceWaiterSequence ?? 0;
+    this.nextModelTurnWaiterSequence = migrated.nextModelTurnWaiterSequence ?? 0;
+    for (const agent of migrated.agents) {
       assertCondition(agent.rootId === this.rootId, "IDENTITY_CONFLICT", `Persisted agent ${agent.id} belongs to another fabric`);
       this.agents.set(agent.id, cloneAgent(agent));
     }
-    for (const task of state.tasks) this.tasks.set(task.id, cloneTask(task));
-    for (const resource of state.resources) {
+    for (const task of migrated.tasks) this.tasks.set(task.id, cloneTask(task));
+    for (const resource of migrated.resources) {
       const next = cloneResource(resource);
       for (const waiter of next.waiters) this.nextResourceWaiterSequence = Math.max(this.nextResourceWaiterSequence, waiter.enqueuedSequence ?? 0);
       this.resources.set(next.id, next);
     }
-    for (const message of state.messages) {
+    for (const message of migrated.messages) {
       const next = cloneMessage(message);
       if (next.brokerSequence !== undefined) this.nextBrokerSequence = Math.max(this.nextBrokerSequence, next.brokerSequence);
       this.messages.set(next.id, next);
     }
-    for (const request of state.requests) this.requests.set(request.id, cloneRequest(request));
-    for (const [key, value] of state.dedupe) this.dedupe.set(key, value);
-    for (const [agentId, sequence] of Object.entries(state.nextMessageSequence)) this.nextMessageSequence.set(agentId, sequence);
-    for (const waiter of state.modelWaiters ?? []) {
+    for (const request of migrated.requests) this.requests.set(request.id, cloneRequest(request));
+    for (const [key, value] of migrated.dedupe) this.dedupe.set(key, value);
+    for (const [agentId, sequence] of Object.entries(migrated.nextMessageSequence)) this.nextMessageSequence.set(agentId, sequence);
+    for (const waiter of migrated.modelWaiters ?? []) {
       const next = cloneModelTurnWaiter(waiter);
       this.nextModelTurnWaiterSequence = Math.max(this.nextModelTurnWaiterSequence, next.enqueuedSequence);
       this.modelWaiters.set(next.id, next);
     }
-    for (const archived of state.archivedAgents ?? []) this.archivedAgents.set(archived.id, { ...archived });
-    for (const archived of state.archivedTasks ?? []) this.archivedTasks.set(archived.id, { ...archived, dependencies: [...(archived.dependencies ?? [])] });
-    for (const archived of state.archivedRequests ?? []) this.archivedRequests.set(archived.id, { ...archived });
-    for (const archived of state.archivedResources ?? []) this.archivedResources.set(archived.id, { ...archived });
-    if (state.retainedArtifacts !== undefined && (!options.preserveExternalRetainedArtifacts || this.retainedArtifacts.size === 0)) {
+    for (const archived of migrated.archivedAgents ?? []) this.archivedAgents.set(archived.id, { ...archived });
+    for (const archived of migrated.archivedTasks ?? []) this.archivedTasks.set(archived.id, { ...archived, dependencies: [...(archived.dependencies ?? [])] });
+    for (const archived of migrated.archivedRequests ?? []) this.archivedRequests.set(archived.id, { ...archived });
+    for (const archived of migrated.archivedResources ?? []) this.archivedResources.set(archived.id, { ...archived, incarnation: this.resourceIncarnation(archived) });
+    if (migrated.retainedArtifacts !== undefined && (!options.preserveExternalRetainedArtifacts || this.retainedArtifacts.size === 0)) {
       this.retainedArtifacts.clear();
-      for (const artifact of state.retainedArtifacts) this.retainedArtifacts.set(artifact.id, { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined });
+      for (const artifact of migrated.retainedArtifacts) this.retainedArtifacts.set(artifact.id, { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined });
     }
-    for (const acknowledged of state.acknowledgedMessages ?? []) this.acknowledgedMessages.set(this.ackTombstoneKey(acknowledged.to, acknowledged.id, acknowledged.revision), { ...acknowledged, acknowledged: true });
-    for (const reservation of state.recoveryTurnReservations ?? []) this.recoveryTurnReservations.set(reservation.agentId, cloneModelTurnRecoveryReservation(reservation));
+    if (!this.ackProofs) {
+      for (const acknowledged of migrated.acknowledgedMessages ?? []) this.acknowledgedMessages.set(this.ackTombstoneKey(acknowledged.to, acknowledged.id, acknowledged.revision), { ...acknowledged, acknowledged: true });
+    }
+    for (const reservation of migrated.recoveryTurnReservations ?? []) this.recoveryTurnReservations.set(reservation.agentId, cloneModelTurnRecoveryReservation(reservation));
     this.idempotency.clear();
-    for (const entry of state.idempotency ?? []) this.rememberIdempotencyEntry({ ...entry });
+    for (const entry of migrated.idempotency ?? []) this.rememberIdempotencyEntry({ ...entry });
+  }
+
+  private migratePersistedState(state: PersistedCoordinatorState): PersistedCoordinatorStateV2 {
+    const version = (state as { version?: unknown }).version;
+    assertCondition(version === 1 || version === 2, "PROTOCOL_VERSION_UNSUPPORTED", `Unsupported coordinator state version ${String(version)}`);
+    const source = state as unknown as PersistedCoordinatorState & { resources: ResourceRecord[] };
+    return {
+      ...source,
+      version: 2,
+      resources: source.resources.map((resource) => ({
+        ...resource,
+        incarnation: resource.incarnation ?? this.legacyResourceIncarnation(resource),
+      })) as ResourceRecord[],
+      archivedResources: source.archivedResources?.map((resource) => ({
+        ...resource,
+        incarnation: resource.incarnation ?? this.legacyResourceIncarnation(resource),
+      })) as ResourceTombstone[] | undefined,
+    };
   }
 
   applyEvents(events: readonly CoordinatorEvent[]): void {
@@ -2705,7 +2758,7 @@ export class Coordinator {
           this.tasks.set(event.task.id, cloneTask(event.task));
           break;
         case "resource_changed": {
-          const resource = cloneResource(event.resource);
+          const resource = cloneResource({ ...event.resource, incarnation: this.resourceIncarnation(event.resource) });
           for (const waiter of resource.waiters) this.nextResourceWaiterSequence = Math.max(this.nextResourceWaiterSequence, waiter.enqueuedSequence ?? 0);
           this.resources.set(resource.id, resource);
           break;
@@ -2793,7 +2846,7 @@ export class Coordinator {
           break;
         case "resource_archived":
           this.resources.delete(event.resource.id);
-          this.archivedResources.set(event.resource.id, { ...event.resource });
+          this.archivedResources.set(event.resource.id, { ...event.resource, incarnation: this.resourceIncarnation(event.resource) });
           break;
         case "resource_archive_pruned":
           this.archivedResources.delete(event.resourceId);
@@ -2868,6 +2921,16 @@ export class Coordinator {
 
   private isResourceActive(resource: ResourceRecord): boolean {
     return resource.status !== "retired";
+  }
+
+  /** Return the durable resource identity, deriving one only for legacy input. */
+  private resourceIncarnation(resource: { id: string; kind: string; parentId?: string; path?: string; createdAt: number; retiredAt?: number; incarnation?: string }): string {
+    return resource.incarnation ?? this.legacyResourceIncarnation(resource);
+  }
+
+  private legacyResourceIncarnation(resource: { id: string; kind: string; parentId?: string; path?: string; createdAt: number; retiredAt?: number }): string {
+    const seed = [this.rootId, resource.id, resource.kind, resource.parentId ?? "", resource.path ?? "", resource.createdAt, resource.retiredAt ?? ""].join("\u0000");
+    return `legacy-${createHash("sha256").update(seed).digest("hex").slice(0, 32)}`;
   }
 
   private validateRoute(route: ModelRoute): ModelRoute {
