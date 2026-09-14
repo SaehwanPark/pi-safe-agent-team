@@ -64,27 +64,15 @@ An LLM should never be asked to act as a mutex, a distributed lock manager, a me
 ## Installation
 
 > [!TIP]
-> **Release channels**: Tagged releases run the cross-platform verification, tarball smoke, and Pi + LCM smoke before trusted npm publication. Use the pinned npm or GitHub forms below for reproducible installs; use the development form only when you intentionally want the moving `main` branch.
+> **Release channels**: Tagged releases run the cross-platform verification, tarball smoke, and Pi + LCM smoke before publication. Use the pinned GitHub release for reproducible installs; use the development form only when you intentionally want the moving `main` branch.
 
-### Option A: Install the published release via Pi (Recommended)
-
-```bash
-pi install npm:pi-safe-agents-team
-```
-
-### Option B: Pin the npm release
-
-```bash
-pi install npm:pi-safe-agents-team@0.3.0
-```
-
-### Option C: Pin the GitHub release
+### Option A: Pin the GitHub release (Recommended)
 
 ```bash
 pi install git:github.com/SaehwanPark/pi-safe-agent-team@v0.3.0
 ```
 
-### Option D: Development/latest from GitHub
+### Option B: Development/latest from GitHub
 
 This follows the moving `main` branch and is intended for unreleased changes:
 
@@ -92,25 +80,19 @@ This follows the moving `main` branch and is intended for unreleased changes:
 pi install git:github.com/SaehwanPark/pi-safe-agent-team
 ```
 
-### Option E: Install the npm package in a project
-
-```bash
-npm install pi-safe-agents-team
-```
-
-### Option F: Clone into User Extensions Directory
+### Option C: Clone into User Extensions Directory
 
 ```bash
 git clone https://github.com/SaehwanPark/pi-safe-agent-team ~/.pi/agent/extensions/pi-safe-agents-team
 ```
 
-### Option G: Local Development
+### Option D: Local Development
 
 ```bash
 git clone https://github.com/SaehwanPark/pi-safe-agent-team.git
 cd pi-safe-agent-team
-npm install
-npm run check
+pnpm install
+pnpm run check
 pi -e ./index.ts
 ```
 
