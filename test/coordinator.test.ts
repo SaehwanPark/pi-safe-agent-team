@@ -34,13 +34,17 @@ function registerRoot(coordinator: Coordinator, capabilities: Partial<AgentRecor
 }
 
 function registerChild(coordinator: Coordinator, id: string, parentId = "root", capabilities: Partial<AgentRecord["capabilities"]> = {}, routeValue = route): AgentRecord {
+  return registerChildWithToken(coordinator, id, parentId, capabilities, routeValue).agent;
+}
+
+function registerChildWithToken(coordinator: Coordinator, id: string, parentId = "root", capabilities: Partial<AgentRecord["capabilities"]> = {}, routeValue = route): { agent: AgentRecord; token: string } {
   return coordinator.dispatch(id, "agent.register", {
     rootId: "fabric",
     parentId,
     role: "worker",
     route: routeValue,
     capabilities: { mayMessagePeers: true, ...capabilities },
-  }).value.agent;
+  }).value as { agent: AgentRecord; token: string };
 }
 
 function expectCode(fn: () => unknown, code: string): void {
@@ -138,6 +142,86 @@ test("maintenance stales actors, releases claims, and expires reconnect reservat
   assert.equal(task.status, "ready");
   const replacement = coordinator.dispatch("root", "agent.spawn", { route }).value.agent as AgentRecord;
   assert.ok(replacement.id);
+});
+
+test("reconnect reservations remain live for topology and child capacity", () => {
+  const now = { value: 1_000 };
+  const coordinator = makeCoordinator({ maxChildrenPerAgent: 1, maxTotalAgents: 8, agentHeartbeatTimeoutMs: 100, reconnectGraceMs: 500 }, now);
+  registerRoot(coordinator);
+  const parent = registerChildWithToken(coordinator, "parent", "root", { maySpawn: true });
+  const child = registerChildWithToken(coordinator, "child", parent.agent.id);
+
+  now.value = 1_101;
+  coordinator.dispatch("root", "agent.heartbeat", {});
+  coordinator.dispatch(parent.agent.id, "agent.heartbeat", {});
+  coordinator.maintenance();
+
+  const stale = coordinator.dispatch("root", "agent.status", { agentId: child.agent.id }).value as AgentRecord;
+  assert.equal(stale.status, "failed");
+  assert.equal(stale.reconnectable, true);
+  expectCode(() => coordinator.dispatch(parent.agent.id, "agent.end_turn", { status: "completed" }), "LIFECYCLE_CONFLICT");
+  expectCode(() => coordinator.dispatch(parent.agent.id, "agent.spawn", { route }), "AGENT_LIMIT_REACHED");
+
+  const reconnected = coordinator.dispatch(child.agent.id, "agent.register", {
+    rootId: "fabric",
+    parentId: parent.agent.id,
+    role: "worker",
+    route,
+    token: child.token,
+  }).value as { agent: AgentRecord; token: string };
+  assert.equal(reconnected.agent.status, "ready");
+  assert.equal(reconnected.agent.reconnectable, false);
+});
+
+test("stale parent recovery fences and retires its complete descendant subtree", () => {
+  const now = { value: 1_000 };
+  const coordinator = makeCoordinator({ maxTotalAgents: 8, agentHeartbeatTimeoutMs: 100, reconnectGraceMs: 200 }, now);
+  registerRoot(coordinator);
+  const parent = registerChildWithToken(coordinator, "parent", "root", { maySpawn: true });
+  const child = registerChildWithToken(coordinator, "child", parent.agent.id);
+
+  now.value = 1_101;
+  coordinator.dispatch("root", "agent.heartbeat", {});
+  coordinator.maintenance();
+  const staleParent = coordinator.dispatch("root", "agent.status", { agentId: parent.agent.id }).value as AgentRecord;
+  const staleChild = coordinator.dispatch("root", "agent.status", { agentId: child.agent.id }).value as AgentRecord;
+  assert.equal(staleParent.reconnectable, true);
+  assert.equal(staleChild.reconnectable, true);
+
+  now.value = 1_302;
+  coordinator.dispatch("root", "agent.heartbeat", {});
+  coordinator.maintenance();
+  const retiredParent = coordinator.dispatch("root", "agent.status", { agentId: parent.agent.id }).value as AgentRecord;
+  const retiredChild = coordinator.dispatch("root", "agent.status", { agentId: child.agent.id }).value as AgentRecord;
+  assert.equal(retiredParent.status, "cancelled");
+  assert.equal(retiredChild.status, "cancelled");
+  assert.equal(retiredParent.reconnectable, false);
+  assert.equal(retiredChild.reconnectable, false);
+  assert.equal(typeof retiredParent.recoveryExpiredAt, "number");
+  assert.equal(typeof retiredChild.recoveryExpiredAt, "number");
+});
+
+test("reconnectable parents retain broker failure notices from recovered children", () => {
+  const now = { value: 1_000 };
+  const coordinator = makeCoordinator({ maxTotalAgents: 8, agentHeartbeatTimeoutMs: 100, reconnectGraceMs: 500 }, now);
+  registerRoot(coordinator);
+  const parent = registerChildWithToken(coordinator, "parent", "root", { maySpawn: true });
+  const child = registerChildWithToken(coordinator, "child", parent.agent.id);
+
+  now.value = 1_101;
+  coordinator.dispatch("root", "agent.heartbeat", {});
+  coordinator.maintenance();
+  coordinator.dispatch(child.agent.id, "agent.register", {
+    rootId: "fabric",
+    parentId: parent.agent.id,
+    role: "worker",
+    route,
+    token: child.token,
+  });
+  coordinator.dispatch(child.agent.id, "agent.end_turn", { status: "failed", statusReason: "child provider failed" });
+
+  const notices = coordinator.dispatch("root", "message.list", { scope: "all" }).value as AgentMessage[];
+  assert.ok(notices.some((message) => message.from === child.agent.id && message.type === "agent_failed"));
 });
 
 test("draining freezes new work until the subtree is cancelled", () => {
@@ -339,10 +423,15 @@ test("control notices coalesce to the newest durable state", () => {
     metadata: { requestId: "request-2", leaseId: "lease-2" },
   });
   assert.equal(second.value.message.id, first.id);
+  assert.equal(first.revision, 1);
+  assert.equal(second.value.message.revision, 2);
   assert.equal(second.value.message.body, "lease-2");
   assert.deepEqual(second.value.message.metadata, { requestId: "request-2", leaseId: "lease-2" });
   assert.equal((coordinator.dispatch("child", "message.inbox", {}).value as AgentMessage[])[0]?.body, "lease-2");
   assert.ok(second.events.some((event) => event.type === "message_updated"));
+  expectCode(() => coordinator.dispatch("child", "message.ack", { messageId: first.id, revision: first.revision }), "MESSAGE_REVISION_CONFLICT");
+  coordinator.dispatch("child", "message.ack", { messageId: first.id, revision: second.value.message.revision });
+  assert.equal((coordinator.dispatch("child", "message.inbox", {}).value as AgentMessage[]).length, 0);
 });
 
 test("reopening a completed prerequisite is rejected while dependents remain live", () => {

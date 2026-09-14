@@ -1,13 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BrokerClient } from "../src/broker/client.ts";
 import { BrokerServer } from "../src/broker/server.ts";
 import { FabricRuntime, ManagedChild } from "../src/pi/runtime.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AgentRecord, ModelRoute } from "../src/core/types.ts";
+import type { AgentRecord, ModelRoute, WorkspaceInfo } from "../src/core/types.ts";
 
 const route: ModelRoute = { provider: "test", model: "small", thinking: "medium" };
 
@@ -58,10 +58,10 @@ test("fresh root attachment drains messages left unacknowledged by the prior ses
     config: { heartbeatMs: 1_000 },
   };
   const firstRuntime = new FabricRuntime(options);
-  const firstMessages: string[] = [];
+  const firstMessages: Array<{ id: string; type: string }> = [];
   let child: BrokerClient | undefined;
   try {
-    await firstRuntime.ensureRoot({} as ExtensionAPI, runtimeContext(directory, "session-1"), (message) => firstMessages.push(message.id));
+    await firstRuntime.ensureRoot({} as ExtensionAPI, runtimeContext(directory, "session-1"), (message) => firstMessages.push({ id: message.id, type: message.type }));
     const spawned = await firstRuntime.request<{ agent: AgentRecord; token: string }>("agent.spawn", { route });
     child = new BrokerClient({ endpoint: firstRuntime.endpoint, agentId: spawned.agent.id, token: spawned.token });
     await child.connect();
@@ -75,10 +75,12 @@ test("fresh root attachment drains messages left unacknowledged by the prior ses
     child = undefined;
 
     const secondRuntime = new FabricRuntime(options);
-    const secondMessages: string[] = [];
+    const secondMessages: Array<{ id: string; type: string }> = [];
     try {
-      await secondRuntime.ensureRoot({} as ExtensionAPI, runtimeContext(directory, "session-2"), (message) => secondMessages.push(message.id));
-      assert.deepEqual(secondMessages, firstMessages);
+      await secondRuntime.ensureRoot({} as ExtensionAPI, runtimeContext(directory, "session-2"), (message) => secondMessages.push({ id: message.id, type: message.type }));
+      assert.deepEqual(secondMessages.slice(0, firstMessages.length), firstMessages);
+      assert.equal(secondMessages.length, firstMessages.length + 1);
+      assert.equal(secondMessages.at(-1)?.type, "agent_failed");
     } finally {
       await secondRuntime.stop();
     }
@@ -106,6 +108,45 @@ test("default fabric identity is finalized from the root Pi session at attachmen
     assert.ok(runtime.stateDirectory.includes("safe-agents"));
   } finally {
     await runtime.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("startup cleanup removes expired clean child artifacts while preserving live workspaces", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "safe-agents-artifact-gc-"));
+  const stateDirectory = join(directory, "state");
+  const oldWorkspace = join(directory, "old-worktree");
+  const liveWorkspace = join(directory, "live-worktree");
+  const sessionArtifact = join(stateDirectory, "sessions", "retired-child", "session.json");
+  const cleaned: WorkspaceInfo[] = [];
+  const workspaceStrategy = {
+    create: async (): Promise<WorkspaceInfo> => ({ mode: "shared", root: directory, path: directory }),
+    cleanup: async (workspace: WorkspaceInfo): Promise<void> => { cleaned.push(workspace); },
+  };
+  const runtime = new FabricRuntime({
+    cwd: directory,
+    stateDirectory,
+    agentDir: directory,
+    workspaceStrategy,
+    config: { reconnectGraceMs: 100 },
+  });
+  (runtime as any).root = { agentId: "root", ctx: { cwd: directory, sessionId: "session" } };
+  await mkdir(join(stateDirectory, "sessions", "retired-child"), { recursive: true });
+  await writeFile(sessionArtifact, "abandoned");
+  const now = Date.now();
+  const status = {
+    agents: [
+      { id: "root", depth: 0, role: "root", route, status: "ready", lastActivity: now },
+      { id: "retired-child", parentId: "root", depth: 1, role: "worker", route, status: "cancelled", lastActivity: now - 1_000, recoveryExpiredAt: now - 1, workspace: { mode: "worktree", root: directory, path: oldWorkspace, branch: "pi-safe/retired" } },
+      { id: "live-child", parentId: "root", depth: 1, role: "worker", route, status: "ready", lastActivity: now, workspace: { mode: "worktree", root: directory, path: liveWorkspace, branch: "pi-safe/live" } },
+    ],
+  };
+
+  try {
+    await (runtime as any).cleanupAbandonedAgentArtifacts(status);
+    assert.deepEqual(cleaned.map((workspace) => workspace.path), [oldWorkspace]);
+    await assert.rejects(() => access(sessionArtifact));
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });

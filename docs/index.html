@@ -789,7 +789,7 @@
           <li><strong>Hierarchical Resources</strong>: Files and folders form a strict permission and borrow hierarchy.</li>
           <li><strong>Shared vs. Mutable Borrows</strong>: Multiple agents may hold shared read leases simultaneously. Only <em>one</em> actor may hold an exclusive mutable lease across any overlapping path tree.</li>
           <li><strong>Time-Bounded Leases & Heartbeats</strong>: Leases automatically reclaim if an agent crashes or stalls, preventing permanent deadlocks without stack locks.</li>
-          <li><strong>In-Flight Write Fencing</strong>: Active writes establish ephemeral exclusion fences so a lease expiring mid-mutation cannot hand the file to a competitor until the disk write finishes.</li>
+          <li><strong>In-Flight Write Fencing</strong>: Active writes establish exclusion fences, with a journaled resource quarantine surviving broker restart, so a lease expiring mid-mutation cannot hand the file to a competitor until the write window finishes.</li>
         </ul>
       </section>
 
@@ -1138,7 +1138,7 @@ console.log("Write authorized, fence active:", writeFence.fenceId);</code></pre>
         
         <div class="callout warning">
           <div class="callout-title">Write Fences Across Broker Crashes</div>
-          Write fences (<code>resource.begin_write</code>) are currently kept in coordinator memory. They strictly protect writes during normal broker operation (including lease lapses and root write interception). However, if the broker process crashes mid-write and restarts while the writer's filesystem call is still executing, the fence is not crash-durable. <em>(A post-v0.1 recovery quarantine mechanism is planned to temporarily fence resources that had active leases upon restart).</em>
+          The active write-fence map for <code>resource.begin_write</code> is kept in coordinator memory, while the matched resource records a journaled restart quarantine through the fence expiry. This continues excluding conflicting writers after a broker restart while the old write window is still active; the filesystem mutation itself remains separate from coordinator state.
         </div>
 
         <div class="callout info">

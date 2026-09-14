@@ -30,3 +30,17 @@ test("pruned dedupe keys can be reused", () => {
   const retried = coordinator.dispatch("root", "message.send", { to: "child", type: "inform", body: "retry", clientDedupeKey: "retry" }).value as { message: AgentMessage };
   assert.notEqual(retried.message.id, first.message.id);
 });
+
+test("messages for permanently terminal actors become retention-eligible without being acknowledged", () => {
+  const coordinator = new Coordinator({ rootId: "fabric", config: { messageRetention: 2 }, idFactory: (() => { let n = 0; return (prefix: string) => `${prefix}-${++n}`; })() });
+  coordinator.dispatch("root", "agent.register", { rootId: "fabric", route, capabilities: { maySpawn: true, mayMessagePeers: true } });
+  coordinator.dispatch("child", "agent.register", { rootId: "fabric", parentId: "root", route });
+  for (const body of ["one", "two", "three"]) coordinator.dispatch("root", "message.send", { to: "child", type: "inform", body });
+
+  const cancellation = coordinator.dispatch("root", "agent.cancel", { agentId: "child" });
+  assert.ok(cancellation.events.some((event) => event.type === "message_updated" && event.message.abandonedAt !== undefined));
+  assert.ok(cancellation.events.some((event) => event.type === "messages_pruned"));
+  const retained = coordinator.dispatch("root", "message.list", { scope: "all" }).value as AgentMessage[];
+  assert.equal(retained.length, 2);
+  assert.ok(retained.every((message) => message.acknowledgedAt === undefined && message.abandonedAt !== undefined));
+});

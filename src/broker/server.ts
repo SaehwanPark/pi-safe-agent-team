@@ -20,6 +20,8 @@ export interface BrokerServerOptions {
   coordinator?: Coordinator;
   journal?: Journal;
   maintenanceMs?: number;
+  /** Wall clock used to detect event-loop suspension between maintenance ticks. */
+  clock?: () => number;
   /** Checkpoint after this many committed transactions (default 4096). */
   checkpointTransactions?: number;
   /** Checkpoint when the journal reaches this many bytes (default 16 MiB). */
@@ -193,7 +195,9 @@ export class BrokerServer {
   private readonly autoCoordinator: boolean;
   private readonly checkpointTransactions: number;
   private readonly checkpointBytes: number;
+  private readonly wallClock: () => number;
   private transactionsSinceCheckpoint = 0;
+  private lastMaintenanceTickAt?: number;
 
   constructor(options: BrokerServerOptions) {
     this.directory = options.directory;
@@ -206,6 +210,7 @@ export class BrokerServer {
     this.maintenanceMs = Math.max(1000, options.maintenanceMs ?? this.coordinator.config.heartbeatMs);
     this.checkpointTransactions = Math.max(1, Math.floor(options.checkpointTransactions ?? 4_096));
     this.checkpointBytes = Math.max(1, Math.floor(options.checkpointBytes ?? 16 * 1024 * 1024));
+    this.wallClock = options.clock ?? (() => Date.now());
   }
 
   async start(): Promise<void> {
@@ -248,6 +253,7 @@ export class BrokerServer {
       if (platform() !== "win32") await fs.chmod(this.endpoint, 0o600).catch(() => undefined);
       this.stopping = false;
       this.started = true;
+      this.lastMaintenanceTickAt = this.wallClock();
       this.maintenanceTimer = setInterval(() => {
         this.enqueueMaintenance();
       }, this.maintenanceMs);
@@ -266,6 +272,7 @@ export class BrokerServer {
     this.stopping = true;
     this.started = false;
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
+    this.lastMaintenanceTickAt = undefined;
     await this.operationTail.catch(() => undefined);
     // Compact the journal before closing connections so all state transitions
     // accepted by this broker are represented by one durable snapshot.
@@ -374,14 +381,19 @@ export class BrokerServer {
   }
 
   private enqueueMaintenance(): void {
-    this.operationTail = this.operationTail.then(() => this.runMaintenance()).catch(() => undefined);
+    const tickAt = this.wallClock();
+    const previousTickAt = this.lastMaintenanceTickAt;
+    this.lastMaintenanceTickAt = tickAt;
+    const heartbeatTimeout = this.coordinator.config.agentHeartbeatTimeoutMs ?? this.coordinator.config.heartbeatMs * 3;
+    const pausedPastLiveness = previousTickAt !== undefined && Math.max(0, tickAt - previousTickAt) > Math.max(this.maintenanceMs, heartbeatTimeout);
+    this.operationTail = this.operationTail.then(() => this.runMaintenance(pausedPastLiveness)).catch(() => undefined);
   }
 
-  private async runMaintenance(): Promise<void> {
+  private async runMaintenance(skipStaleAgents = false): Promise<void> {
     if (!this.started) return;
     const before = this.coordinator.exportState();
     try {
-      const result = this.coordinator.maintenance();
+      const result = this.coordinator.maintenance({ skipStaleAgents });
       if (result.events.length > 0) {
         await this.journal.append(result.events);
         this.transactionsSinceCheckpoint += 1;

@@ -54,7 +54,7 @@ Broker notification:
   "kind": "event",
   "version": 1,
   "event": "message.available",
-  "data": { "message": { "id": "msg-...", "from": "agent-a", "to": "agent-b", "type": "inform", "body": "..." } }
+  "data": { "message": { "id": "msg-...", "from": "agent-a", "to": "agent-b", "type": "inform", "body": "...", "revision": 1 } }
 }
 ```
 
@@ -110,7 +110,7 @@ result | task_result | handoff | resource_request | resource_granted |
 request | response | cancel | steer | agent_failed
 ```
 
-Messages have stable broker IDs, a sender-local sequence number, a monotonic broker sequence for durable replay, creation timestamp, priority, optional request/reply IDs, and optional bounded metadata.
+Messages have stable broker IDs, a sender-local sequence number, a monotonic broker sequence for durable replay, a positive payload `revision`, creation timestamp, priority, optional request/reply IDs, and optional bounded metadata. Control-plane coalescing keeps the logical ID and increments `revision` whenever the durable payload is replaced; `message_updated` carries that replacement.
 
 Guarantees:
 
@@ -119,10 +119,11 @@ Guarantees:
 - **per-sender FIFO**: messages from one sender are returned in ascending `senderSequence`, even when timestamps and IDs would sort differently;
 - **no global ordering**: messages from different senders may interleave;
 - **request/reply correlation**: a request has one request ID and at most one accepted response;
-- **busy safety**: notification delivery is separate from the durable inbox, so an active model turn cannot discard a message; the host tracks in-flight/accepted IDs so duplicate notifications do not execute a message twice;
-- **bounded retention**: the broker keeps recent message metadata/body within configured limits and reports truncation/retention in status.
+- **busy safety**: notification delivery is separate from the durable inbox, so an active model turn cannot discard a message; the host tracks in-flight/accepted ID/revision pairs so duplicate notifications do not execute a message twice;
+- **exact acknowledgement**: a new client acknowledges `(messageId, revision)`. The broker rejects a stale revision, so a host that persisted an older coalesced payload cannot acknowledge the newer payload accidentally. An omitted revision remains accepted only for revision-1 legacy records;
+- **bounded retention**: the broker keeps recent message metadata/body within configured limits and reports truncation/retention in status. Messages addressed to permanently terminal actors become `abandonedAt` retention candidates without being presented as acknowledged.
 
-Acknowledgement means the Pi host accepted the message into its session queue. It does not mean the model read or followed it. A model response is not a broker acknowledgement.
+Acknowledgement means the Pi host accepted the exact `(messageId, revision)` payload into its session queue. It does not mean the model read or followed it. A model response is not a broker acknowledgement. Hosts should preserve the revision in their durable receipt and ACK payload.
 
 ### Root message delivery policy
 
@@ -192,7 +193,7 @@ A resource can have an owner, an optional workspace-relative `path`, and active 
 
 Path identity is enforced at the guarded filesystem boundary, not inside the broker: before a guarded write asks `resource.check_write`, the host resolves the target's real path (symlinks, junctions, and alternate spellings through the nearest existing ancestor; policy keys are case-folded on case-insensitive volumes, auto-probed at broker start and overridable with `FabricConfig.caseInsensitivePaths`). Declarations name real paths — a write that reaches a coordinated file through an alias is authorized only against the file's own declaration and holds. A target whose real identity escapes the workspace is denied outright for managed children and left uncoordinated for the root. Unresolvable targets (for example symlink loops) fail closed.
 
-Authorization and the filesystem mutation are not atomic, so guarded writes fence the target: `resource.begin_write` authorizes exactly like `resource.check_write` and, when allowed, places a short-lived fence (default 30s, clamped 1s-120s via `fenceMs`) on the matched resource. While a fence is active the coordinator grants no conflicting lease to any other actor — even in the gap where the writer's own hold has just lapsed — and denies conflicting root `hostGuard` writes. Queued waiters drain when the writer calls `resource.end_write` (idempotent, only the fencing actor may lift its fence) or the fence expires. Write fencing protects coordinated writes during normal broker operation, including lease expiry, but is not crash-durable across an independent broker restart (post-v0.1 recovery quarantine planned).
+Authorization and the filesystem mutation are not atomic, so guarded writes fence the target: `resource.begin_write` authorizes exactly like `resource.check_write` and, when allowed, places a short-lived fence (default 30s, clamped 1s-120s via `fenceMs`) on the matched resource. While a fence is active the coordinator grants no conflicting lease to any other actor — even in the gap where the writer's own hold has just lapsed — and denies conflicting root `hostGuard` writes. The matched resource also records a durable restart quarantine through the fence expiry. If an independent broker restarts before `resource.end_write`, the quarantine continues blocking foreign borrows and writes until that expiry; a normal `end_write` clears it early. Queued waiters drain when the writer calls `resource.end_write` (idempotent, only the fencing actor may lift its fence) or the fence expires.
 
 - `own`/`claim`: logical semantic owner; a same-owner re-claim is idempotent and does not bump the resource version;
 - `borrow(shared)`: many readers if no overlapping mutable holder;
@@ -218,13 +219,15 @@ starting -> ready -> running -> ready
                     +-> completed | failed | cancelled
 ```
 
-Terminal states are idempotent and permanently terminal. Only the explicit broker-recovery window is reconnectable: a broker restart marks live actors as reconnectable liveness failures, and a matching token may reattach them once. A cancelled/completed/non-recoverable failed actor cannot be revived by registration. `agent.drain` enters a restrictive shutdown phase without releasing claims; `agent.cancel` then terminalizes the target subtree child-first. Failed and cancelled parents cascade to all descendants, and completion is rejected while any live descendant remains. Cancellation releases task/resource runtime claims and is safe to repeat.
+Terminal states are idempotent and permanently terminal. Only the explicit broker-recovery window is reconnectable: a broker restart marks live actors as reconnectable liveness failures, and a matching token may reattach them once. A reconnectable actor remains reserved/live for descendant completion, direct-child capacity, and parent topology until it reconnects or its grace expires; registration revalidates the parent, depth, and reserved child capacity. A cancelled/completed/non-recoverable failed actor cannot be revived by registration. `agent.drain` enters a restrictive shutdown phase without releasing claims; `agent.cancel` then terminalizes the target subtree child-first. Failed, cancelled, and stale-recovery parent transitions cascade across the complete descendant subtree, and completion is rejected while any reserved-live descendant remains. Cancellation releases task/resource runtime claims and is safe to repeat.
 
 ## Persistence and recovery
 
-Only the broker writes `events.jsonl`. Mutations are transaction-framed. Recovery applies committed transactions and ignores a partial trailing transaction. Broker restart marks previously live sessions as liveness-unknown/reconnectable, releases their active leases and requeues their non-terminal task claims, and permits matching session identities to re-register once. It does not fail pending clarification records. No model transcript is replicated in the broker journal.
+Only the broker writes `events.jsonl`. Mutations are transaction-framed. Recovery applies committed transactions and ignores a partial trailing transaction. Broker restart marks previously live sessions as liveness-unknown/reconnectable, recovery-fences each complete live descendant subtree, releases runtime claims and requeues non-terminal task claims, and permits matching session identities to re-register once in parent-to-child topology. The broker skips new stale-agent reclamation on the first maintenance tick after a detected maintenance pause longer than the liveness window, giving managed hosts a heartbeat opportunity after laptop sleep or event-loop suspension. It does not fail pending clarification records. No model transcript is replicated in the broker journal.
 
 A reconnectable actor keeps its `maxTotalAgents` slot reserved while its reconnect window is open: new registrations and spawns are refused rather than allowed to evict an expected reconnection, and the reservation is released when the actor reconnects, resolves its turn, or is cancelled. `maxConcurrentAgents` bounds concurrently running turns and is deliberately not reserved; a turn start that finds the fabric full is retryable and reports a structured limit error.
+
+When recovery grace expires, the broker recursively retires the complete reserved subtree, marks unfinished messages to those actors as undeliverable (`abandonedAt`), and releases runtime claims. On a later runtime startup, terminal child workspaces whose recovery retirement has expired are offered to the configured workspace strategy for clean-only cleanup; dirty worktrees and their session history remain available as recovery artifacts.
 
 `agent.finish_turn` is the atomic recovery transition used by managed hosts for a
 provider/compaction outcome. It may update the assigned task (`taskAction: "block"`
@@ -256,6 +259,7 @@ RESOURCE_NOT_OWNER
 LEASE_EXPIRED
 MESSAGE_NOT_FOUND
 MESSAGE_NOT_VISIBLE
+MESSAGE_REVISION_CONFLICT
 DUPLICATE_REQUEST
 REQUEST_NOT_FOUND
 REQUEST_ALREADY_RESOLVED
@@ -303,9 +307,12 @@ interface FabricStateSnapshotV1 {
   cwd?: string;
 
   runningChildren: number;
+  recoveringAgents: number;
   unresolvedChildTasks: number;
+  unownedUnresolvedTasks: number;
   mutableHolds: number;
   activeWriteFences: number;
+  activeWriteQuarantines: number;
   pendingRootRequests: number;
   pendingRootDeliveries: number;
 
@@ -317,10 +324,10 @@ interface FabricStateSnapshotV1 {
 
 Quiescence and session replacement rules are strictly conservative:
 - **Root agent turn**: Root must be attached and not currently executing a turn (`rootBusy = !rootAgent || rootAgent.status === "starting" || rootAgent.status === "running"`).
-- **Child agent states**: No child agent may be in `starting` or `running` state (`runningChildren === 0`).
-- **Child tasks**: All child tasks must have reached a terminal state (`completed`, `failed`, `cancelled`), ensuring `unresolvedChildTasks === 0`.
-- **Resource holds and write fences**: Zero active mutable borrows (`mutableHolds === 0`) and zero active write fences (`activeWriteFences === 0`) across the entire fabric.
-- **Pending root requests and deliveries**: Zero unresolved requests or unconsumed deliveries directed to the root (`pendingRootRequests === 0` and `pendingRootDeliveries === 0`).
+- **Child agent states**: No child agent may be in `starting` or `running` state (`runningChildren === 0`), and no actor may remain in the reconnectable recovery window (`recoveringAgents === 0`).
+- **Fabric tasks**: Every non-terminal task, including a task whose owner was released during recovery, keeps replacement unsafe (`unresolvedChildTasks === 0` and `unownedUnresolvedTasks === 0`).
+- **Resource holds, fences, and restart quarantines**: Zero active mutable borrows (`mutableHolds === 0`), active write fences (`activeWriteFences === 0`), and durable write quarantines (`activeWriteQuarantines === 0`) across the entire fabric.
+- **Pending root requests and deliveries**: Zero unresolved requests in either direction involving the root (`pendingRootRequests === 0`) or unconsumed deliveries directed to the root (`pendingRootDeliveries === 0`).
 - **Root context mutation**: `rootCompactionInFlight === false`; manual, threshold, overflow, and embedded root compaction keep `sessionReplacementSafe === false` for the entire hook interval.
 - **Root provider health**: `rootContextHealth === "degraded"` is a visible recovery gate after an exhausted root provider/context outcome; diagnostics are bounded and automatic message wakes remain suppressed until recovery.
 - **Failure state**: If the broker is unreachable or a status query fails while the root is attached, the snapshot fails closed with `active: true, quiescent: false, state: "uncertain", sessionReplacementSafe: false`, and `quiescenceReasons: ["broker_status_query_failed"]`.
