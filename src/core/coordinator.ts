@@ -36,6 +36,7 @@ import {
   type ModelTurnWaiter,
   type MessageType,
   type ModelRoute,
+  type OpaqueShellBarrierRecord,
   type PersistedCoordinatorState,
   type PersistedCoordinatorStateV2,
   type RequestId,
@@ -160,6 +161,8 @@ export class Coordinator {
     "agent.finish_turn",
     "message.send",
     "message.ack",
+    "shell.begin_barrier",
+    "shell.end_barrier",
   ]);
   /** Operations that only read hot state and therefore do not need rollback snapshots. */
   static readonly readOnlyOperations = new Set([
@@ -217,6 +220,8 @@ export class Coordinator {
   private recoveryTurnReservations = new Map<AgentId, ModelTurnRecoveryReservation>();
   /** Ephemeral write fences (begin_write/end_write); never persisted or replayed. */
   private fences = new Map<string, WriteFenceRecord>();
+  /** Opaque shared-workspace shell barriers; the owning host releases them after execution. */
+  private shellBarriers = new Map<string, OpaqueShellBarrierRecord>();
 
   constructor(options: CoordinatorOptions) {
     this.rootId = parseString(options.rootId, "rootId");
@@ -250,6 +255,8 @@ export class Coordinator {
     assertCondition((this.config.reconnectGraceMs ?? 0) > 0, "INVALID_ARGUMENT", "reconnectGraceMs must be positive");
     assertCondition(Number.isInteger(this.config.modelTurnGrantTtlMs) && (this.config.modelTurnGrantTtlMs ?? 0) > 0, "INVALID_ARGUMENT", "modelTurnGrantTtlMs must be a positive integer");
     assertCondition(Number.isInteger(this.config.historyGcBatchSize) && (this.config.historyGcBatchSize ?? 0) > 0, "INVALID_ARGUMENT", "historyGcBatchSize must be a positive integer");
+    assertCondition(this.config.shellPolicy === "coordination" || this.config.shellPolicy === "strict" || this.config.shellPolicy === "trusted", "INVALID_ARGUMENT", "shellPolicy must be coordination, strict, or trusted");
+    assertCondition(this.config.externalPathAccess === "deny" || this.config.externalPathAccess === "read" || this.config.externalPathAccess === "any", "INVALID_ARGUMENT", "externalPathAccess must be deny, read, or any");
     this.validateRoutePolicies();
   }
 
@@ -390,6 +397,10 @@ export class Coordinator {
         return this.withEvents(events, this.beginWrite(this.requireActor(actorId).id, args, events), events);
       case "resource.end_write":
         return this.withEvents(events, this.endWrite(this.requireActor(actorId).id, args, events));
+      case "shell.begin_barrier":
+        return this.withEvents(events, this.beginShellBarrier(this.requireActor(actorId).id, args, events), events);
+      case "shell.end_barrier":
+        return this.withEvents(events, this.endShellBarrier(this.requireActor(actorId).id, args, events), events);
       case "resource.retire":
         return this.withEvents(events, this.retireResource(this.requireActor(actorId).id, parseString(args.resourceId, "resourceId"), events));
       case "fabric.status":
@@ -1033,6 +1044,11 @@ export class Coordinator {
     this.removeRecoveryTurnReservation(actorId, events);
     this.agents.set(actorId, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
+
+    // A shell tool normally releases its barrier in a finally path. Releasing
+    // any leftover owner barriers at the turn boundary also converges an
+    // ambiguous/lost end-barrier response once the local process has settled.
+    this.releaseShellBarriers(actorId, events);
 
     // A blocked context/provider turn is deliberately recoverable, but it is
     // not making progress. Release mutable claims immediately so another actor
@@ -1880,6 +1896,13 @@ export class Coordinator {
     if (!actor.capabilities.mayWriteRepo) {
       return { allowed: false, reason: `Agent ${actorId} is not allowed to write repository files` };
     }
+    const shellBarrier = this.shellBarriers.values().next().value as OpaqueShellBarrierRecord | undefined;
+    if (shellBarrier) {
+      return {
+        allowed: false,
+        reason: `An opaque shared-workspace shell command is running under ${shellBarrier.actorId}; coordinated writes are paused until it exits`,
+      };
+    }
     const resourceId = parseOptionalString(args.resourceId, "resourceId");
     const requestedPath = args.path === undefined ? undefined : normalizeResourcePath(args.path, "path", this.caseFoldPaths);
     assertCondition(resourceId || requestedPath, "INVALID_ARGUMENT", "resource.check_write requires resourceId or path");
@@ -1988,6 +2011,87 @@ export class Coordinator {
     return { released: Boolean(released || quarantined) };
   }
 
+  /**
+   * Admit an opaque shared-workspace shell command. The executable's write set
+   * is unknowable, so the barrier is deliberately broader than a resource
+   * fence: it excludes foreign mutable holds and in-flight writes for the
+   * command's lifetime while leaving shared readers alone.
+   */
+  private beginShellBarrier(actorId: AgentId, _args: Record<string, unknown>, events: CoordinatorEvent[]): { allowed: boolean; barrierId?: string; reason?: string } {
+    const actor = this.requireActor(actorId);
+    assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot start a shell barrier`);
+    assertCondition(actor.capabilities.mayUseShell, "CAPABILITY_DENIED", `Agent ${actorId} is not allowed to use managed shell`);
+    const existing = [...this.shellBarriers.values()].find((barrier) => barrier.actorId === actorId);
+    if (existing) {
+      existing.references = (existing.references ?? 1) + 1;
+      events.push({ type: "shell_barrier_started", barrier: { ...existing } });
+      return { allowed: true, barrierId: existing.id };
+    }
+    const activeForeignBarrier = this.activeForeignShellBarrier(actorId);
+    if (activeForeignBarrier) {
+      return {
+        allowed: false,
+        reason: `Another agent (${activeForeignBarrier.actorId}) already holds the opaque shared-workspace shell barrier`,
+      };
+    }
+
+    const foreignHold = [...this.resources.values()].find((resource) =>
+      this.isResourceActive(resource) && resource.mutableHold !== undefined && resource.mutableHold.agentId !== actorId,
+    );
+    if (foreignHold) {
+      return {
+        allowed: false,
+        reason: `An opaque shell barrier cannot start while another agent holds mutable resource ${foreignHold.path ?? foreignHold.id}`,
+      };
+    }
+    const foreignFence = [...this.fences.values()].find((fence) => fence.actorId !== actorId && fence.expiresAt > this.clock());
+    if (foreignFence) {
+      const resource = this.resources.get(foreignFence.resourceId);
+      return {
+        allowed: false,
+        reason: `An opaque shell barrier cannot start while another agent has an active write fence on ${resource?.path ?? foreignFence.resourceId}`,
+      };
+    }
+    const foreignQuarantine = [...this.resources.values()].find((resource) =>
+      this.isResourceActive(resource) && resource.writeQuarantineActorId !== actorId && (resource.writeQuarantineUntil ?? 0) > this.clock(),
+    );
+    if (foreignQuarantine) {
+      return {
+        allowed: false,
+        reason: `An opaque shell barrier cannot start while a broker-restart write quarantine covers ${foreignQuarantine.path ?? foreignQuarantine.id}`,
+      };
+    }
+
+    const barrier: OpaqueShellBarrierRecord = {
+      id: this.idFactory("shell-barrier"),
+      actorId,
+      createdAt: this.clock(),
+    };
+    this.shellBarriers.set(barrier.id, barrier);
+    events.push({ type: "shell_barrier_started", barrier: { ...barrier } });
+    return { allowed: true, barrierId: barrier.id };
+  }
+
+  /** Release one opaque barrier. Releasing an unknown/already-released ID is idempotent. */
+  private endShellBarrier(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): { released: boolean } {
+    const barrierId = parseString(args.barrierId, "barrierId", 512);
+    const barrier = this.shellBarriers.get(barrierId);
+    if (!barrier || barrier.actorId !== actorId) return { released: false };
+    if ((barrier.references ?? 1) > 1) {
+      barrier.references = (barrier.references ?? 1) - 1;
+      events.push({ type: "shell_barrier_released", barrierId, actorId, remainingReferences: barrier.references });
+    } else {
+      this.shellBarriers.delete(barrierId);
+      events.push({ type: "shell_barrier_released", barrierId, actorId });
+    }
+    this.drainWaiters(events);
+    return { released: true };
+  }
+
+  private activeForeignShellBarrier(actorId: AgentId): OpaqueShellBarrierRecord | undefined {
+    return [...this.shellBarriers.values()].find((barrier) => barrier.actorId !== actorId);
+  }
+
   private activeForeignFence(resource: ResourceRecord, actorId: AgentId): boolean {
     const now = this.clock();
     for (const fence of this.fences.values()) {
@@ -2026,6 +2130,7 @@ export class Coordinator {
     const recentMessages = [...this.messages.values()]
       .sort((left, right) => (right.brokerSequence ?? 0) - (left.brokerSequence ?? 0) || right.createdAt - left.createdAt || right.id.localeCompare(left.id));
     const fences = [...this.fences.values()].filter((candidate) => candidate.expiresAt > now);
+    const shellBarriers = [...this.shellBarriers.values()];
     const boundedLimit = 50;
     return {
       rootId: this.rootId,
@@ -2053,6 +2158,8 @@ export class Coordinator {
           actorId: fence.actorId,
         };
       }),
+      activeShellBarriers: shellBarriers.length,
+      shellBarriers: shellBarriers.slice(0, boundedLimit).map((barrier) => ({ id: barrier.id, actorId: barrier.actorId })),
       activeWriteQuarantines: [...this.resources.values()].filter((resource) => this.isResourceActive(resource) && (resource.writeQuarantineUntil ?? 0) > now).length,
       pendingModelTurns: [...this.modelWaiters.values()].sort((left, right) => left.enqueuedSequence - right.enqueuedSequence).slice(0, boundedLimit).map(cloneModelTurnWaiter),
       recoveryTurnReservations: [...this.recoveryTurnReservations.values()].slice(0, boundedLimit).map(cloneModelTurnRecoveryReservation),
@@ -2081,6 +2188,7 @@ export class Coordinator {
     const unresolvedTasks = [...this.tasks.values()].filter((task) => unresolvedStatuses.has(task.status));
     const pendingRequests = [...this.requests.values()].filter((request) => request.status === "pending");
     const activeWriteFences = [...this.fences.values()].filter((fence) => fence.expiresAt > now);
+    const activeShellBarriers = this.shellBarriers.size;
     const mutableResources = [...this.resources.values()]
       .filter((resource) => this.isResourceActive(resource) && resource.mutableHold !== undefined)
       .sort((left, right) => left.updatedAt - right.updatedAt || left.id.localeCompare(right.id));
@@ -2096,6 +2204,7 @@ export class Coordinator {
       mutableHolds: mutableResources.length,
       activeWriteFences: activeWriteFences.length,
       activeWriteQuarantines: [...this.resources.values()].filter((resource) => this.isResourceActive(resource) && (resource.writeQuarantineUntil ?? 0) > now).length,
+      activeShellBarriers,
       pendingRootRequests: root ? pendingRequests.filter((request) => request.to === root.id || request.from === root.id).length : 0,
       pendingModelTurns: this.modelWaiters.size,
       fences: activeWriteFences.slice(0, 50).map((fence) => {
@@ -2132,6 +2241,8 @@ export class Coordinator {
       maxArchivedRecords: this.config.maxArchivedRecords,
       maxRetainedArtifacts: this.config.maxRetainedArtifacts,
       historyGcBatchSize: this.config.historyGcBatchSize,
+      shellPolicy: this.config.shellPolicy,
+      externalPathAccess: this.config.externalPathAccess,
     };
   }
 
@@ -2614,7 +2725,9 @@ export class Coordinator {
     // fresh turn after it has reconciled its durable task state. The task owner
     // remains reserved until this actor reconnects or grace expires.
     this.removeModelTurnWaiter(next.id, events);
-    this.releaseAgentResourceClaims(next.id, events);
+    // Keep an opaque shell barrier across broker recovery: the original host
+    // may still be executing the command and will release it after reconnect.
+    this.releaseAgentResourceClaims(next.id, events, false);
     recovered?.push(next.id);
   }
 
@@ -2656,6 +2769,7 @@ export class Coordinator {
         : { retainedArtifactIds: [...this.retainedArtifacts.keys()] }),
       ...(!this.ackProofs ? { acknowledgedMessages: [...this.acknowledgedMessages.values()].map(cloneAckTombstone) } : {}),
       recoveryTurnReservations: [...this.recoveryTurnReservations.values()].map(cloneModelTurnRecoveryReservation),
+      shellBarriers: [...this.shellBarriers.values()].map((barrier) => ({ ...barrier })),
     };
   }
 
@@ -2689,6 +2803,7 @@ export class Coordinator {
     if (!options.preserveExternalRetainedArtifacts && migrated.retainedArtifacts !== undefined) this.retainedArtifacts.clear();
     this.acknowledgedMessages.clear();
     this.recoveryTurnReservations.clear();
+    this.shellBarriers.clear();
     this.nextMessageSequence.clear();
     this.nextBrokerSequence = migrated.nextBrokerSequence ?? 0;
     this.nextResourceWaiterSequence = migrated.nextResourceWaiterSequence ?? 0;
@@ -2728,6 +2843,11 @@ export class Coordinator {
       for (const acknowledged of migrated.acknowledgedMessages ?? []) this.acknowledgedMessages.set(this.ackTombstoneKey(acknowledged.to, acknowledged.id, acknowledged.revision), { ...acknowledged, acknowledged: true });
     }
     for (const reservation of migrated.recoveryTurnReservations ?? []) this.recoveryTurnReservations.set(reservation.agentId, cloneModelTurnRecoveryReservation(reservation));
+    for (const barrier of migrated.shellBarriers ?? []) {
+      const owner = this.agents.get(barrier.actorId);
+      if (!owner || isTerminal(owner.status) && owner.reconnectable !== true) continue;
+      this.shellBarriers.set(barrier.id, { ...barrier, references: Math.max(1, Math.floor(barrier.references ?? 1)) });
+    }
     this.idempotency.clear();
     for (const entry of migrated.idempotency ?? []) this.rememberIdempotencyEntry({ ...entry });
   }
@@ -2834,6 +2954,16 @@ export class Coordinator {
         case "model_turn_recovery_resolved":
           this.recoveryTurnReservations.delete(event.agentId);
           break;
+        case "shell_barrier_started":
+          this.shellBarriers.set(event.barrier.id, { ...event.barrier, references: Math.max(1, Math.floor(event.barrier.references ?? 1)) });
+          break;
+        case "shell_barrier_released": {
+          const barrier = this.shellBarriers.get(event.barrierId);
+          if (!barrier || barrier.actorId !== event.actorId) break;
+          if (event.remainingReferences !== undefined && event.remainingReferences > 0) barrier.references = event.remainingReferences;
+          else this.shellBarriers.delete(event.barrierId);
+          break;
+        }
         case "agent_artifacts_retained":
           this.retainedArtifacts.set(event.artifact.id, { ...event.artifact, workspace: event.artifact.workspace ? { ...event.artifact.workspace } : undefined });
           break;
@@ -3145,7 +3275,8 @@ export class Coordinator {
   }
 
   /** Release leases, waiters, and in-flight write fences without changing task ownership. */
-  private releaseAgentResourceClaims(agentId: AgentId, events: CoordinatorEvent[]): void {
+  private releaseAgentResourceClaims(agentId: AgentId, events: CoordinatorEvent[], releaseShellBarrier = true): void {
+    if (releaseShellBarrier) this.releaseShellBarriers(agentId, events);
     for (const resource of this.resources.values()) {
       let changed = false;
       const beforeShared = resource.sharedHolds.length;
@@ -3168,6 +3299,17 @@ export class Coordinator {
       }
     }
     this.drainWaiters(events);
+  }
+
+  private releaseShellBarriers(agentId: AgentId, events: CoordinatorEvent[]): void {
+    let released = false;
+    for (const [id, barrier] of this.shellBarriers) {
+      if (barrier.actorId !== agentId) continue;
+      this.shellBarriers.delete(id);
+      events.push({ type: "shell_barrier_released", barrierId: id, actorId: agentId });
+      released = true;
+    }
+    if (released) this.drainWaiters(events);
   }
 
   private releaseAgentRuntime(agentId: AgentId, reason: string, events: CoordinatorEvent[]): void {
@@ -3305,6 +3447,10 @@ export class Coordinator {
   }
 
   private canAcquire(resource: ResourceRecord, agentId: AgentId, mode: BorrowMode): boolean {
+    // An opaque shell command may touch any path in the shared workspace. Keep
+    // mutable borrows behind its broad barrier while allowing shared readers
+    // to continue concurrently.
+    if (mode === "mutable" && this.shellBarriers.size > 0) return false;
     // A write fence is a promise that no one else touches the file while a
     // guarded write is in flight, so it excludes conflicting grants even in
     // the gap where the writer's own lease has just lapsed.

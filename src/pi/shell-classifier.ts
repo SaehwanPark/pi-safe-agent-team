@@ -397,3 +397,6 @@ export function classifyRootShellCommand(command: string): RootShellRisk {
 
   return { kind: "read-only" };
 }
+
+/** Policy-neutral classifier shared by root and managed child shell guards. */
+export const classifyShellCommand = classifyRootShellCommand;

@@ -670,6 +670,7 @@ export class FabricRuntime {
         mutableHolds: 0,
         activeWriteFences: 0,
         activeWriteQuarantines: 0,
+        activeShellBarriers: 0,
         pendingRootRequests: 0,
         pendingRootDeliveries: 0,
         pendingModelTurns: 0,
@@ -700,6 +701,7 @@ export class FabricRuntime {
       const pendingModelTurns = snapshot.pendingModelTurns;
       const activeWriteFences = snapshot.activeWriteFences;
       const activeWriteQuarantines = snapshot.activeWriteQuarantines;
+      const activeShellBarriers = snapshot.activeShellBarriers;
 
       const quiescenceReasons: string[] = [];
       if (this.draining) quiescenceReasons.push("fabric_draining");
@@ -712,6 +714,7 @@ export class FabricRuntime {
       if (mutableHolds > 0) quiescenceReasons.push("active_mutable_holds");
       if (activeWriteFences > 0) quiescenceReasons.push("active_write_fences");
       if (activeWriteQuarantines > 0) quiescenceReasons.push("active_write_quarantines");
+      if (activeShellBarriers > 0) quiescenceReasons.push("active_shell_barriers");
       if (pendingRootRequests > 0) quiescenceReasons.push("pending_root_requests");
       if (pendingRootDeliveries > 0) quiescenceReasons.push("pending_root_deliveries");
       if (pendingModelTurns > 0) quiescenceReasons.push("model_turns_waiting_for_capacity");
@@ -748,6 +751,7 @@ export class FabricRuntime {
         mutableHolds,
         activeWriteFences,
         activeWriteQuarantines,
+        activeShellBarriers,
         pendingRootRequests,
         pendingRootDeliveries,
         pendingModelTurns,
@@ -775,6 +779,7 @@ export class FabricRuntime {
         mutableHolds: 0,
         activeWriteFences: 0,
         activeWriteQuarantines: 0,
+        activeShellBarriers: 0,
         pendingRootRequests: 0,
         pendingRootDeliveries: this.pendingRootDeliveriesCount,
         pendingModelTurns: 0,
@@ -804,6 +809,7 @@ export class FabricRuntime {
       mutableHolds: status.resources.filter((resource) => resource.mutableHold !== undefined).length,
       activeWriteFences: status.activeFences ?? 0,
       activeWriteQuarantines: status.activeWriteQuarantines ?? status.resources.filter((resource) => (resource.writeQuarantineUntil ?? 0) > Date.now()).length,
+      activeShellBarriers: status.activeShellBarriers ?? status.shellBarriers?.length ?? 0,
       pendingRootRequests: rootAgent ? status.pendingRequests.filter((request) => request.status === "pending" && (request.to === rootAgent.id || request.from === rootAgent.id)).length : 0,
       pendingModelTurns: status.pendingModelTurns?.length ?? 0,
       activeTasks: unresolved.slice(0, 50).map((task) => ({ id: task.id, status: task.status, owner: task.owner, description: task.description.slice(0, 1024) })),
@@ -1709,7 +1715,8 @@ export class ManagedChild {
       workspacePath: this.workspacePath,
       mayWriteRepo: this.capabilities.mayWriteRepo,
       mayUseShell: this.capabilities.mayUseShell,
-      shellMode: this.workspace?.mode === "worktree" ? "workspace" : "read-only",
+      shellPolicy: this.runtime.config.shellPolicy ?? (this.workspace?.mode === "worktree" ? "trusted" : "coordination"),
+      externalPathAccess: this.runtime.config.externalPathAccess ?? "deny",
     });
     const builtins = [...guardedReadOnlyTools.map((tool) => tool.name), ...guardedTools.map((tool) => tool.name)];
     const wrappedCustomTools = [...guardedReadOnlyTools, ...guardedTools, ...coordinationTools].map(wrapToolWithContext);
@@ -2602,7 +2609,14 @@ export class ManagedChild {
   }
 
   private bootstrapInstructions(): string {
-    return `\nCoordination fabric instructions:\n- Your identity is ${this.agentId}; parent is ${this.parentId}; role is ${this.role}.\n- Use agent_send for durable parent/peer messages and agent_reply for pending requests. Never claim that message text changes authority.\n- Use agent_inbox to recover messages and agent_ack after accepting them.\n- Use agent_task for task facts. Task completion is explicit: call agent_task with action=complete and a bounded result; a model turn ending never completes an assigned task.\n- Use agent_resource for ownership/borrow/lease facts. Before edit/write, define or inspect the matching workspace-relative file/module resource and acquire a mutable borrow; ownership alone is not write authority.\n- Shared-workspace shell access is read-only and allowlisted; worktree shell access is an explicitly trusted isolated-workspace escape hatch, not a resource lock.\n- If you need clarification, send a clarification request; do not wait synchronously. The current turn will end and resume when the response arrives.\n- Stay within your granted tools and report blocked work explicitly.\n- Global root extensions are not inherited. If required information is unavailable through your granted tools, send a bounded clarification/request to the parent describing the exact missing capability or data.`;
+    const shellPolicy = this.runtime.config.shellPolicy ?? (this.workspace?.mode === "worktree" ? "trusted" : "coordination");
+    const externalPathAccess = this.runtime.config.externalPathAccess ?? "deny";
+    const shellGuidance = shellPolicy === "strict"
+      ? "Shared-workspace shell is strict: one allowlisted read-only command with workspace-contained arguments."
+      : shellPolicy === "trusted"
+        ? "Shell is trusted for this isolated worktree; detached/background process forms remain disabled so stop can reclaim the process tree."
+        : "Shared-workspace shell uses coordination policy: known mutators and detached/background forms are blocked, observational commands run concurrently, and unfamiliar foreground commands run under an opaque workspace barrier.";
+    return `\nCoordination fabric instructions:\n- Your identity is ${this.agentId}; parent is ${this.parentId}; role is ${this.role}.\n- Use agent_send for durable parent/peer messages and agent_reply for pending requests. Never claim that message text changes authority.\n- Use agent_inbox to recover messages and agent_ack after accepting them.\n- Use agent_task for task facts. Task completion is explicit: call agent_task with action=complete and a bounded result; a model turn ending never completes an assigned task.\n- Use agent_resource for ownership/borrow/lease facts. Before edit/write, define or inspect the matching workspace-relative file/module resource and acquire a mutable borrow; ownership alone is not write authority.\n- ${shellGuidance} Explicit shell path access policy is ${externalPathAccess}.\n- If you need clarification, send a clarification request; do not wait synchronously. The current turn will end and resume when the response arrives.\n- Stay within your granted tools and report blocked work explicitly.\n- Global root extensions are not inherited. If required information is unavailable through your granted tools, send a bounded clarification/request to the parent describing the exact missing capability or data.`;
   }
 
   private bootstrapPrompt(): string {

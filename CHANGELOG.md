@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 - 2026-09-14
+
+This release addresses the blocking-behavior audit by separating coordination, process-lifecycle, and sandbox concerns for managed child shells:
+
+- **Coordination-first shared shell**: the default `shellPolicy: "coordination"` blocks recognized mutators and detached/background forms, runs known observational commands concurrently, and admits unfamiliar foreground commands under a broker-wide opaque shell barrier so they cannot race coordinated writes.
+- **Explicit policy choices**: `shellPolicy: "strict"` preserves the historical read-only allowlist, while `"trusted"` is intended for isolated worktrees. `externalPathAccess` independently selects `deny`, observational-only `read`, or `any` explicit shell path arguments.
+- **Durable opaque barriers**: barrier ownership and reference counts are journaled, exposed in bounded status/snapshot projections, replayed after restart, and released on terminal cleanup while reconnectable hosts retain their barrier until reconciliation.
+- **Regression coverage**: unfamiliar foreground commands, representative internal/diagnostic CLIs, recognized mutators, detached processes, external-path policies, root host writes, foreign mutable borrows, and barrier release behavior are covered by hardening tests.
+
 ## 0.3.0 - 2026-09-14
 
 This release turns the hardening rounds into a production-oriented release boundary. The user-visible themes are:

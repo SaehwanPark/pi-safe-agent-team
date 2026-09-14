@@ -112,6 +112,8 @@ export interface FabricStateSnapshotV1 {
   activeWriteFences: number;
   /** Durable restart quarantine for a write that may have crossed broker loss. */
   activeWriteQuarantines: number;
+  /** Opaque shared-workspace shell operations holding the coordination barrier. */
+  activeShellBarriers?: number;
   pendingRootRequests: number;
   pendingRootDeliveries: number;
   /** Model turns waiting for durable global/route capacity admission. */
