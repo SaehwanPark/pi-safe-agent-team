@@ -584,9 +584,9 @@ function formatMessage(message: AgentMessage): string {
   return `[${message.type}] ${message.from} -> ${message.to}: ${message.body}`;
 }
 
-function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricStateSnapshotV1 | null): string {
+export function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricStateSnapshotV1 | null): string {
   if (mode === "tree" || mode === "agents") {
-    return status.agents.map((agent) => {
+    const rows = status.agents.map((agent) => {
       const indent = "  ".repeat(agent.depth);
       if (agent.depth === 0) {
         return `${agent.id} [${agent.status}] ${agent.role} ${agent.route.provider}/${agent.route.model}`;
@@ -603,10 +603,17 @@ function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricState
         agent.contextDiagnostic ? `${indent}  context-diagnostic=${agent.contextDiagnostic}` : undefined,
       ].filter(Boolean);
       return lines.join("\n");
-    }).join("\n") || "safe-agents: no agents";
+    }).join("\n");
+    return [boundedNotice("agents", status.agents.length, status.totalAgents, status.truncated?.agents), rows || "safe-agents: no agents"].filter(Boolean).join("\n");
   }
-  if (mode === "tasks") return status.tasks.map((task) => `${task.id} [${task.status}] ${task.owner ?? "unclaimed"}: ${task.description}`).join("\n") || "safe-agents: no tasks";
-  if (mode === "resources") return status.resources.map((resource) => `${resource.id}@${resource.version} owner=${resource.owner ?? "none"} shared=${resource.sharedHolds.length} mutable=${resource.mutableHold?.agentId ?? "none"} waiters=${resource.waiters.length}`).join("\n") || "safe-agents: no resources";
+  if (mode === "tasks") {
+    const rows = status.tasks.map((task) => `${task.id} [${task.status}] ${task.owner ?? "unclaimed"}: ${task.description}`).join("\n");
+    return [boundedNotice("tasks", status.tasks.length, status.totalTasks, status.truncated?.tasks), rows || "safe-agents: no tasks"].filter(Boolean).join("\n");
+  }
+  if (mode === "resources") {
+    const rows = status.resources.map((resource) => `${resource.id}@${resource.version} owner=${resource.owner ?? "none"} shared=${resource.sharedHolds.length} mutable=${resource.mutableHold?.agentId ?? "none"} waiters=${resource.waiters.length}`).join("\n");
+    return [boundedNotice("resources", status.resources.length, status.totalResources, status.truncated?.resources), rows || "safe-agents: no resources"].filter(Boolean).join("\n");
+  }
   if (mode === "messages") return status.recentMessages.slice(0, 30).map(formatMessage).join("\n\n") || "safe-agents: no recent messages";
 
   const quiescentStr = snapshot ? (snapshot.quiescent ? "yes" : "no") : "unknown";
@@ -624,12 +631,21 @@ function formatStatus(status: FabricStatus, mode: string, snapshot?: FabricState
     `pending root requests: ${pendingRequests}`,
     `pending root deliveries: ${pendingDeliveries}`,
     `root context: ${snapshot?.rootCompactionInFlight ? "compacting" : snapshot?.rootContextHealth === "degraded" ? `degraded${snapshot.rootContextDiagnostic ? ` (${snapshot.rootContextDiagnostic})` : ""}` : "healthy"}`,
-    `agents: ${status.agents.length} (running ${status.runningChildren})`,
-    `tasks: ${status.tasks.length}`,
-    `resources: ${status.resources.length}`,
+    formatCount("agents", status.agents.length, status.totalAgents, status.truncated?.agents) + ` (running ${status.runningChildren})`,
+    formatCount("tasks", status.tasks.length, status.totalTasks, status.truncated?.tasks),
+    formatCount("resources", status.resources.length, status.totalResources, status.truncated?.resources),
     "",
     ...status.agents.map((agent) => `${agent.id} [${agent.status}] ${agent.role} context=${agent.contextMode ?? "native"}`),
   ].filter((line): line is string => Boolean(line)).join("\n");
 
   return summary;
+}
+
+function formatCount(label: string, visible: number, total: number | undefined, truncated: boolean | undefined): string {
+  const authoritative = Number.isInteger(total) ? total as number : visible;
+  return truncated ? `${label}: showing ${visible} of ${authoritative} (truncated)` : `${label}: ${authoritative}`;
+}
+
+function boundedNotice(label: string, visible: number, total: number | undefined, truncated: boolean | undefined): string | undefined {
+  return truncated ? `safe-agents: showing ${visible} of ${Number.isInteger(total) ? total : "an unknown total"} ${label}; use the paginated ${label} operation for complete results` : undefined;
 }

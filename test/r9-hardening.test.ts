@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Coordinator } from "../src/core/coordinator.ts";
 import { FabricError } from "../src/core/errors.ts";
-import type { AgentRecord, AgentSummary, FabricConfig, ModelRoute, ResourceRecord } from "../src/core/types.ts";
+import type { AgentRecord, AgentSummary, FabricConfig, FabricStatus, ModelRoute, ResourceRecord } from "../src/core/types.ts";
 import { FabricRuntime, ManagedChild } from "../src/pi/runtime.ts";
+import { formatStatus } from "../index.ts";
 
 const route: ModelRoute = { provider: "test", model: "small", thinking: "medium" };
 
@@ -181,6 +182,28 @@ test("cleanup discovery starts its own cursor when bounded status omits one", as
   const discovered = await (runtime as any).discoverAllAgentsForCleanup(status) as AgentSummary[];
   assert.equal(calls[0].after, undefined);
   assert.equal(discovered.some((agent) => agent.id === "late-agent"), true);
+});
+
+test("agent diagnostics report authoritative totals when bounded pages are truncated", () => {
+  const status = {
+    rootId: "fabric",
+    agents: [],
+    tasks: [],
+    resources: [],
+    pendingRequests: [],
+    recentMessages: [],
+    runningChildren: 0,
+    totalAgents: 347,
+    totalTasks: 12,
+    totalResources: 9,
+    truncated: { agents: true, tasks: false, resources: true, pendingRequests: false, recentMessages: false },
+    config: {} as FabricConfig,
+  } as FabricStatus;
+  const text = formatStatus(status, "status");
+  assert.match(text, /agents: showing 0 of 347 \(truncated\)/);
+  assert.match(text, /tasks: 12/);
+  assert.match(formatStatus(status, "tasks"), /showing 0 of 12|safe-agents: no tasks/);
+  assert.match(formatStatus(status, "resources"), /showing 0 of 9/);
 });
 
 test("retaining a committed worktree does not retain its child session transcript", async () => {
