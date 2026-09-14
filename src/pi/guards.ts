@@ -657,11 +657,19 @@ export function assertCoordinationShellCommand(command: string): RootShellRisk {
   if (!trimmed) throw new FabricError("CAPABILITY_DENIED", "Empty shell commands are not allowed");
   if (trimmed.includes("\u0000")) throw new FabricError("CAPABILITY_DENIED", "Shell commands must not contain NUL characters");
   assertNoDetachedShellCommand(trimmed);
+  if (hasUnsafeGitInspectionOption(trimmed)) {
+    throw new FabricError("CAPABILITY_DENIED", "Git configuration and execution options are not allowed in a shared workspace");
+  }
   const risk = classifyRootShellCommand(trimmed);
   if (risk.kind === "known-mutator") {
     throw new FabricError("CAPABILITY_DENIED", `Shared-workspace coordination shell blocks recognized mutators: ${risk.reason}`);
   }
   return risk;
+}
+
+/** Prevent repository-local aliases and helper hooks from turning a read-looking Git invocation into a write. */
+function hasUnsafeGitInspectionOption(command: string): boolean {
+  return /\bgit(?:\.exe)?\b[^;&|]*(?:\s|^)(?:-c(?:\s|=)|--config-env(?:\s|=)|--config-system(?:\s|=)|--config-global(?:\s|=)|--exec-path(?:\s|=)|--git-dir(?:\s|=)|--work-tree(?:\s|=)|--upload-pack(?:\s|=)|--receive-pack(?:\s|=)|--exec(?:\s|=)|--ext-diff(?:\s|=)|--textconv(?:\s|=)|--show-signature(?:\s|=))/i.test(command);
 }
 
 /** Keep known observational commands from bypassing the direct path policy. */
@@ -699,6 +707,12 @@ function assertCoordinationInspectionSafety(command: string, risk: RootShellRisk
     return option === "-L" || /^-[^-]*L/.test(option) || option === "--follow" || option === "--pre" || option.startsWith("--pre=") || option === "--hostname-bin" || option.startsWith("--hostname-bin=");
   })) {
     throw new FabricError("CAPABILITY_DENIED", "ripgrep preprocessors and command hooks are not allowed in a shared workspace");
+  }
+  if (executable === "git" && tokens.some((token) => {
+    const option = stripQuotes(token);
+    return ["-C", "-c", "--config-env", "--config-system", "--config-global", "--exec-path", "--git-dir", "--work-tree", "-D", "-d", "-M", "-m", "--delete", "--move", "--output", "--output=", "--edit-description", "--set-upstream-to", "--unset-upstream", "--track", "--create-reflog", "--exec", "--ext-diff", "--textconv", "--show-signature", "--upload-pack", "--receive-pack", "--help", "-h"].some((flag) => option === flag || option.startsWith(flag));
+  })) {
+    throw new FabricError("CAPABILITY_DENIED", "This git option can mutate the workspace or execute configured commands");
   }
   if ((executable === "diff" || executable === "git") && tokens.some((token) => {
     const option = stripQuotes(token);

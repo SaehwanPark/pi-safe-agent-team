@@ -211,6 +211,10 @@ test("shared git inspection cannot execute a repository alias", async () => {
     const sessionContext = { cwd: directory, sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined } };
     await bash.execute("bash-1", { command: "git status" }, undefined, undefined, sessionContext as never);
     await assert.rejects(() => readFile(join(directory, "alias-marker")));
+    assert.throws(
+      () => assertCoordinationShellCommand("git -c alias.status=!touch status"),
+      (error: unknown) => error instanceof FabricError && error.code === "CAPABILITY_DENIED",
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
