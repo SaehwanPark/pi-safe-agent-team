@@ -659,7 +659,7 @@
   <header class="top-nav">
     <a href="#" class="brand">
       <span>🛡️ safe-agents-team</span>
-      <span class="brand-badge">v0.2.3</span>
+      <span class="brand-badge">v0.3.0</span>
     </a>
     <div class="nav-actions">
       <button class="mobile-toggle" id="mobile-toggle" aria-label="Toggle navigation menu" style="display: none;">
@@ -715,7 +715,7 @@
       <!-- Hero Section -->
       <section id="overview" class="hero-section">
         <div class="hero-badges">
-          <span class="badge success">● Production Candidate v0.2.3</span>
+          <span class="badge success">● Production Candidate v0.3.0</span>
           <span class="badge">CI: Linux · macOS · Windows</span>
           <span class="badge">MIT License</span>
         </div>
@@ -1025,10 +1025,9 @@
       <section id="installation">
         <h2 class="section-header">Installation</h2>
         
-        <div class="callout warning">
-          <div class="callout-title">npm Deployment Deferred</div>
-          Due to npm registry authentication and credential configuration, direct installation via the public npm registry is currently deferred. 
-          <strong>Please install directly from the GitHub repository using the options below.</strong>
+        <div class="callout info">
+          <div class="callout-title">Verified Release Channels</div>
+          Tagged releases run cross-platform checks, the installed-tarball smoke, and the Pi + local-context-manager smoke before trusted npm publication. Use the GitHub install below for unreleased changes.
         </div>
 
         <h3 class="subsection-header">Option 1: Pi Package Manager (Recommended)</h3>
@@ -1041,7 +1040,16 @@
           <pre><code id="install-pi">pi install git:github.com/SaehwanPark/pi-safe-agent-team</code></pre>
         </div>
 
-        <h3 class="subsection-header">Option 2: Clone to User Extensions Directory</h3>
+        <h3 class="subsection-header">Option 2: Install the npm package</h3>
+        <div class="code-wrapper">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button class="copy-btn" onclick="copyCode('install-npm')">Copy</button>
+          </div>
+          <pre><code id="install-npm">npm install pi-safe-agent-team</code></pre>
+        </div>
+
+        <h3 class="subsection-header">Option 3: Clone to User Extensions Directory</h3>
         <p>Clone directly into your personal Pi extensions directory to make it available across all workspaces:</p>
         <div class="code-wrapper">
           <div class="code-header">
@@ -1051,7 +1059,7 @@
           <pre><code id="install-git">git clone https://github.com/SaehwanPark/pi-safe-agent-team ~/.pi/agent/extensions/pi-safe-agents-team</code></pre>
         </div>
 
-        <h3 class="subsection-header">Option 3: Local Development Setup</h3>
+        <h3 class="subsection-header">Option 4: Local Development Setup</h3>
         <div class="code-wrapper">
           <div class="code-header">
             <span>Terminal</span>
@@ -1183,12 +1191,12 @@ console.log("Write authorized, fence active:", writeFence.fenceId);</code></pre>
   <footer style="border-top: 1px solid var(--border-subtle); background: var(--bg-secondary); padding: 32px 24px; margin-top: auto;">
     <div style="max-width: 1440px; margin: 0 auto; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 16px; font-size: 0.9rem; color: var(--text-muted);">
       <div>
-        <strong style="color: var(--text-primary);">pi-safe-agents-team</strong> · v0.2.3 · MIT License · © Saehwan Park
+        <strong style="color: var(--text-primary);">pi-safe-agents-team</strong> · v0.3.0 · MIT License · © Saehwan Park
       </div>
       <div style="display: flex; gap: 24px; flex-wrap: wrap;">
         <a href="https://github.com/SaehwanPark/pi-safe-agent-team" style="color: var(--text-secondary); text-decoration: none;" target="_blank" rel="noopener">GitHub Repository</a>
         <a href="https://github.com/SaehwanPark/pi-safe-agent-team/blob/main/README.md" style="color: var(--text-secondary); text-decoration: none;" target="_blank" rel="noopener">README</a>
-        <a href="https://github.com/SaehwanPark/pi-safe-agent-team/releases/tag/v0.2.3" style="color: var(--text-secondary); text-decoration: none;" target="_blank" rel="noopener">Release (v0.2.3)</a>
+        <a href="https://github.com/SaehwanPark/pi-safe-agent-team/releases/tag/v0.3.0" style="color: var(--text-secondary); text-decoration: none;" target="_blank" rel="noopener">Release (v0.3.0)</a>
         <a href="https://github.com/SaehwanPark/pi-safe-agent-team/issues" style="color: var(--text-secondary); text-decoration: none;" target="_blank" rel="noopener">Issues</a>
       </div>
     </div>

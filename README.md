@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml/badge.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue.svg)](https://saehwanpark.github.io/pi-safe-agent-team/)
-[![Version](https://img.shields.io/badge/version-0.2.3-blue.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/releases/tag/v0.2.3)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue.svg)](https://github.com/SaehwanPark/pi-safe-agent-team/releases/tag/v0.3.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node](https://img.shields.io/badge/node-%3E%3D22.19.0-brightgreen.svg)](https://nodejs.org/)
 
@@ -35,7 +35,7 @@ An LLM should never be asked to act as a mutex, a distributed lock manager, a me
 1. **Rust-Inspired Hierarchical Borrowing**: Files and directories are hierarchical resources. Multiple agents can hold concurrent shared read leases, but only one agent may hold an exclusive mutable borrow across an overlapping hierarchy. Time-bounded leases automatically prevent deadlocks.
 2. **Write Fencing & Root Host Guard**: Before touching disk, an authorized writer establishes an in-flight write fence (`resource.begin_write` → write → `resource.end_write`) that keeps competing leases out even if a lease expires mid-mutation. The root user/parent session participates in borrowing without manual declarations: active child reservations veto conflicting root edits.
 3. **Physical Path Identity & Case Folding**: Symlinks, directory junctions, and relative path aliases are resolved to canonical real filesystem paths before coordinator checks. The broker automatically probes volume case-folding on startup (macOS APFS / Windows NTFS) to prevent cross-casing write collisions.
-4. **Durable Idempotency & Crash Recovery**: `agent.spawn`, `task.create`, lifecycle turns, and message ACKs enforce unique per-actor `operationId` records committed to an append-only transaction journal (`events.jsonl`). Ambiguous network/timeout retries replay original responses safely without duplicating agents, tasks, turns, or acknowledgements. Broker recovery fences complete descendant subtrees, retains task ownership during reconnect grace, and keeps reconnectable capacity reserved until reattach or expiry. Capacity grants are identified, durable, expiring reservations claimed by the exact host retry.
+4. **Durable Idempotency & Crash Recovery**: `agent.spawn`, `task.create`, lifecycle turns, and message ACKs enforce unique per-actor `operationId` records committed to an append-only transaction journal (`events.jsonl`). Exact ACK proofs continue in a cold append-only store after hot mailbox history is pruned. Ambiguous network/timeout retries replay original responses safely without duplicating agents, tasks, turns, or acknowledgements. Broker recovery fences complete descendant subtrees, retains task ownership during reconnect grace, and keeps reconnectable capacity reserved until reattach or expiry. Capacity grants are identified, durable, expiring reservations claimed by the exact host retry.
 5. **Non-Blocking Clarifications**: When a child asks for parent or user input via `agent_send(type="clarification")`, it yields its turn (`terminate: true`) and transitions to `waiting`. The parent is never blocked on the JavaScript event loop.
 6. **Hardened Sandboxing**: Shared-workspace shell access is strictly read-only (`git`, `rg`, `grep`, `cat`, etc.) and rejects indirect file-list expansion flags (such as `file -f` or `wc --files0-from`).
 7. **Root Shell Mutator Preflight Guard**: Root shell execution is intercepted before process spawn to detect broad mutations (`git checkout`, `git restore`, `rm -rf`, `prettier --write`, `sed -i`, `black`, `ruff format`, etc.) or pipe/redirection writes. If active child mutable holds or write fences exist in the workspace, the mutator is safely vetoed before damaging child work.
@@ -46,7 +46,7 @@ An LLM should never be asked to act as a mutex, a distributed lock manager, a me
 
 ## Comparison at a Glance
 
-| Capability | Standard Pi Subagents | `nicobailon/pi-subagents` | `tmustier/pi-agent-teams` | `pi-safe-agent-team` (v0.1) |
+| Capability | Standard Pi Subagents | `nicobailon/pi-subagents` | `tmustier/pi-agent-teams` | `pi-safe-agent-team` (v0.3) |
 | :--- | :--- | :--- | :--- | :--- |
 | **Concurrency Enforcement** | None (advisory) | None (advisory) | Git branch/worktree only | **Authoritative Borrow Checker + Leases** |
 | **Filesystem Write Guard** | None | None | None | **Write boundary hook with Write Fences** |
@@ -63,8 +63,8 @@ An LLM should never be asked to act as a mutex, a distributed lock manager, a me
 
 ## Installation
 
-> [!IMPORTANT]
-> **npm Publishing Deferred**: Due to account authentication setup, npm publishing is temporarily deferred. Please install directly from GitHub.
+> [!TIP]
+> **Release channels**: Tagged releases run the cross-platform verification, tarball smoke, and Pi + LCM smoke before trusted npm publication. Install an unreleased checkout from GitHub; install a published release with `npm install pi-safe-agent-team`.
 
 ### Option A: Install via Pi Package Manager (Recommended)
 
@@ -72,13 +72,19 @@ An LLM should never be asked to act as a mutex, a distributed lock manager, a me
 pi install git:github.com/SaehwanPark/pi-safe-agent-team
 ```
 
-### Option B: Clone into User Extensions Directory
+### Option B: Install the npm package
+
+```bash
+npm install pi-safe-agent-team
+```
+
+### Option C: Clone into User Extensions Directory
 
 ```bash
 git clone https://github.com/SaehwanPark/pi-safe-agent-team ~/.pi/agent/extensions/pi-safe-agents-team
 ```
 
-### Option C: Local Development
+### Option D: Local Development
 
 ```bash
 git clone https://github.com/SaehwanPark/pi-safe-agent-team.git
@@ -128,7 +134,7 @@ When an agent needs to edit a file:
 - **Borrowing Guarantee & Root Shell Escape Hatch**: Guarded Pi writes participate in borrowing and write fencing. Root shell remains a trusted escape hatch with best-effort preflight blocking of recognized broad mutators when live child holds exist. Shell commands are not mechanically sandbox-guaranteed.
 - **Child Capability Boundary**: Managed children run with `noExtensions: true` and receive only guarded tools. External web access, browser, MCP tools, and computer-use actions are root capabilities not inherited by children; children request external information through parent messages.
 - **Context Integration**: When an embedded context provider (`local-context-manager.embedded-context.v1`) is discovered via interop, children safely utilize adaptive output reduction and compaction without loading external extensions. If absent, children fall back cleanly to native Pi context behavior.
-- **Local-First IPC**: v0.1 is designed for local multi-agent coordination via Unix domain sockets and Windows named pipes. Distributed network clustering is planned for future milestones.
+- **Local-First IPC**: v0.3.0 provides local multi-agent coordination via Unix domain sockets and Windows named pipes. Distributed network clustering is planned for future milestones.
 
 ---
 
@@ -143,6 +149,7 @@ When an agent needs to edit a file:
 - [`bench/r7-long-run.ts`](bench/r7-long-run.ts) — Deterministic long-run/archive and write-quarantine benchmark (`npm run bench:r7 [iterations]`)
 - [`bench/r8-longevity-scale.ts`](bench/r8-longevity-scale.ts) — Default-retention hot-state, large-resource, bounded-frame, grant-recovery, and checkpoint soak (`npm run bench:r8 [iterations]`)
 - [`bench/r9-chaos.ts`](bench/r9-chaos.ts) — Broker/client/journal restart, dropped-connection, grant-expiry, ACK-pruning, resource-compaction, and retained-artifact chaos soak (`npm run bench:r9-chaos [iterations]`)
+- [`bench/r10-production-soak.ts`](bench/r10-production-soak.ts) — Real broker soak with default 24-hour hot history, rollback-image, memory, storage, and event-loop measurements (`npm run bench:r10-production-soak [items]`)
 - [`PRIOR_ART.md`](PRIOR_ART.md) — Technical breakdown of preceding agent implementations
 
 ---

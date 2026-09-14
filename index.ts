@@ -21,6 +21,7 @@ export { effectivePrefillBudget, modelRouteCapacity, modelRouteCapacityKey, mode
 export { BrokerClient } from "./src/broker/client.ts";
 export { BrokerServer, startBroker } from "./src/broker/server.ts";
 export { RetainedArtifactStore } from "./src/broker/artifact-store.ts";
+export { AckProofStore } from "./src/broker/ack-proof-store.ts";
 export { Journal } from "./src/broker/journal.ts";
 export { FabricRuntime, ManagedChild, taskAwareTurnStatus } from "./src/pi/runtime.ts";
 export type { DescendantShutdownMode, HandoffSnapshot } from "./src/pi/runtime.ts";

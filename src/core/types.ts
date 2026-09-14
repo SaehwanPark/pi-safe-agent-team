@@ -217,6 +217,12 @@ export interface MessageAckTombstone {
   alreadyAcknowledged?: true;
 }
 
+/** Synchronous lookup boundary for ACK proofs kept outside coordinator hot state. */
+export interface MessageAckProofLookup {
+  findExact(to: AgentId, id: MessageId, revision: number): MessageAckTombstone | undefined;
+  findMessage(to: AgentId, id: MessageId): MessageAckTombstone | undefined;
+}
+
 /** Physical route capacity reserved while a running host reconnects after broker recovery. */
 export interface ModelTurnRecoveryReservation {
   agentId: AgentId;
@@ -231,6 +237,8 @@ export interface ModelTurnRecoveryReservation {
 /** Compact retired-resource identity retained after its runtime record is compacted. */
 export interface ResourceTombstone {
   id: ResourceId;
+  /** Durable identity of this resource incarnation. */
+  incarnation?: string;
   kind: string;
   parentId?: ResourceId;
   path?: string;
@@ -306,6 +314,8 @@ export interface ResourceWaiter {
 
 export interface ResourceRecord {
   id: ResourceId;
+  /** Durable incarnation identity; unlike `version`, it survives retirement history pruning. */
+  incarnation?: string;
   kind: string;
   parentId?: ResourceId;
   /** Workspace-relative path for mechanically guarded file/module writes. */
@@ -432,12 +442,12 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   historyGcBatchSize: 256,
 };
 
-export interface PersistedCoordinatorState {
-  version: 1;
+type PersistedResourceRecord = Omit<ResourceRecord, "incarnation"> & { incarnation?: string };
+
+interface PersistedCoordinatorStateFields {
   nextMessageSequence: Record<AgentId, number>;
   agents: AgentRecord[];
   tasks: TaskRecord[];
-  resources: ResourceRecord[];
   messages: AgentMessage[];
   requests: RequestRecord[];
   dedupe: Array<[string, MessageId]>;
@@ -459,13 +469,29 @@ export interface PersistedCoordinatorState {
   retainedArtifacts?: RetainedArtifactRecord[];
   /** Compact references emitted when retained artifact metadata is externalized. */
   retainedArtifactIds?: string[];
-  /** Compact ACK proofs survive message and ordinary idempotency retention. */
+  /** Optional in standalone coordinator snapshots; brokered ACK proofs are cold. */
   acknowledgedMessages?: MessageAckTombstone[];
   /** Capacity reservations for provider calls that may outlive a broker restart. */
   recoveryTurnReservations?: ModelTurnRecoveryReservation[];
+}
+
+/** Persisted state written by v0.2.x. It is accepted only as migration input. */
+export interface PersistedCoordinatorStateV1 extends PersistedCoordinatorStateFields {
+  version: 1;
+  resources: PersistedResourceRecord[];
+  /** Compact retired-resource history introduced after v0.2.3. */
+  archivedResources?: Array<Omit<ResourceTombstone, "incarnation"> & { incarnation?: string }>;
+}
+
+/** Persisted state written by v0.3.x and later. */
+export interface PersistedCoordinatorStateV2 extends PersistedCoordinatorStateFields {
+  version: 2;
+  resources: ResourceRecord[];
   /** Compact retired-resource history; active resources stay in `resources`. */
   archivedResources?: ResourceTombstone[];
 }
+
+export type PersistedCoordinatorState = PersistedCoordinatorStateV1 | PersistedCoordinatorStateV2;
 
 export interface AgentSummary {
   id: AgentId;
@@ -666,6 +692,7 @@ export function cloneResource(resource: ResourceRecord): ResourceRecord {
 export function resourceFromTombstone(tombstone: ResourceTombstone): ResourceRecord {
   return {
     id: tombstone.id,
+    incarnation: tombstone.incarnation,
     kind: tombstone.kind,
     parentId: tombstone.parentId,
     path: tombstone.path,

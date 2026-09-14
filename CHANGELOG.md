@@ -1,7 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-09-14
 
+This release turns the hardening rounds into a production-oriented release boundary. The user-visible themes are:
+
+- **Crash/reconnect convergence**: broker recovery preserves topology, task ownership, model-capacity reservations, and exact host reconciliation across restarts, with explicit persisted-state migration from v1 to v2.
+- **Durable messaging and exact ACK semantics**: bounded hot mailboxes retain exact revisions while an append-only cold ACK proof store keeps lost-ACK retries provable after mailbox and idempotency pruning.
+- **Local-model capacity and fairness**: route-aware capacity groups, durable FIFO turn tickets, targeted wakeups, recovery reservations, and bounded grant retry prevent local backends from being oversubscribed or starved.
+- **Context/LCM resilience**: embedded context management, native fallback, compaction recovery, and conservative fabric quiescence interoperate without loading child extensions.
+- **Safe retained Git artifacts**: clean worktrees are reclaimed only under verified conditions; dirty or committed artifacts remain inspectable with independent session/worktree retention and explicit resolution.
+- **Bounded long-running state**: terminal histories, resources, request records, artifacts, projections, and rollback images have explicit retention or identity boundaries; resource snapshot tokens include a durable incarnation.
+- **Observability and operator controls**: `/agents` exposes authoritative totals, truncation, resource fences, routes, context mode, artifacts, inbox state, and bounded fabric status/snapshot views.
+- **Release verification**: real broker chaos, production-default soak measurements, cross-platform release gates, Pi + LCM smoke, and an installed npm-tarball smoke run before publication.
+
+### Implementation audit trail
+
+- **Round-ten release hardening**: external ACK proofs, generation-safe resource reuse, exact-limit artifact admission, persisted state v2 migration with a tagged v0.2.3 fixture, the `bench:r10-production-soak` production-default benchmark, package tarball coverage, and release workflow gates.
 - **Round-nine convergence hardening**: ACK tombstones preserve exact recipient/message/revision proofs after mailbox and idempotency pruning; broker recovery reserves physical model capacity until the reconnecting host reconciles its provider call; unclaimed grants get bounded retry priority before FIFO demotion; retained artifact metadata is persisted in a separate atomic cold manifest with root-only list/resolve operations; worktree/session cleanup is independent; retired resources compact into bounded inspectable tombstones; long-ID cursors use opaque v2 encoding; `/agents` reports authoritative totals and truncation; and `bench:r9-chaos` exercises real BrokerServer/BrokerClient/journal restarts, dropped connections, expiry, pruning, and artifact recovery.
 - **Round-eight longevity/scale hardening**: `fabric.snapshot` and `fabric.status` use bounded server-side projections; committed/divergent worktrees become cold retained artifacts so terminal agents/tasks can archive; model-turn tickets carry operation/purpose identity with expiring host-claimed grants; archival uses bounded maintenance batches and relationship indexes while retaining task dependency edges; draining removes queued turns immediately; resources support root-authorized retirement; task/discovery cursors are stable and return `CURSOR_STALE`; and `bench:r8` exercises default-retention hot history, dynamic resources, large results/messages, capacity contention, restart shape, and 2 MiB frame bounds.
 - **Round-seven long-run convergence**: clean committed worktrees are preserved unless `HEAD` still equals the recorded base commit; reconnect grace retains semantic task ownership and suppresses transient `agent_failed` notices; descendant reconnect is parent-first; terminal agents/tasks/requests archive into bounded tombstones; read projections skip rollback cloning; model turns use durable FIFO capacity tickets and targeted wakes; ACKs replay safely after prune; artifact cleanup records a durable completion marker; and `bench:r7` measures soak latency plus write-quarantine journal overhead.
