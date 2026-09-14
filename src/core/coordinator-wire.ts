@@ -262,6 +262,26 @@ export function requestFingerprint(operation: string, args: Record<string, unkno
   return createHash("sha256").update(stableStringify({ operation, args: rest })).digest("hex");
 }
 
+/** Encode the ordering tuple used by stable agent/task pagination. */
+export function encodePaginationCursor(createdAt: number, id: string): string {
+  return `v1:${createdAt}:${encodeURIComponent(id)}`;
+}
+
+export function decodePaginationCursor(value: string): { createdAt: number; id: string } | undefined {
+  if (!value.startsWith("v1:")) return undefined;
+  const separator = value.indexOf(":", 3);
+  if (separator < 0) return undefined;
+  const createdAt = Number(value.slice(3, separator));
+  if (!Number.isSafeInteger(createdAt) || createdAt < 0) return undefined;
+  let id: string;
+  try {
+    id = decodeURIComponent(value.slice(separator + 1));
+  } catch {
+    return undefined;
+  }
+  return id.length > 0 && id.length <= 512 && !id.includes("\u0000") ? { createdAt, id } : undefined;
+}
+
 export function normalizeClone<T>(value: T): T {
   return value === undefined ? value : (JSON.parse(JSON.stringify(value)) as T);
 }

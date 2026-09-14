@@ -34,6 +34,7 @@ import {
   type RequestStatus,
   type RequestTombstone,
   type ResourceHold,
+  type RetainedArtifactRecord,
   type ResourceId,
   type ResourcePermission,
   type ResourceRecord,
@@ -43,6 +44,8 @@ import {
   type TaskResult,
   type TaskStatus,
   type TaskTombstone,
+  type FabricSnapshot,
+  type ModelTurnPurpose,
   type WriteFenceRecord,
 } from "./types.ts";
 import {
@@ -52,8 +55,9 @@ import {
   ALL_THINKING_LEVELS,
   INTERNAL_MESSAGE_TYPES,
   TERMINAL_STATUSES,
-  cloneConfig,
   defaultCapabilities,
+  decodePaginationCursor,
+  encodePaginationCursor,
   hasOwn,
   idempotencyKey,
   isDispatchResult,
@@ -158,6 +162,7 @@ export class Coordinator {
     "resource.list",
     "resource.check_write",
     "fabric.status",
+    "fabric.snapshot",
   ]);
 
   static isReadOnlyOperation(operation: string): boolean {
@@ -189,6 +194,8 @@ export class Coordinator {
   private archivedAgents = new Map<AgentId, AgentTombstone>();
   private archivedTasks = new Map<TaskId, TaskTombstone>();
   private archivedRequests = new Map<RequestId, RequestTombstone>();
+  /** Retained Git/session artifacts are cold metadata, not hot agent pins. */
+  private retainedArtifacts = new Map<string, RetainedArtifactRecord>();
   /** Ephemeral write fences (begin_write/end_write); never persisted or replayed. */
   private fences = new Map<string, WriteFenceRecord>();
 
@@ -220,6 +227,8 @@ export class Coordinator {
     assertCondition(this.config.heartbeatMs > 0, "INVALID_ARGUMENT", "heartbeatMs must be positive");
     assertCondition((this.config.agentHeartbeatTimeoutMs ?? 0) > 0, "INVALID_ARGUMENT", "agentHeartbeatTimeoutMs must be positive");
     assertCondition((this.config.reconnectGraceMs ?? 0) > 0, "INVALID_ARGUMENT", "reconnectGraceMs must be positive");
+    assertCondition(Number.isInteger(this.config.modelTurnGrantTtlMs) && (this.config.modelTurnGrantTtlMs ?? 0) > 0, "INVALID_ARGUMENT", "modelTurnGrantTtlMs must be a positive integer");
+    assertCondition(Number.isInteger(this.config.historyGcBatchSize) && (this.config.historyGcBatchSize ?? 0) > 0, "INVALID_ARGUMENT", "historyGcBatchSize must be a positive integer");
     this.validateRoutePolicies();
   }
 
@@ -285,6 +294,8 @@ export class Coordinator {
         return this.withEvents(events, this.configureChild(this.requireActor(actorId).id, args, events));
       case "agent.mark_artifacts_cleaned":
         return this.withEvents(events, this.markArtifactsCleaned(this.requireActor(actorId).id, parseString(args.agentId, "agentId"), events));
+      case "agent.mark_artifacts_retained":
+        return this.withEvents(events, this.markArtifactsRetained(this.requireActor(actorId).id, parseString(args.agentId, "agentId"), args.artifact, events));
       case "agent.begin_turn":
         return this.withEvents(events, this.beginTurn(this.requireActor(actorId).id, args, events));
       case "agent.drain":
@@ -328,7 +339,7 @@ export class Coordinator {
       case "resource.snapshot":
         return this.withEvents(events, this.resourceSnapshot(this.requireActor(actorId).id, parseString(args.resourceId, "resourceId")), events);
       case "resource.list":
-        return this.withEvents(events, this.listResources(this.requireActor(actorId).id), events);
+        return this.withEvents(events, this.listResources(this.requireActor(actorId).id, args), events);
       case "resource.grant":
         return this.withEvents(events, this.grantResource(this.requireActor(actorId).id, args, events));
       case "resource.claim":
@@ -346,8 +357,12 @@ export class Coordinator {
         return this.withEvents(events, this.beginWrite(this.requireActor(actorId).id, args, events), events);
       case "resource.end_write":
         return this.withEvents(events, this.endWrite(this.requireActor(actorId).id, args, events));
+      case "resource.retire":
+        return this.withEvents(events, this.retireResource(this.requireActor(actorId).id, parseString(args.resourceId, "resourceId"), events));
       case "fabric.status":
         return this.withEvents(events, this.status(this.requireActor(actorId).id, args), events);
+      case "fabric.snapshot":
+        return this.withEvents(events, this.snapshot(this.requireActor(actorId).id), events);
         default:
           throw new FabricError("INVALID_ARGUMENT", `Unknown coordinator operation: ${operation}`);
       }
@@ -478,9 +493,9 @@ export class Coordinator {
           events.push({ type: "task_changed", task: cloneTask(task) });
         }
       }
-      if (input.route && (input.route.provider !== existing.route.provider || input.route.model !== existing.route.model || input.route.thinking !== existing.route.thinking)) {
-        next.route = route;
-      }
+      const routeChanged = input.route && (input.route.provider !== existing.route.provider || input.route.model !== existing.route.model || input.route.thinking !== existing.route.thinking || input.route.capacityGroup !== existing.route.capacityGroup);
+      assertCondition(!routeChanged || this.findModelTurnWaiter(id) === undefined, "LIFECYCLE_CONFLICT", `Agent ${id} cannot change route while a model turn is queued`);
+      if (routeChanged) next.route = route;
       this.agents.set(id, next);
       events.push({ type: "agent_updated", agent: cloneAgent(next) });
       return { agent: publicAgent(next), token: next.authToken as string };
@@ -612,9 +627,43 @@ export class Coordinator {
     assertCondition(this.canControl(actor, target), "CAPABILITY_DENIED", `Agent ${actorId} cannot mark artifacts for ${targetId}`);
     assertCondition(isTerminal(target.status) && target.reconnectable !== true, "LIFECYCLE_CONFLICT", `Agent ${targetId} is not permanently stopped`);
     if (target.artifactsCleanedAt !== undefined) return publicAgent(target);
+    assertCondition(target.artifactDisposition !== "retained", "LIFECYCLE_CONFLICT", `Agent ${targetId} has retained artifacts that must not be certified as cleaned`);
     const next = cloneAgent(target);
     next.artifactsCleanedAt = this.clock();
+    next.artifactDisposition = "cleaned";
     this.agents.set(target.id, next);
+    events.push({ type: "agent_updated", agent: cloneAgent(next) });
+    return publicAgent(next);
+  }
+
+  private markArtifactsRetained(actorId: AgentId, targetId: AgentId, rawArtifact: unknown, events: CoordinatorEvent[]): AgentRecord {
+    const actor = this.requireActor(actorId);
+    const target = this.requireAgent(targetId);
+    assertCondition(target.depth > 0, "INVALID_ARGUMENT", "Only child agent artifacts may be retained");
+    assertCondition(this.canControl(actor, target), "CAPABILITY_DENIED", `Agent ${actorId} cannot retain artifacts for ${targetId}`);
+    assertCondition(isTerminal(target.status) && target.reconnectable !== true, "LIFECYCLE_CONFLICT", `Agent ${targetId} is not permanently stopped`);
+    assertCondition(target.artifactDisposition !== "cleaned" && target.artifactsCleanedAt === undefined, "LIFECYCLE_CONFLICT", `Agent ${targetId} has already been certified as cleaned`);
+    assertCondition(rawArtifact === undefined || (Boolean(rawArtifact) && typeof rawArtifact === "object" && !Array.isArray(rawArtifact)), "INVALID_ARGUMENT", "artifact must be an object");
+    const input = (rawArtifact ?? {}) as Record<string, unknown>;
+    const existing = target.retainedArtifactId ? this.retainedArtifacts.get(target.retainedArtifactId) : undefined;
+    const artifact: RetainedArtifactRecord = {
+      id: existing?.id ?? this.idFactory("retained-artifact"),
+      agentId: target.id,
+      workspace: input.workspace === undefined ? target.workspace ? { ...target.workspace } : undefined : parseWorkspace(input.workspace),
+      sessionPath: parseOptionalString(input.sessionPath, "artifact.sessionPath", 4096),
+      baseRef: parseOptionalString(input.baseRef, "artifact.baseRef", 512),
+      headRef: parseOptionalString(input.headRef, "artifact.headRef", 512),
+      reason: parseOptionalString(input.reason, "artifact.reason", 2048),
+      retainedAt: existing?.retainedAt ?? this.clock(),
+    };
+    this.retainedArtifacts.set(artifact.id, { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined });
+    const next = cloneAgent(target);
+    next.artifactDisposition = "retained";
+    next.retainedArtifactId = artifact.id;
+    next.artifactsCleanedAt = undefined;
+    next.lastActivity = this.clock();
+    this.agents.set(target.id, next);
+    events.push({ type: "agent_artifacts_retained", agentId: target.id, artifact: { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined } });
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
     return publicAgent(next);
   }
@@ -624,9 +673,10 @@ export class Coordinator {
     const next = cloneAgent(agent);
     const requestedStatus = args.status as AgentStatus | undefined;
     if (args.route !== undefined) next.route = this.validateRoute(args.route as ModelRoute);
-    const routeChanged = next.route.provider !== agent.route.provider || next.route.model !== agent.route.model || next.route.thinking !== agent.route.thinking;
+    const routeChanged = next.route.provider !== agent.route.provider || next.route.model !== agent.route.model || next.route.thinking !== agent.route.thinking || next.route.capacityGroup !== agent.route.capacityGroup;
+    assertCondition(!routeChanged || this.findModelTurnWaiter(agent.id) === undefined, "LIFECYCLE_CONFLICT", `Agent ${agent.id} cannot change route while a model turn is queued`);
     if ((requestedStatus === "running" && agent.status !== "running") || (agent.status === "running" && routeChanged)) {
-      const runningExcludingSelf = this.runningAgentCount() - (agent.status === "running" ? 1 : 0);
+      const runningExcludingSelf = this.runningAgentCount() - (agent.status === "running" ? 1 : 0) + this.grantedModelTurnCount();
       assertCondition(runningExcludingSelf < this.config.maxConcurrentAgents, "AGENT_LIMIT_REACHED", "maxConcurrentAgents reached");
       this.assertRouteCapacity(next.route, agent.id);
     }
@@ -634,6 +684,13 @@ export class Coordinator {
       throw new FabricError("LIFECYCLE_CONFLICT", "Use agent.end_turn for terminal transitions so runtime claims are released");
     }
     if (requestedStatus) this.transitionStatus(next, requestedStatus, parseOptionalString(args.statusReason, "statusReason", 2048));
+    if (requestedStatus === "running" && next.status === "running" && next.activeTurnOperationId === undefined) {
+      next.activeTurnOperationId = this.idFactory("turn");
+      next.activeTurnPurpose = "turn";
+    } else if (requestedStatus !== undefined && requestedStatus !== "running") {
+      next.activeTurnOperationId = undefined;
+      next.activeTurnPurpose = undefined;
+    }
     assertCondition(args.taskId === undefined, "IDENTITY_CONFLICT", "Use task.claim or task.update to change task ownership");
     if (args.workspace !== undefined) next.workspace = parseWorkspace(args.workspace);
     if (args.contextMode !== undefined) next.contextMode = parseOptionalString(args.contextMode, "contextMode", 128);
@@ -651,21 +708,37 @@ export class Coordinator {
 
   private beginTurn(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): { started: boolean; reason?: string; queued?: boolean } {
     const agent = this.requireAgent(actorId);
-    // A retry can arrive after the broker granted a durable ticket but before
-    // its response reached the host. Compaction is deliberately different: it
-    // is nested inside the root's already-running turn and must not release the
-    // outer reservation when it finishes.
+    const purpose = this.parseTurnPurpose(args.purpose);
+    const operationId = args.operationId === undefined ? undefined : parseString(args.operationId, "operationId", 128);
+    // A compaction request made while a normal root turn is running is nested
+    // and must not release the outer reservation. Other retries may only claim
+    // the active turn when their logical operation identity matches it.
     if (agent.status === "running") {
-      if (args.purpose === "compaction") throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} is already running`);
+      if (purpose === "compaction") throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} is already running`);
+      if (operationId !== undefined && agent.activeTurnOperationId !== undefined && operationId !== agent.activeTurnOperationId) {
+        throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} is already running another model turn`);
+      }
+      if (operationId !== undefined && agent.activeTurnOperationId === undefined) {
+        throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} has no matching active model turn`);
+      }
       return { started: true };
     }
     if (isTerminal(agent.status)) throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} is terminal`);
     assertCondition(agent.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot start another turn`);
 
-    const queued = this.findModelTurnWaiter(actorId);
-    if (queued) {
+    const waiter = this.findModelTurnWaiter(actorId);
+    if (waiter) {
+      if (waiter.operationId !== undefined && waiter.operationId !== operationId || waiter.purpose !== undefined && waiter.purpose !== purpose) {
+        throw new FabricError("LIFECYCLE_CONFLICT", `Agent ${actorId} already has a queued model turn`);
+      }
       this.drainModelTurnWaiters(events);
-      if (this.requireAgent(actorId).status === "running") return { started: true };
+      const current = this.findModelTurnWaiter(actorId);
+      if (current?.state === "granted" && (current.operationId === undefined || current.operationId === operationId)) {
+        this.modelWaiters.delete(current.id);
+        events.push({ type: "model_turn_claimed", waiterId: current.id, agentId: actorId, operationId: current.operationId, purpose: current.purpose });
+        this.startTurn(agent, events, current.operationId ?? operationId, current.purpose ?? purpose);
+        return { started: true };
+      }
       return { started: false, reason: this.turnCapacityReason(agent), queued: true };
     }
 
@@ -678,6 +751,9 @@ export class Coordinator {
         route: { ...agent.route },
         capacityKey: modelRouteCapacityKey(this.config, agent.route),
         enqueuedAt: this.clock(),
+        operationId,
+        purpose,
+        state: "queued",
       };
       this.modelWaiters.set(waiter.id, waiter);
       events.push({ type: "model_turn_waiting", waiter: cloneModelTurnWaiter(waiter) });
@@ -689,26 +765,38 @@ export class Coordinator {
         : { started: false, reason, queued: true };
     }
 
-    this.startTurn(agent, events);
+    this.startTurn(agent, events, operationId, purpose);
     return { started: true };
   }
 
-  private startTurn(agent: AgentRecord, events: CoordinatorEvent[]): void {
+  private parseTurnPurpose(value: unknown): ModelTurnPurpose {
+    if (value === undefined) return "turn";
+    assertCondition(value === "turn" || value === "compaction", "INVALID_ARGUMENT", "purpose must be turn or compaction");
+    return value;
+  }
+
+  private startTurn(agent: AgentRecord, events: CoordinatorEvent[], operationId?: string, purpose: ModelTurnPurpose = "turn"): void {
     const next = cloneAgent(agent);
     if (next.status === "starting") next.status = "ready";
     this.transitionStatus(next, "running");
+    next.activeTurnOperationId = operationId ?? this.idFactory("turn");
+    next.activeTurnPurpose = purpose;
     next.lastActivity = this.clock();
     this.agents.set(next.id, next);
     events.push({ type: "agent_updated", agent: cloneAgent(next) });
   }
 
   private turnCapacityReason(agent: AgentRecord): string | undefined {
-    if (this.runningAgentCount() >= this.config.maxConcurrentAgents) return "maxConcurrentAgents reached";
+    if (this.runningAgentCount() + this.grantedModelTurnCount() >= this.config.maxConcurrentAgents) return "maxConcurrentAgents reached";
     const routeLimit = this.routeCapacityLimit(agent.route);
-    if (routeLimit !== undefined && this.runningRouteCount(agent.route, agent.id) >= routeLimit) {
+    if (routeLimit !== undefined && this.runningRouteCount(agent.route, agent.id) + this.grantedModelTurnCount(modelRouteCapacityKey(this.config, agent.route)) >= routeLimit) {
       return `model route capacity reached for ${modelRouteKey(agent.route)}`;
     }
     return undefined;
+  }
+
+  private grantedModelTurnCount(capacityKey?: string): number {
+    return [...this.modelWaiters.values()].filter((waiter) => waiter.state === "granted" && (capacityKey === undefined || waiter.capacityKey === capacityKey)).length;
   }
 
   private findModelTurnWaiter(agentId: AgentId): ModelTurnWaiter | undefined {
@@ -728,18 +816,38 @@ export class Coordinator {
           changed = true;
           break;
         }
+        if (waiter.state === "granted") continue;
         // Preserve FIFO per physical backend while allowing an unrelated route
-        // to use an otherwise free global slot.
-        if ([...this.modelWaiters.values()].some((earlier) => earlier.id !== waiter.id && earlier.capacityKey === waiter.capacityKey && earlier.enqueuedSequence < waiter.enqueuedSequence)) continue;
+        // to use an otherwise free global slot. A grant reserves capacity until
+        // this exact host claims it or the short lease expires.
+        if ([...this.modelWaiters.values()].some((earlier) => earlier.id !== waiter.id && earlier.state !== "granted" && earlier.capacityKey === waiter.capacityKey && earlier.enqueuedSequence < waiter.enqueuedSequence)) continue;
         if (this.turnCapacityReason(agent)) continue;
-        this.modelWaiters.delete(waiter.id);
-        events.push({ type: "model_turn_granted", waiterId: waiter.id, agentId: waiter.agentId });
-        this.startTurn(agent, events);
+        const now = this.clock();
+        waiter.state = "granted";
+        waiter.grantedAt = now;
+        waiter.grantExpiresAt = now + (this.config.modelTurnGrantTtlMs ?? DEFAULT_FABRIC_CONFIG.modelTurnGrantTtlMs!);
+        events.push({ type: "model_turn_granted", waiterId: waiter.id, agentId: waiter.agentId, operationId: waiter.operationId, purpose: waiter.purpose, grantedAt: waiter.grantedAt, grantExpiresAt: waiter.grantExpiresAt });
         events.push({ type: "slot_available", agentId: waiter.agentId });
         changed = true;
         break;
       }
     }
+  }
+
+  private expireModelTurnGrants(now: number, events: CoordinatorEvent[]): boolean {
+    let expired = false;
+    for (const waiter of this.modelWaiters.values()) {
+      if (waiter.state !== "granted" || (waiter.grantExpiresAt ?? Number.POSITIVE_INFINITY) > now) continue;
+      // A lost grant notification must not lose the caller's logical turn.
+      // Return the same ticket to the FIFO queue and let the normal drain
+      // path re-grant it when capacity is available.
+      waiter.state = "queued";
+      waiter.grantedAt = undefined;
+      waiter.grantExpiresAt = undefined;
+      events.push({ type: "model_turn_waiting", waiter: cloneModelTurnWaiter(waiter) });
+      expired = true;
+    }
+    return expired;
   }
 
   private removeModelTurnWaiter(agentId: AgentId, events: CoordinatorEvent[]): void {
@@ -771,6 +879,8 @@ export class Coordinator {
 
     const next = cloneAgent(agent);
     this.transitionStatus(next, effectiveStatus, parseOptionalString(args.statusReason, "statusReason", 2048));
+    next.activeTurnOperationId = undefined;
+    next.activeTurnPurpose = undefined;
     if (isTerminal(effectiveStatus)) {
       next.reconnectable = false;
       next.terminalAt = this.clock();
@@ -917,6 +1027,7 @@ export class Coordinator {
       for (const child of this.agents.values()) if (child.parentId === agent.id) visit(child);
       if (isTerminal(agent.status) || agent.status === "draining") return;
       const next = cloneAgent(agent);
+      this.removeModelTurnWaiter(agent.id, events);
       this.transitionStatus(next, "draining", reason ?? `Draining by ${actorId}`);
       next.lastActivity = this.clock();
       this.agents.set(next.id, next);
@@ -924,6 +1035,7 @@ export class Coordinator {
       draining.push(next.id);
     };
     visit(target);
+    this.drainModelTurnWaiters(events);
     return { draining };
   }
 
@@ -948,6 +1060,8 @@ export class Coordinator {
     next.reconnectable = false;
     next.terminalAt = this.clock();
     next.statusReason = reason;
+    next.activeTurnOperationId = undefined;
+    next.activeTurnPurpose = undefined;
     next.lastActivity = this.clock();
     this.removeModelTurnWaiter(next.id, events);
     this.agents.set(next.id, next);
@@ -989,9 +1103,29 @@ export class Coordinator {
     const status = args.status === undefined ? undefined : parseString(args.status, "status", 32);
     const filtered = status ? selected.filter((candidate) => candidate.status === status) : selected;
     const sorted = filtered.sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-    const after = args.after === undefined ? undefined : parseString(args.after, "after", 512);
-    const start = after === undefined ? 0 : Math.max(0, sorted.findIndex((candidate) => candidate.id === after) + 1);
-    return sorted.slice(start, start + this.listLimit(args.limit)).map((candidate) => this.toSummary(candidate));
+    const after = args.after === undefined ? undefined : parseString(args.after, "after", 4096);
+    const anchor = after === undefined ? undefined : this.agentPaginationAnchor(after);
+    const start = anchor === undefined ? 0 : sorted.findIndex((candidate) => candidate.createdAt > anchor.createdAt || candidate.createdAt === anchor.createdAt && candidate.id.localeCompare(anchor.id) > 0);
+    return sorted.slice(start < 0 ? sorted.length : start, (start < 0 ? sorted.length : start) + this.listLimit(args.limit)).map((candidate) => ({
+      ...this.toSummary(candidate),
+      cursor: encodePaginationCursor(candidate.createdAt, candidate.id),
+    }));
+  }
+
+  private agentPaginationAnchor(after: string): { createdAt: number; id: string } {
+    const decoded = decodePaginationCursor(after);
+    if (decoded) {
+      const hot = this.agents.get(decoded.id);
+      const archived = this.archivedAgents.get(decoded.id);
+      const createdAt = hot?.createdAt ?? archived?.createdAt ?? archived?.terminalAt;
+      assertCondition(createdAt !== undefined && createdAt === decoded.createdAt, "CURSOR_STALE", `Agent pagination cursor ${after} is stale`);
+      return decoded;
+    }
+    assertCondition(!after.startsWith("v1:"), "INVALID_ARGUMENT", "after contains an invalid pagination cursor");
+    const hot = this.agents.get(after);
+    const archived = this.archivedAgents.get(after);
+    assertCondition(hot || archived, "CURSOR_STALE", `Agent pagination cursor ${after} is stale`);
+    return { createdAt: hot?.createdAt ?? archived?.createdAt ?? archived?.terminalAt ?? 0, id: after };
   }
 
   private sendMessage(actorId: AgentId, input: MessageSendArgs, events: CoordinatorEvent[]): { message: AgentMessage; request?: RequestRecord } {
@@ -1263,9 +1397,30 @@ export class Coordinator {
       .filter((task) => status === undefined || task.status === status)
       .filter((task) => owner === undefined || task.owner === owner)
       .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
-    const after = args.after === undefined ? undefined : parseString(args.after, "after", 512);
-    const start = after === undefined ? 0 : Math.max(0, sorted.findIndex((task) => task.id === after) + 1);
-    return sorted.slice(start, start + this.listLimit(args.limit)).map(cloneTask);
+    const after = args.after === undefined ? undefined : parseString(args.after, "after", 4096);
+    const anchor = after === undefined ? undefined : this.taskPaginationAnchor(after);
+    const start = anchor === undefined ? 0 : sorted.findIndex((task) => task.createdAt > anchor.createdAt || task.createdAt === anchor.createdAt && task.id.localeCompare(anchor.id) > 0);
+    const offset = start < 0 ? sorted.length : start;
+    return sorted.slice(offset, offset + this.listLimit(args.limit)).map((task) => ({
+      ...cloneTask(task),
+      cursor: encodePaginationCursor(task.createdAt, task.id),
+    }));
+  }
+
+  private taskPaginationAnchor(after: string): { createdAt: number; id: string } {
+    const decoded = decodePaginationCursor(after);
+    if (decoded) {
+      const hot = this.tasks.get(decoded.id);
+      const archived = this.archivedTasks.get(decoded.id);
+      const createdAt = hot?.createdAt ?? archived?.createdAt ?? archived?.updatedAt;
+      assertCondition(createdAt !== undefined && createdAt === decoded.createdAt, "CURSOR_STALE", `Task pagination cursor ${after} is stale`);
+      return decoded;
+    }
+    assertCondition(!after.startsWith("v1:"), "INVALID_ARGUMENT", "after contains an invalid pagination cursor");
+    const hot = this.tasks.get(after);
+    const archived = this.archivedTasks.get(after);
+    assertCondition(hot || archived, "CURSOR_STALE", `Task pagination cursor ${after} is stale`);
+    return { createdAt: hot?.createdAt ?? archived?.createdAt ?? archived?.updatedAt ?? 0, id: after };
   }
 
   private showTask(actorId: AgentId, taskId: TaskId): TaskRecord {
@@ -1294,6 +1449,7 @@ export class Coordinator {
     }
     if (parentId) {
       assertCondition(parentId !== id && this.resources.has(parentId), "RESOURCE_NOT_FOUND", `Parent resource ${parentId} was not found`);
+      assertCondition(this.isResourceActive(this.requireResource(parentId)), "LIFECYCLE_CONFLICT", `Parent resource ${parentId} is retired`);
       assertCondition(!this.wouldCreateResourceCycle(id, parentId), "INVALID_ARGUMENT", `Resource ${id} would create a hierarchy cycle`);
     }
     const permissions = this.parsePermissions(args.permissions);
@@ -1304,6 +1460,7 @@ export class Coordinator {
       parentId,
       path: resourcePath,
       owner: actorId,
+      status: "active",
       version: 1,
       grants: { [actorId]: permissions.length ? permissions : ["read", "comment", "write", "test"] },
       sharedHolds: [],
@@ -1329,12 +1486,57 @@ export class Coordinator {
     return { resourceId, version: resource.version, token: `${resourceId}@${resource.version}` };
   }
 
-  private listResources(actorId: AgentId): ResourceRecord[] {
-    return [...this.resources.values()].filter((resource) => this.canInspectResource(actorId, resource)).map(cloneResource);
+  private listResources(actorId: AgentId, args: Record<string, unknown>): Array<ResourceRecord & { cursor?: string }> {
+    const sorted = [...this.resources.values()]
+      .filter((resource) => this.canInspectResource(actorId, resource))
+      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    const after = args.after === undefined ? undefined : parseString(args.after, "after", 4096);
+    const anchor = after === undefined ? undefined : this.resourcePaginationAnchor(after);
+    const start = anchor === undefined ? 0 : sorted.findIndex((resource) => resource.createdAt > anchor.createdAt || resource.createdAt === anchor.createdAt && resource.id.localeCompare(anchor.id) > 0);
+    const offset = start < 0 ? sorted.length : start;
+    return sorted.slice(offset, offset + this.listLimit(args.limit)).map((resource) => ({
+      ...cloneResource(resource),
+      cursor: encodePaginationCursor(resource.createdAt, resource.id),
+    }));
+  }
+
+  private resourcePaginationAnchor(after: string): { createdAt: number; id: string } {
+    const decoded = decodePaginationCursor(after);
+    if (decoded) {
+      const resource = this.resources.get(decoded.id);
+      assertCondition(resource !== undefined && resource.createdAt === decoded.createdAt, "CURSOR_STALE", `Resource pagination cursor ${after} is stale`);
+      return decoded;
+    }
+    assertCondition(!after.startsWith("v1:"), "INVALID_ARGUMENT", "after contains an invalid pagination cursor");
+    const resource = this.resources.get(after);
+    assertCondition(resource !== undefined, "CURSOR_STALE", `Resource pagination cursor ${after} is stale`);
+    return { createdAt: resource.createdAt, id: resource.id };
+  }
+
+  private retireResource(actorId: AgentId, resourceId: ResourceId, events: CoordinatorEvent[]): ResourceRecord {
+    const actor = this.requireActor(actorId);
+    assertCondition(actor.depth === 0, "CAPABILITY_DENIED", "Only a fabric root may retire resources");
+    const resource = this.requireResource(resourceId);
+    if (!this.isResourceActive(resource)) return cloneResource(resource);
+    assertCondition(resource.sharedHolds.length === 0 && resource.mutableHold === undefined, "RESOURCE_CONFLICT", `Cannot retire ${resource.id} while it is held`);
+    assertCondition(resource.waiters.length === 0, "RESOURCE_CONFLICT", `Cannot retire ${resource.id} while borrow requests are waiting`);
+    assertCondition((resource.writeQuarantineUntil ?? 0) <= this.clock(), "RESOURCE_CONFLICT", `Cannot retire ${resource.id} while a write quarantine is active`);
+    assertCondition(![...this.fences.values()].some((fence) => fence.expiresAt > this.clock() && this.overlaps(fence.resourceId, resource.id)), "RESOURCE_CONFLICT", `Cannot retire ${resource.id} while a write fence is active`);
+    assertCondition(![...this.resources.values()].some((candidate) => candidate.id !== resource.id && this.isResourceActive(candidate) && (candidate.parentId === resource.id || this.isAncestor(resource.id, candidate.id))), "RESOURCE_CONFLICT", `Cannot retire ${resource.id} while active child resources remain`);
+    resource.status = "retired";
+    resource.writeQuarantineUntil = undefined;
+    resource.writeQuarantineActorId = undefined;
+    resource.writeQuarantineFenceId = undefined;
+    resource.retiredAt = this.clock();
+    resource.version += 1;
+    resource.updatedAt = resource.retiredAt;
+    events.push({ type: "resource_changed", resource: cloneResource(resource) });
+    return cloneResource(resource);
   }
 
   private grantResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const resource = this.requireResource(parseString(args.resourceId, "resourceId"));
+    assertCondition(this.isResourceActive(resource), "LIFECYCLE_CONFLICT", `Resource ${resource.id} is retired`);
     const actor = this.requireActor(actorId);
     assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot grant resources`);
     assertCondition(this.canManageResource(actor, resource), "CAPABILITY_DENIED", `Agent ${actorId} cannot grant ${resource.id}`);
@@ -1351,6 +1553,7 @@ export class Coordinator {
 
   private claimResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const resource = this.requireResource(parseString(args.resourceId, "resourceId"));
+    assertCondition(this.isResourceActive(resource), "LIFECYCLE_CONFLICT", `Resource ${resource.id} is retired`);
     const actor = this.requireActor(actorId);
     assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot claim resources`);
     assertCondition(this.hasPermission(resource, actorId, "write") || actor.capabilities.mayTransferOwnership, "CAPABILITY_DENIED", `Agent ${actorId} cannot claim ${resource.id}`);
@@ -1380,6 +1583,7 @@ export class Coordinator {
 
   private borrowResource(actorId: AgentId, input: ResourceBorrowArgs, events: CoordinatorEvent[]): { status: "granted" | "waiting"; leaseId?: string; requestId?: RequestId; resource: ResourceRecord } {
     const resource = this.requireResource(parseString(input.resourceId, "resourceId"));
+    assertCondition(this.isResourceActive(resource), "LIFECYCLE_CONFLICT", `Resource ${resource.id} is retired`);
     const actor = this.requireActor(actorId);
     assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot borrow resources`);
     const mode = input.mode;
@@ -1413,6 +1617,7 @@ export class Coordinator {
 
   private transferResource(actorId: AgentId, args: Record<string, unknown>, events: CoordinatorEvent[]): ResourceRecord {
     const resource = this.requireResource(parseString(args.resourceId, "resourceId"));
+    assertCondition(this.isResourceActive(resource), "LIFECYCLE_CONFLICT", `Resource ${resource.id} is retired`);
     const actor = this.requireActor(actorId);
     assertCondition(actor.status !== "draining", "LIFECYCLE_CONFLICT", `Agent ${actorId} is draining and cannot transfer resources`);
     const targetId = parseString(args.agentId, "agentId");
@@ -1483,6 +1688,9 @@ export class Coordinator {
     assertCondition(resourceId || requestedPath, "INVALID_ARGUMENT", "resource.check_write requires resourceId or path");
 
     const selectedResource = resourceId ? this.requireResource(resourceId) : undefined;
+    if (selectedResource && !this.isResourceActive(selectedResource)) {
+      return { allowed: false, resourceId: selectedResource.id, reason: `Resource ${selectedResource.id} is retired` };
+    }
     const candidates = requestedPath
       ? this.resourcesForPath(requestedPath)
       : selectedResource ? [selectedResource] : [];
@@ -1601,49 +1809,241 @@ export class Coordinator {
     return false;
   }
 
-  private status(actorId: AgentId, args: Record<string, unknown>): FabricStatus {
+  private status(actorId: AgentId, _args: Record<string, unknown>): FabricStatus {
     const actor = this.requireActor(actorId);
     assertCondition(actor.depth === 0, "CAPABILITY_DENIED", "Only a fabric root may request full status");
     const now = this.clock();
-    const allMessages = [...this.messages.values()].sort((left, right) => (right.brokerSequence ?? 0) - (left.brokerSequence ?? 0) || right.createdAt - left.createdAt).slice(0, 100).map(cloneMessage);
+    const agents = [...this.agents.values()].sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    const tasks = [...this.tasks.values()].sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    const resources = [...this.resources.values()].sort((left, right) => {
+      const leftContention = (left.mutableHold ? 4 : 0) + (left.sharedHolds.length > 0 ? 2 : 0) + (left.waiters.length > 0 ? 1 : 0) + ((left.writeQuarantineUntil ?? 0) > now ? 2 : 0);
+      const rightContention = (right.mutableHold ? 4 : 0) + (right.sharedHolds.length > 0 ? 2 : 0) + (right.waiters.length > 0 ? 1 : 0) + ((right.writeQuarantineUntil ?? 0) > now ? 2 : 0);
+      return rightContention - leftContention || left.createdAt - right.createdAt || left.id.localeCompare(right.id);
+    });
+    const pendingRequests = [...this.requests.values()]
+      .filter((request) => request.status === "pending")
+      .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+    const recentMessages = [...this.messages.values()]
+      .sort((left, right) => (right.brokerSequence ?? 0) - (left.brokerSequence ?? 0) || right.createdAt - left.createdAt || right.id.localeCompare(left.id));
+    const fences = [...this.fences.values()].filter((candidate) => candidate.expiresAt > now);
+    const boundedLimit = 50;
     return {
       rootId: this.rootId,
-      agents: [...this.agents.values()].map((candidate) => this.toSummary(candidate)),
-      tasks: [...this.tasks.values()].map(cloneTask),
-      resources: [...this.resources.values()].map(cloneResource),
-      pendingRequests: [...this.requests.values()].filter((request) => request.status === "pending").map(cloneRequest),
-      recentMessages: allMessages,
-      runningChildren: this.runningAgentCount(),
-      config: cloneConfig(this.config),
-      activeFences: [...this.fences.values()].filter((candidate) => candidate.expiresAt > now).length,
-      fences: [...this.fences.values()]
-        .filter((candidate) => candidate.expiresAt > now)
-        .map((fence) => {
-          const res = this.resources.get(fence.resourceId);
-          return {
-            id: fence.id,
-            resourceId: fence.resourceId,
-            path: res?.path,
-            actorId: fence.actorId,
-          };
-        }),
-      activeWriteQuarantines: [...this.resources.values()].filter((resource) => (resource.writeQuarantineUntil ?? 0) > now).length,
-      pendingModelTurns: [...this.modelWaiters.values()].sort((left, right) => left.enqueuedSequence - right.enqueuedSequence).map(cloneModelTurnWaiter),
+      rootAgentId: (this.rootAgentId ? this.agents.get(this.rootAgentId) : agents.find((candidate) => candidate.depth === 0))?.id,
+      agents: agents.slice(0, boundedLimit).map((candidate) => this.toBoundedSummary(candidate)),
+      tasks: tasks.slice(0, boundedLimit).map((task) => this.toBoundedTask(task)),
+      resources: resources.slice(0, boundedLimit).map((resource) => this.toBoundedResource(resource)),
+      pendingRequests: pendingRequests.slice(0, boundedLimit).map((request) => this.toBoundedRequest(request)),
+      recentMessages: recentMessages.slice(0, 20).map((message) => this.toBoundedMessage(message)),
+      runningChildren: agents.filter((candidate) => candidate.depth > 0 && candidate.status === "running").length,
+      totalAgents: agents.length,
+      totalTasks: tasks.length,
+      totalResources: resources.length,
+      totalPendingRequests: pendingRequests.length,
+      totalRecentMessages: recentMessages.length,
+      config: this.boundedConfig(),
+      activeFences: fences.length,
+      activeMutableHolds: resources.filter((resource) => this.isResourceActive(resource) && resource.mutableHold !== undefined).length,
+      fences: fences.slice(0, boundedLimit).map((fence) => {
+        const res = this.resources.get(fence.resourceId);
+        return {
+          id: fence.id,
+          resourceId: fence.resourceId,
+          path: res?.path,
+          actorId: fence.actorId,
+        };
+      }),
+      activeWriteQuarantines: [...this.resources.values()].filter((resource) => this.isResourceActive(resource) && (resource.writeQuarantineUntil ?? 0) > now).length,
+      pendingModelTurns: [...this.modelWaiters.values()].sort((left, right) => left.enqueuedSequence - right.enqueuedSequence).slice(0, boundedLimit).map(cloneModelTurnWaiter),
       archivedCounts: {
         agents: this.archivedAgents.size,
         tasks: this.archivedTasks.size,
         requests: this.archivedRequests.size,
       },
+      truncated: {
+        agents: agents.length > boundedLimit,
+        tasks: tasks.length > boundedLimit,
+        resources: resources.length > boundedLimit,
+        pendingRequests: pendingRequests.length > boundedLimit,
+        recentMessages: recentMessages.length > 20,
+      },
+    };
+  }
+
+  private snapshot(actorId: AgentId): FabricSnapshot {
+    const actor = this.requireActor(actorId);
+    assertCondition(actor.depth === 0, "CAPABILITY_DENIED", "Only a fabric root may request a fabric snapshot");
+    const now = this.clock();
+    const root = this.rootAgentId ? this.agents.get(this.rootAgentId) : [...this.agents.values()].find((candidate) => candidate.depth === 0);
+    const unresolvedStatuses = new Set<TaskStatus>(["pending", "ready", "active", "waiting", "blocked"]);
+    const unresolvedTasks = [...this.tasks.values()].filter((task) => unresolvedStatuses.has(task.status));
+    const pendingRequests = [...this.requests.values()].filter((request) => request.status === "pending");
+    const activeWriteFences = [...this.fences.values()].filter((fence) => fence.expiresAt > now);
+    const mutableResources = [...this.resources.values()]
+      .filter((resource) => this.isResourceActive(resource) && resource.mutableHold !== undefined)
+      .sort((left, right) => left.updatedAt - right.updatedAt || left.id.localeCompare(right.id));
+    return {
+      rootId: this.rootId,
+      rootAgentId: root?.id,
+      rootStatus: root?.status,
+      caseInsensitivePaths: this.caseFoldPaths,
+      runningChildren: [...this.agents.values()].filter((candidate) => candidate.depth > 0 && ["starting", "running", "draining"].includes(candidate.status)).length,
+      recoveringAgents: [...this.agents.values()].filter((candidate) => candidate.reconnectable === true).length,
+      unresolvedChildTasks: unresolvedTasks.length,
+      unownedUnresolvedTasks: unresolvedTasks.filter((task) => task.owner === undefined).length,
+      mutableHolds: mutableResources.length,
+      activeWriteFences: activeWriteFences.length,
+      activeWriteQuarantines: [...this.resources.values()].filter((resource) => this.isResourceActive(resource) && (resource.writeQuarantineUntil ?? 0) > now).length,
+      pendingRootRequests: root ? pendingRequests.filter((request) => request.to === root.id || request.from === root.id).length : 0,
+      pendingModelTurns: this.modelWaiters.size,
+      fences: activeWriteFences.slice(0, 50).map((fence) => {
+        const resource = this.resources.get(fence.resourceId);
+        return { id: fence.id, resourceId: fence.resourceId, path: resource?.path, actorId: fence.actorId };
+      }),
+      activeTasks: unresolvedTasks.slice(0, 50).map((task) => ({ id: task.id, status: task.status, owner: task.owner, description: task.description.slice(0, 1024) })),
+      mutableResources: mutableResources.slice(0, 50).map((resource) => ({ id: resource.id, path: resource.path, holder: resource.mutableHold?.agentId })),
+    };
+  }
+
+  private boundedConfig(): FabricConfig {
+    // Route-policy maps are configuration, not quiescence state. Omitting
+    // them from the diagnostic projection prevents a large user config from
+    // defeating the broker's frame bound; the authoritative config remains in
+    // the broker process and checkpoints.
+    return {
+      caseInsensitivePaths: this.config.caseInsensitivePaths,
+      maxDepth: this.config.maxDepth,
+      maxChildrenPerAgent: this.config.maxChildrenPerAgent,
+      maxChildrenCreatedPerAgent: this.config.maxChildrenCreatedPerAgent,
+      maxTotalAgents: this.config.maxTotalAgents,
+      maxConcurrentAgents: this.config.maxConcurrentAgents,
+      maxMailboxMessages: this.config.maxMailboxMessages,
+      maxMessageBody: this.config.maxMessageBody,
+      maxTaskOutput: this.config.maxTaskOutput,
+      leaseMs: this.config.leaseMs,
+      heartbeatMs: this.config.heartbeatMs,
+      agentHeartbeatTimeoutMs: this.config.agentHeartbeatTimeoutMs,
+      reconnectGraceMs: this.config.reconnectGraceMs,
+      modelTurnGrantTtlMs: this.config.modelTurnGrantTtlMs,
+      messageRetention: this.config.messageRetention,
+      historyRetentionMs: this.config.historyRetentionMs,
+      maxArchivedRecords: this.config.maxArchivedRecords,
+      historyGcBatchSize: this.config.historyGcBatchSize,
+    };
+  }
+
+  private toBoundedSummary(agent: AgentRecord): AgentSummary {
+    const summary = this.toSummary(agent, false);
+    if (summary.contextDiagnostic) summary.contextDiagnostic = summary.contextDiagnostic.slice(0, 1024);
+    summary.capabilities = {
+      maySpawn: agent.capabilities.maySpawn,
+      mayMessagePeers: agent.capabilities.mayMessagePeers,
+      mayEscalate: agent.capabilities.mayEscalate,
+      mayTransferOwnership: agent.capabilities.mayTransferOwnership,
+      mayWriteRepo: agent.capabilities.mayWriteRepo,
+      mayUseShell: agent.capabilities.mayUseShell,
+      peerIds: agent.capabilities.peerIds.slice(0, 16).map((id) => id.slice(0, 128)),
+      resourceGrants: {},
+    };
+    return summary;
+  }
+
+  private toBoundedTask(task: TaskRecord): TaskRecord {
+    return {
+      id: task.id,
+      description: task.description.slice(0, 1024),
+      owner: task.owner,
+      creator: task.creator,
+      parentTaskId: task.parentTaskId,
+      dependencies: (task.dependencies ?? []).slice(0, 50),
+      status: task.status,
+      result: task.result ? {
+        summary: task.result.summary.slice(0, 1024),
+        output: task.result.output?.slice(0, 1024),
+        completedAt: task.result.completedAt,
+        by: task.result.by,
+      } : undefined,
+      blockedReason: task.blockedReason?.slice(0, 1024),
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+    };
+  }
+
+  private toBoundedResource(resource: ResourceRecord): ResourceRecord {
+    const boundedHold = (hold: ResourceHold): ResourceHold => ({
+      leaseId: hold.leaseId.slice(0, 128),
+      agentId: hold.agentId.slice(0, 128),
+      mode: hold.mode,
+      acquiredAt: hold.acquiredAt,
+      lastHeartbeat: hold.lastHeartbeat,
+      expiresAt: hold.expiresAt,
+      leaseMs: hold.leaseMs,
+    });
+    const boundedWaiter = (waiter: ResourceWaiter): ResourceWaiter => ({
+      requestId: waiter.requestId.slice(0, 128),
+      enqueuedSequence: waiter.enqueuedSequence,
+      agentId: waiter.agentId.slice(0, 128),
+      mode: waiter.mode,
+      enqueuedAt: waiter.enqueuedAt,
+      leaseMs: waiter.leaseMs,
+    });
+    return {
+      id: resource.id,
+      kind: resource.kind,
+      parentId: resource.parentId,
+      path: resource.path?.slice(0, 1024),
+      owner: resource.owner,
+      version: resource.version,
+      status: resource.status ?? "active",
+      retiredAt: resource.retiredAt,
+      grants: {},
+      sharedHolds: resource.sharedHolds.slice(0, 8).map(boundedHold),
+      mutableHold: resource.mutableHold ? boundedHold(resource.mutableHold) : undefined,
+      waiters: resource.waiters.slice(0, 8).map(boundedWaiter),
+      writeQuarantineUntil: resource.writeQuarantineUntil,
+      writeQuarantineActorId: resource.writeQuarantineActorId?.slice(0, 128),
+      writeQuarantineFenceId: resource.writeQuarantineFenceId?.slice(0, 128),
+      createdAt: resource.createdAt,
+      updatedAt: resource.updatedAt,
+    };
+  }
+
+  private toBoundedRequest(request: RequestRecord): RequestRecord {
+    const bounded = cloneRequest(request);
+    if (bounded.failureReason) bounded.failureReason = bounded.failureReason.slice(0, 1024);
+    return bounded;
+  }
+
+  private toBoundedMessage(message: AgentMessage): AgentMessage {
+    return {
+      id: message.id,
+      from: message.from,
+      to: message.to,
+      type: message.type,
+      body: message.body.slice(0, 2048),
+      revision: message.revision,
+      senderSequence: message.senderSequence,
+      brokerSequence: message.brokerSequence,
+      requestId: message.requestId,
+      replyTo: message.replyTo,
+      priority: message.priority,
+      createdAt: message.createdAt,
+      clientDedupeKey: message.clientDedupeKey?.slice(0, 128),
+      deliveredAt: message.deliveredAt,
+      acknowledgedAt: message.acknowledgedAt,
+      abandonedAt: message.abandonedAt,
     };
   }
 
   /** Run the time-based maintenance transition without requiring an actor request. */
-  maintenance(options: { skipStaleAgents?: boolean } = {}): DispatchResult<null> {
+  maintenance(options: { skipStaleAgents?: boolean; skipHistoricalArchival?: boolean } = {}): DispatchResult<null> {
     const events: CoordinatorEvent[] = [];
     const now = this.clock();
     this.reclaimExpired(now, events);
     this.reclaimStaleAgents(now, events, options.skipStaleAgents !== true);
-    this.archiveHistoricalRecords(now, events);
+    // A long event-loop suspension can make a large history eligible at once.
+    // Give live hosts one tick to reattach before doing bounded archival work.
+    if (options.skipHistoricalArchival !== true) this.archiveHistoricalRecords(now, events);
     return { value: null, events };
   }
 
@@ -1685,6 +2085,8 @@ export class Coordinator {
     next.reconnectable = false;
     next.recoveryExpiredAt = this.clock();
     next.terminalAt = next.recoveryExpiredAt;
+    next.activeTurnOperationId = undefined;
+    next.activeTurnPurpose = undefined;
     next.statusReason = "Reconnect grace expired; unfinished work returned to the task pool";
     next.lastActivity = next.recoveryExpiredAt;
     this.removeModelTurnWaiter(next.id, events);
@@ -1703,30 +2105,65 @@ export class Coordinator {
   private archiveHistoricalRecords(now: number, events: CoordinatorEvent[]): void {
     const retention = this.config.historyRetentionMs ?? DEFAULT_FABRIC_CONFIG.historyRetentionMs as number;
     const cutoff = now - retention;
+    let budget = Math.max(1, Math.floor(this.config.historyGcBatchSize ?? DEFAULT_FABRIC_CONFIG.historyGcBatchSize!));
 
-    // Archive leaves first. Removing an old child can then make its terminal
-    // parent eligible on the same maintenance pass without disturbing live
-    // topology or task ownership.
+    // Build each relationship index once per bounded pass. The previous
+    // implementation rescanned every whole collection for every candidate,
+    // making a permanently pinned terminal set quadratic under the default
+    // 24-hour retention window.
+    const childrenByParent = new Map<AgentId, Set<AgentId>>();
+    for (const agent of this.agents.values()) {
+      if (!agent.parentId) continue;
+      const children = childrenByParent.get(agent.parentId) ?? new Set<AgentId>();
+      children.add(agent.id);
+      childrenByParent.set(agent.parentId, children);
+    }
+    const nonTerminalTasksByOwner = new Set<AgentId>();
+    for (const task of this.tasks.values()) if (task.owner && !isTaskTerminal(task.status)) nonTerminalTasksByOwner.add(task.owner);
+    const resourceOwners = new Set<AgentId>();
+    const grantedResourcesByAgent = new Map<AgentId, ResourceRecord[]>();
+    for (const resource of this.resources.values()) {
+      if (resource.owner && this.isResourceActive(resource)) resourceOwners.add(resource.owner);
+      for (const agentId of Object.keys(resource.grants)) {
+        const granted = grantedResourcesByAgent.get(agentId) ?? [];
+        granted.push(resource);
+        grantedResourcesByAgent.set(agentId, granted);
+      }
+    }
+
+    // Archive leaves first. Removing a child updates the small parent index so
+    // a terminal parent can become eligible without another full scan.
     const terminalAgents = [...this.agents.values()]
       .filter((agent) => agent.depth > 0 && isTerminal(agent.status) && agent.reconnectable !== true)
       .sort((left, right) => right.depth - left.depth || (left.terminalAt ?? left.lastActivity) - (right.terminalAt ?? right.lastActivity));
     for (const agent of terminalAgents) {
+      if (budget <= 0) break;
       const current = this.agents.get(agent.id);
       if (!current || !isTerminal(current.status) || current.reconnectable === true) continue;
       const terminalAt = current.terminalAt ?? current.lastActivity;
       if (terminalAt > cutoff) continue;
-      // Runtime-managed children carry workspace/session artifacts. Keep the
-      // hot identity until the host or startup GC certifies both are handled.
-      if (current.workspace && current.artifactsCleanedAt === undefined) continue;
-      if ([...this.agents.values()].some((candidate) => candidate.parentId === current.id)) continue;
-      if ([...this.tasks.values()].some((task) => task.owner === current.id && !isTaskTerminal(task.status))) continue;
-      if ([...this.resources.values()].some((resource) => resource.owner === current.id)) continue;
+      // A useful committed/dirty worktree is retained deliberately. Its cold
+      // artifact record is sufficient; the hot agent identity need not remain.
+      if (current.workspace && current.artifactDisposition !== "cleaned" && current.artifactDisposition !== "retained" && current.artifactsCleanedAt === undefined) continue;
+      if ((childrenByParent.get(current.id)?.size ?? 0) > 0) continue;
+      if (nonTerminalTasksByOwner.has(current.id) || resourceOwners.has(current.id)) continue;
 
-      for (const resource of this.resources.values()) {
+      for (const resource of grantedResourcesByAgent.get(current.id) ?? []) {
         if (!hasOwn(resource.grants, current.id)) continue;
         delete resource.grants[current.id];
         resource.updatedAt = now;
         events.push({ type: "resource_changed", resource: cloneResource(resource) });
+      }
+      let retainedArtifactId = current.retainedArtifactId;
+      if (current.artifactDisposition === "retained" && !retainedArtifactId) {
+        retainedArtifactId = this.idFactory("retained-artifact");
+        this.retainedArtifacts.set(retainedArtifactId, {
+          id: retainedArtifactId,
+          agentId: current.id,
+          workspace: current.workspace ? { ...current.workspace } : undefined,
+          retainedAt: now,
+          reason: "Terminal agent artifacts were retained",
+        });
       }
       const tombstone: AgentTombstone = {
         id: current.id,
@@ -1735,33 +2172,60 @@ export class Coordinator {
         depth: current.depth,
         role: current.role,
         status: current.status as AgentTombstone["status"],
+        createdAt: current.createdAt,
         terminalAt,
+        taskId: current.taskId,
         recoveryExpiredAt: current.recoveryExpiredAt,
         artifactsCleanedAt: current.artifactsCleanedAt,
+        artifactDisposition: current.artifactDisposition ?? (current.artifactsCleanedAt !== undefined ? "cleaned" : undefined),
+        retainedArtifactId,
       };
       this.agents.delete(current.id);
       this.archivedAgents.set(current.id, tombstone);
       this.nextMessageSequence.delete(current.id);
+      if (current.parentId) childrenByParent.get(current.parentId)?.delete(current.id);
       events.push({ type: "agent_archived", agent: { ...tombstone } });
+      budget -= 1;
     }
 
-    for (const task of [...this.tasks.values()]) {
+    const nonTerminalDependents = new Set<TaskId>();
+    for (const candidate of this.tasks.values()) {
+      if (isTaskTerminal(candidate.status)) continue;
+      for (const dependency of candidate.dependencies ?? []) nonTerminalDependents.add(dependency);
+    }
+    const referencedByAgent = new Set<TaskId>();
+    for (const agent of this.agents.values()) {
+      if (!agent.taskId || isTerminal(agent.status)) continue;
+      if (this.tasks.has(agent.taskId)) referencedByAgent.add(agent.taskId);
+    }
+    for (const task of [...this.tasks.values()].sort((left, right) => left.updatedAt - right.updatedAt || left.id.localeCompare(right.id))) {
+      if (budget <= 0) break;
       if (!isTaskTerminal(task.status) || task.updatedAt > cutoff) continue;
-      // A hot terminal agent may still use taskId for lifecycle reconciliation.
-      if ([...this.agents.values()].some((agent) => agent.taskId === task.id)) continue;
-      if ([...this.tasks.values()].some((candidate) => candidate.id !== task.id && candidate.dependencies.includes(task.id) && !isTaskTerminal(candidate.status))) continue;
-      const tombstone: TaskTombstone = { id: task.id, status: task.status as TaskTombstone["status"], updatedAt: task.updatedAt };
+      if (referencedByAgent.has(task.id) || nonTerminalDependents.has(task.id)) continue;
+      const tombstone: TaskTombstone = {
+        id: task.id,
+        status: task.status as TaskTombstone["status"],
+        dependencies: [...(task.dependencies ?? [])],
+        parentTaskId: task.parentTaskId,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+      };
       this.tasks.delete(task.id);
       this.archivedTasks.set(task.id, tombstone);
       events.push({ type: "task_archived", task: { ...tombstone } });
+      budget -= 1;
     }
 
-    for (const request of [...this.requests.values()]) {
-      if (request.status === "pending" || request.resolvedAt === undefined || request.resolvedAt > cutoff) continue;
-      const tombstone: RequestTombstone = { id: request.id, status: request.status, resolvedAt: request.resolvedAt };
-      this.requests.delete(request.id);
-      this.archivedRequests.set(request.id, tombstone);
-      events.push({ type: "request_archived", request: { ...tombstone } });
+    if (budget > 0) {
+      for (const request of [...this.requests.values()].sort((left, right) => (left.resolvedAt ?? 0) - (right.resolvedAt ?? 0) || left.id.localeCompare(right.id))) {
+        if (budget <= 0) break;
+        if (request.status === "pending" || request.resolvedAt === undefined || request.resolvedAt > cutoff) continue;
+        const tombstone: RequestTombstone = { id: request.id, status: request.status, resolvedAt: request.resolvedAt };
+        this.requests.delete(request.id);
+        this.archivedRequests.set(request.id, tombstone);
+        events.push({ type: "request_archived", request: { ...tombstone } });
+        budget -= 1;
+      }
     }
     this.trimArchivedHistory(events);
   }
@@ -1774,6 +2238,7 @@ export class Coordinator {
       referencedAgents.add(task.creator);
     }
     for (const resource of this.resources.values()) {
+      if (!this.isResourceActive(resource)) continue;
       if (resource.owner) referencedAgents.add(resource.owner);
       for (const id of Object.keys(resource.grants)) referencedAgents.add(id);
       for (const hold of [...resource.sharedHolds, ...(resource.mutableHold ? [resource.mutableHold] : [])]) referencedAgents.add(hold.agentId);
@@ -1786,9 +2251,12 @@ export class Coordinator {
     for (const waiter of this.modelWaiters.values()) referencedAgents.add(waiter.agentId);
 
     const referencedTasks = new Set<TaskId>();
+    // Only hot records can still become live again or participate in a live
+    // dependency check. A tombstone's terminal edges are retained for
+    // diagnostics but must not pin the entire historical dependency graph.
     for (const task of this.tasks.values()) {
       if (task.parentTaskId) referencedTasks.add(task.parentTaskId);
-      for (const dependency of task.dependencies) referencedTasks.add(dependency);
+      for (const dependency of task.dependencies ?? []) referencedTasks.add(dependency);
     }
     const referencedRequests = new Set<RequestId>();
     for (const message of this.messages.values()) if (message.requestId) referencedRequests.add(message.requestId);
@@ -1824,6 +2292,9 @@ export class Coordinator {
       if (!ACTIVE_STATUSES.has(agent.status) || agent.reconnectable === true) continue;
       this.markReconnectableSubtree(agent.id, "Broker restarted before the agent reconnected", now, events, visited, recovered);
     }
+    // A persisted grant may have expired while the broker was down. Reapply
+    // the normal expiry/requeue path before exposing the recovered state.
+    this.reclaimExpired(now, events);
     return { value: { recovered }, events };
   }
 
@@ -1853,6 +2324,8 @@ export class Coordinator {
     next.status = "failed";
     next.statusReason = reason;
     next.reconnectable = true;
+    next.activeTurnOperationId = undefined;
+    next.activeTurnPurpose = undefined;
     next.terminalAt = undefined;
     next.lastActivity = now;
     this.agents.set(next.id, next);
@@ -1895,8 +2368,9 @@ export class Coordinator {
       nextModelTurnWaiterSequence: this.nextModelTurnWaiterSequence,
       modelWaiters: [...this.modelWaiters.values()].map(cloneModelTurnWaiter),
       archivedAgents: [...this.archivedAgents.values()].map((agent) => ({ ...agent })),
-      archivedTasks: [...this.archivedTasks.values()].map((task) => ({ ...task })),
+      archivedTasks: [...this.archivedTasks.values()].map((task) => ({ ...task, dependencies: [...(task.dependencies ?? [])] })),
       archivedRequests: [...this.archivedRequests.values()].map((request) => ({ ...request })),
+      retainedArtifacts: [...this.retainedArtifacts.values()].map((artifact) => ({ ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined })),
     };
   }
 
@@ -1912,6 +2386,7 @@ export class Coordinator {
     this.archivedAgents.clear();
     this.archivedTasks.clear();
     this.archivedRequests.clear();
+    this.retainedArtifacts.clear();
     this.nextMessageSequence.clear();
     this.nextBrokerSequence = state.nextBrokerSequence ?? 0;
     this.nextResourceWaiterSequence = state.nextResourceWaiterSequence ?? 0;
@@ -1940,8 +2415,9 @@ export class Coordinator {
       this.modelWaiters.set(next.id, next);
     }
     for (const archived of state.archivedAgents ?? []) this.archivedAgents.set(archived.id, { ...archived });
-    for (const archived of state.archivedTasks ?? []) this.archivedTasks.set(archived.id, { ...archived });
+    for (const archived of state.archivedTasks ?? []) this.archivedTasks.set(archived.id, { ...archived, dependencies: [...(archived.dependencies ?? [])] });
     for (const archived of state.archivedRequests ?? []) this.archivedRequests.set(archived.id, { ...archived });
+    for (const artifact of state.retainedArtifacts ?? []) this.retainedArtifacts.set(artifact.id, { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined });
     this.idempotency.clear();
     for (const entry of state.idempotency ?? []) this.rememberIdempotencyEntry({ ...entry });
   }
@@ -2001,9 +2477,28 @@ export class Coordinator {
           this.modelWaiters.set(waiter.id, waiter);
           break;
         }
-        case "model_turn_granted":
+        case "model_turn_granted": {
+          const waiter = this.modelWaiters.get(event.waiterId);
+          // Pre-R8 journals deleted a waiter when it was granted and emitted an
+          // agent_updated running record. New grants remain durable until the
+          // exact host claims them.
+          if (!waiter || event.grantExpiresAt === undefined) {
+            this.modelWaiters.delete(event.waiterId);
+            break;
+          }
+          waiter.state = "granted";
+          waiter.operationId = event.operationId ?? waiter.operationId;
+          waiter.purpose = event.purpose ?? waiter.purpose;
+          waiter.grantExpiresAt = event.grantExpiresAt;
+          waiter.grantedAt = event.grantedAt ?? waiter.grantedAt;
+          break;
+        }
+        case "model_turn_claimed":
         case "model_turn_cancelled":
           this.modelWaiters.delete(event.waiterId);
+          break;
+        case "agent_artifacts_retained":
+          this.retainedArtifacts.set(event.artifact.id, { ...event.artifact, workspace: event.artifact.workspace ? { ...event.artifact.workspace } : undefined });
           break;
         case "agent_archived":
           this.agents.delete(event.agent.id);
@@ -2012,7 +2507,7 @@ export class Coordinator {
           break;
         case "task_archived":
           this.tasks.delete(event.task.id);
-          this.archivedTasks.set(event.task.id, { ...event.task });
+          this.archivedTasks.set(event.task.id, { ...event.task, dependencies: [...(event.task.dependencies ?? [])] });
           break;
         case "request_archived":
           this.requests.delete(event.request.id);
@@ -2069,6 +2564,10 @@ export class Coordinator {
     const resource = this.resources.get(resourceId);
     assertCondition(resource, "RESOURCE_NOT_FOUND", `Resource ${resourceId} was not found`);
     return resource;
+  }
+
+  private isResourceActive(resource: ResourceRecord): boolean {
+    return resource.status !== "retired";
   }
 
   private validateRoute(route: ModelRoute): ModelRoute {
@@ -2374,6 +2873,7 @@ export class Coordinator {
   }
 
   private reclaimExpired(now: number, events: CoordinatorEvent[]): void {
+    const expiredModelTurnGrants = this.expireModelTurnGrants(now, events);
     for (const resource of this.resources.values()) {
       let changed = false;
       const before = resource.sharedHolds.length;
@@ -2409,6 +2909,7 @@ export class Coordinator {
       }
     }
     if (fencesPruned || events.some((event) => event.type === "resource_changed")) this.drainWaiters(events);
+    if (expiredModelTurnGrants) this.drainModelTurnWaiters(events);
   }
 
   private findHold(agentId: AgentId, resourceId: ResourceId, mode: BorrowMode): ResourceHold | undefined {
@@ -2446,7 +2947,7 @@ export class Coordinator {
   }
 
   private overlappingResources(resourceId: ResourceId): ResourceRecord[] {
-    return [...this.resources.values()].filter((candidate) => this.overlaps(resourceId, candidate.id));
+    return [...this.resources.values()].filter((candidate) => this.isResourceActive(candidate) && this.overlaps(resourceId, candidate.id));
   }
 
   private overlaps(left: ResourceId, right: ResourceId): boolean {
@@ -2534,6 +3035,7 @@ export class Coordinator {
 
   private resourcesForPath(path: string): ResourceRecord[] {
     return [...this.resources.values()]
+      .filter((resource) => this.isResourceActive(resource))
       .filter((resource) => {
         const resourcePath = this.declaredResourcePath(resource);
         if (!resourcePath) return false;
@@ -2642,21 +3144,25 @@ export class Coordinator {
   }
 
   private taskDependenciesCompleted(task: TaskRecord): boolean {
-    return task.dependencies.every((dependency) => this.taskStatus(dependency) === "completed");
+    return (task.dependencies ?? []).every((dependency) => this.taskStatus(dependency) === "completed");
   }
 
-  /** Return every non-cancelled downstream task, including transitive dependents. */
-  private taskDependents(taskId: TaskId): TaskRecord[] {
-    const dependents: TaskRecord[] = [];
+  /** Return every non-terminal downstream task; terminal history is semantically inert for reopen. */
+  private taskDependents(taskId: TaskId): Array<{ id: TaskId; status: TaskStatus }> {
+    const dependents: Array<{ id: TaskId; status: TaskStatus }> = [];
     const seen = new Set<TaskId>([taskId]);
     const queue: TaskId[] = [taskId];
+    const candidates = [
+      ...this.tasks.values(),
+      ...this.archivedTasks.values(),
+    ];
     while (queue.length > 0) {
       const prerequisite = queue.shift() as TaskId;
-      for (const candidate of this.tasks.values()) {
-        if (seen.has(candidate.id) || !candidate.dependencies.includes(prerequisite)) continue;
+      for (const candidate of candidates) {
+        if (seen.has(candidate.id) || isTaskTerminal(candidate.status) || !(candidate.dependencies ?? []).includes(prerequisite)) continue;
         seen.add(candidate.id);
         queue.push(candidate.id);
-        if (candidate.status !== "cancelled") dependents.push(candidate);
+        dependents.push({ id: candidate.id, status: candidate.status });
       }
     }
     return dependents;
@@ -2717,11 +3223,11 @@ export class Coordinator {
   private assertRouteCapacity(route: ModelRoute, excludeAgentId?: string): void {
     const limit = this.routeCapacityLimit(route);
     if (limit !== undefined) {
-      assertCondition(this.runningRouteCount(route, excludeAgentId) < limit, "AGENT_LIMIT_REACHED", `model route capacity reached for ${modelRouteKey(route)}`);
+      assertCondition(this.runningRouteCount(route, excludeAgentId) + this.grantedModelTurnCount(modelRouteCapacityKey(this.config, route)) < limit, "AGENT_LIMIT_REACHED", `model route capacity reached for ${modelRouteKey(route)}`);
     }
   }
 
-  private toSummary(agent: AgentRecord): AgentSummary {
+  private toSummary(agent: AgentRecord, includeCapabilities = true): AgentSummary {
     return {
       id: agent.id,
       parentId: agent.parentId,
@@ -2733,11 +3239,13 @@ export class Coordinator {
       reconnectable: agent.reconnectable,
       recoveryExpiredAt: agent.recoveryExpiredAt,
       artifactsCleanedAt: agent.artifactsCleanedAt,
+      artifactDisposition: agent.artifactDisposition,
+      retainedArtifactId: agent.retainedArtifactId,
       workspace: agent.workspace ? { ...agent.workspace } : undefined,
       lastActivity: agent.lastActivity,
       contextMode: agent.contextMode,
       contextDiagnostic: agent.contextDiagnostic,
-      capabilities: cloneCapabilities(agent.capabilities),
+      capabilities: includeCapabilities ? cloneCapabilities(agent.capabilities) : undefined,
     };
   }
 }

@@ -23,6 +23,10 @@ export type AgentStatus =
 export type TaskStatus = "pending" | "ready" | "active" | "waiting" | "blocked" | "completed" | "failed" | "cancelled";
 export type BorrowMode = "shared" | "mutable";
 export type MessagePriority = "normal" | "urgent";
+export type ModelTurnPurpose = "turn" | "compaction";
+export type ModelTurnState = "queued" | "granted";
+export type ArtifactDisposition = "cleaned" | "retained";
+export type ResourceStatus = "active" | "retired";
 
 export const MESSAGE_TYPES = [
   "inform",
@@ -119,6 +123,13 @@ export interface AgentRecord {
   terminalAt?: number;
   /** Durable marker set after the matching workspace/session artifacts are handled. */
   artifactsCleanedAt?: number;
+  /** Terminal artifact handling may retain useful Git work instead of deleting it. */
+  artifactDisposition?: ArtifactDisposition;
+  /** Stable reference into the cold retained-artifact collection. */
+  retainedArtifactId?: string;
+  /** Logical model operation currently holding the broker turn slot. */
+  activeTurnOperationId?: string;
+  activeTurnPurpose?: ModelTurnPurpose;
   /** Context management mode (e.g. lcm-embedded or native). */
   contextMode?: string;
   /** Bounded last context/provider diagnostic, for recovery visibility. */
@@ -134,6 +145,8 @@ export interface TaskResult {
 
 export interface TaskRecord {
   id: TaskId;
+  /** Stable pagination cursor present only on task.list projections. */
+  cursor?: string;
   /** True only on a response replayed from a prior request with the same operationId. */
   replayed?: boolean;
   description: string;
@@ -156,15 +169,35 @@ export interface AgentTombstone {
   depth: number;
   role: string;
   status: Extract<AgentStatus, "completed" | "failed" | "cancelled">;
+  createdAt?: number;
   terminalAt: number;
+  taskId?: TaskId;
   recoveryExpiredAt?: number;
   artifactsCleanedAt?: number;
+  artifactDisposition?: ArtifactDisposition;
+  retainedArtifactId?: string;
 }
 
 export interface TaskTombstone {
   id: TaskId;
   status: Extract<TaskStatus, "completed" | "failed" | "cancelled">;
+  /** Keep dependency edges so archive timing cannot change reopen semantics. */
+  dependencies: TaskId[];
+  parentTaskId?: TaskId;
+  createdAt?: number;
   updatedAt: number;
+}
+
+/** Cold metadata for a terminal agent whose useful external artifacts were retained. */
+export interface RetainedArtifactRecord {
+  id: string;
+  agentId: AgentId;
+  workspace?: WorkspaceInfo;
+  sessionPath?: string;
+  baseRef?: string;
+  headRef?: string;
+  reason?: string;
+  retainedAt: number;
 }
 
 export interface RequestTombstone {
@@ -181,6 +214,12 @@ export interface ModelTurnWaiter {
   route: ModelRoute;
   capacityKey: string;
   enqueuedAt: number;
+  /** Identifies the exact logical begin_turn request that may claim a grant. */
+  operationId?: string;
+  purpose?: ModelTurnPurpose;
+  state?: ModelTurnState;
+  grantedAt?: number;
+  grantExpiresAt?: number;
 }
 
 /**
@@ -233,6 +272,9 @@ export interface ResourceRecord {
   sharedHolds: ResourceHold[];
   mutableHold?: ResourceHold;
   waiters: ResourceWaiter[];
+  /** Explicit lifecycle; retired resources remain inspectable but cannot be borrowed. */
+  status?: ResourceStatus;
+  retiredAt?: number;
   /** Durable restart quarantine for an in-flight guarded write. */
   writeQuarantineUntil?: number;
   /** Actor that started the quarantined write, when known. */
@@ -305,6 +347,8 @@ export interface FabricConfig {
   agentHeartbeatTimeoutMs?: number;
   /** Retain a stale reconnectable actor's slot for this long before retiring it. */
   reconnectGraceMs?: number;
+  /** Lease duration for a granted model-turn ticket before it returns to the queue. */
+  modelTurnGrantTtlMs?: number;
   messageRetention: number;
   /** Exact provider/model route capacities, keyed as `provider/model`. */
   modelRouteCapacity?: Record<string, number>;
@@ -318,6 +362,8 @@ export interface FabricConfig {
   historyRetentionMs?: number;
   /** Bound each compact tombstone collection so cold history cannot grow forever. */
   maxArchivedRecords?: number;
+  /** Maximum records archived by one maintenance pass. */
+  historyGcBatchSize?: number;
 }
 
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
@@ -332,9 +378,11 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   heartbeatMs: 60 * 1000,
   agentHeartbeatTimeoutMs: 3 * 60 * 1000,
   reconnectGraceMs: 10 * 60 * 1000,
+  modelTurnGrantTtlMs: 30 * 1000,
   messageRetention: 2048,
   historyRetentionMs: 24 * 60 * 60 * 1000,
   maxArchivedRecords: 4_096,
+  historyGcBatchSize: 256,
 };
 
 export interface PersistedCoordinatorState {
@@ -360,10 +408,14 @@ export interface PersistedCoordinatorState {
   archivedAgents?: AgentTombstone[];
   archivedTasks?: TaskTombstone[];
   archivedRequests?: RequestTombstone[];
+  /** Useful retained Git/session artifacts are intentionally outside hot agent state. */
+  retainedArtifacts?: RetainedArtifactRecord[];
 }
 
 export interface AgentSummary {
   id: AgentId;
+  /** Stable pagination cursor present only on discover.agents projections. */
+  cursor?: string;
   parentId?: AgentId;
   depth: number;
   role: string;
@@ -376,6 +428,8 @@ export interface AgentSummary {
   recoveryExpiredAt?: number;
   /** Durable marker set after the matching workspace/session artifacts are handled. */
   artifactsCleanedAt?: number;
+  artifactDisposition?: ArtifactDisposition;
+  retainedArtifactId?: string;
   workspace?: WorkspaceInfo;
   lastActivity: number;
   contextMode?: string;
@@ -392,20 +446,63 @@ export interface ActiveFenceSummary {
 
 export interface FabricStatus {
   rootId: RootId;
+  rootAgentId?: AgentId;
+  /** Bounded diagnostic pages; use the list/show operations for complete records. */
   agents: AgentSummary[];
   tasks: TaskRecord[];
   resources: ResourceRecord[];
   pendingRequests: RequestRecord[];
   recentMessages: AgentMessage[];
   runningChildren: number;
+  totalAgents?: number;
+  totalTasks?: number;
+  totalResources?: number;
+  totalPendingRequests?: number;
+  totalRecentMessages?: number;
   config: FabricConfig;
   activeFences?: number;
+  activeMutableHolds?: number;
   fences?: ActiveFenceSummary[];
   activeWriteQuarantines?: number;
   /** Durable turn requests waiting for global or route capacity. */
   pendingModelTurns?: ModelTurnWaiter[];
   /** Counts of terminal records moved out of hot coordinator state. */
   archivedCounts?: { agents: number; tasks: number; requests: number };
+  truncated?: { agents: boolean; tasks: boolean; resources: boolean; pendingRequests: boolean; recentMessages: boolean };
+}
+
+export interface FabricTaskSummary {
+  id: TaskId;
+  status: TaskStatus;
+  owner?: AgentId;
+  description?: string;
+}
+
+export interface FabricResourceSummary {
+  id: ResourceId;
+  path?: string;
+  holder?: AgentId;
+}
+
+/** Bounded server-side projection used for quiescence and replacement decisions. */
+export interface FabricSnapshot {
+  rootId: RootId;
+  rootAgentId?: AgentId;
+  rootStatus?: AgentStatus;
+  caseInsensitivePaths?: boolean;
+  runningChildren: number;
+  recoveringAgents: number;
+  unresolvedChildTasks: number;
+  unownedUnresolvedTasks: number;
+  mutableHolds: number;
+  activeWriteFences: number;
+  activeWriteQuarantines: number;
+  pendingRootRequests: number;
+  pendingModelTurns: number;
+  /** Bounded fence details; the count remains authoritative when truncated. */
+  fences?: ActiveFenceSummary[];
+  activeTasks: FabricTaskSummary[];
+  mutableResources: FabricResourceSummary[];
 }
 
 export type CoordinatorEvent =
@@ -421,8 +518,10 @@ export type CoordinatorEvent =
   | { type: "request_changed"; request: RequestRecord }
   | { type: "slot_available"; agentId: AgentId }
   | { type: "model_turn_waiting"; waiter: ModelTurnWaiter }
-  | { type: "model_turn_granted"; waiterId: string; agentId: AgentId }
+  | { type: "model_turn_granted"; waiterId: string; agentId: AgentId; operationId?: string; purpose?: ModelTurnPurpose; grantedAt?: number; grantExpiresAt?: number }
+  | { type: "model_turn_claimed"; waiterId: string; agentId: AgentId; operationId?: string; purpose?: ModelTurnPurpose }
   | { type: "model_turn_cancelled"; waiterId: string; agentId: AgentId }
+  | { type: "agent_artifacts_retained"; agentId: AgentId; artifact: RetainedArtifactRecord }
   | { type: "agent_archived"; agent: AgentTombstone }
   | { type: "task_archived"; task: TaskTombstone }
   | { type: "request_archived"; request: RequestTombstone }
@@ -483,12 +582,13 @@ export function cloneModelTurnWaiter(waiter: ModelTurnWaiter): ModelTurnWaiter {
 }
 
 export function cloneTask(task: TaskRecord): TaskRecord {
-  return { ...task, dependencies: [...task.dependencies], result: task.result ? { ...task.result } : undefined };
+  return { ...task, dependencies: [...(task.dependencies ?? [])], result: task.result ? { ...task.result } : undefined };
 }
 
 export function cloneResource(resource: ResourceRecord): ResourceRecord {
   return {
     ...resource,
+    status: resource.status ?? "active",
     grants: Object.fromEntries(Object.entries(resource.grants).map(([id, permissions]) => [id, [...permissions]])),
     sharedHolds: resource.sharedHolds.map((hold) => ({ ...hold })),
     mutableHold: resource.mutableHold ? { ...resource.mutableHold } : undefined,

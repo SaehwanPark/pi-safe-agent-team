@@ -403,13 +403,26 @@ export async function evaluateRootShellGuard(
     };
   }
 
+  const rootAgentId = status.rootAgentId ?? status.rootId;
   const childHolds = status.resources.filter(
-    (r) => r.mutableHold && r.mutableHold.agentId !== status?.rootId,
+    (r) => r.mutableHold && r.mutableHold.agentId !== rootAgentId,
   );
   const activeFences = status.activeFences ?? 0;
   const childFences = (status.fences ?? []).filter(
-    (f) => f.actorId !== status?.rootId,
+    (f) => f.actorId !== rootAgentId,
   );
+  // A bounded diagnostic page cannot prove that an omitted contention record
+  // is unrelated to the command. Preserve the guard's fail-closed contract
+  // when the authoritative count exceeds the visible details.
+  const visibleMutableHolds = status.resources.filter((resource) => resource.mutableHold !== undefined).length;
+  const omittedContention = (status.activeMutableHolds ?? 0) > visibleMutableHolds || activeFences > (status.fences?.length ?? 0);
+  if (omittedContention) {
+    const contention = activeFences > (status.fences?.length ?? 0) ? "an active write fence" : "a mutable resource hold";
+    return {
+      block: true,
+      reason: `safe-agents blocked \`${command.trim()}\` because the broker returned a bounded contention projection and may have omitted ${contention}; wait for coordinated work to settle and retry.`,
+    };
+  }
 
   // Unknown commands are a deliberate trusted-root escape hatch while the
   // fabric is idle. Once a child has a mutable hold or active fence, allowing

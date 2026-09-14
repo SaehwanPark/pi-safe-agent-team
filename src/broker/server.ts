@@ -207,7 +207,9 @@ export class BrokerServer {
     this.autoCoordinator = options.coordinator === undefined;
     this.coordinator = options.coordinator ?? new Coordinator({ rootId: options.rootId, rootAgentId: options.rootAgentId, config: resolveBrokerConfig(options) });
     this.journal = options.journal ?? new Journal({ directory: options.directory });
-    this.maintenanceMs = Math.max(1000, options.maintenanceMs ?? this.coordinator.config.heartbeatMs);
+    const requestedMaintenanceMs = options.maintenanceMs ?? this.coordinator.config.heartbeatMs;
+    const grantTtlMs = this.coordinator.config.modelTurnGrantTtlMs ?? 30_000;
+    this.maintenanceMs = Math.max(1000, Math.min(requestedMaintenanceMs, grantTtlMs));
     this.checkpointTransactions = Math.max(1, Math.floor(options.checkpointTransactions ?? 4_096));
     this.checkpointBytes = Math.max(1, Math.floor(options.checkpointBytes ?? 16 * 1024 * 1024));
     this.wallClock = options.clock ?? (() => Date.now());
@@ -396,7 +398,7 @@ export class BrokerServer {
     if (!this.started) return;
     const before = this.coordinator.exportState();
     try {
-      const result = this.coordinator.maintenance({ skipStaleAgents });
+      const result = this.coordinator.maintenance({ skipStaleAgents, skipHistoricalArchival: skipStaleAgents });
       if (result.events.length > 0) {
         await this.journal.append(result.events);
         this.transactionsSinceCheckpoint += 1;
@@ -456,8 +458,11 @@ export class BrokerServer {
       case "model_turn_waiting":
         return event.waiter.agentId === actorId;
       case "model_turn_granted":
+      case "model_turn_claimed":
       case "model_turn_cancelled":
         return event.agentId === actorId;
+      case "agent_artifacts_retained":
+        return observer.depth === 0 || event.agentId === actorId;
       case "agent_archived":
       case "task_archived":
       case "request_archived":

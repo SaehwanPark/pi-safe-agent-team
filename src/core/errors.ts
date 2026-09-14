@@ -27,7 +27,8 @@ export type FabricErrorCode =
   | "WORKSPACE_FAILURE"
   | "MODEL_NOT_FOUND"
   | "MODEL_ROUTE_INVALID"
-  | "CHILD_SESSION_FAILURE";
+  | "CHILD_SESSION_FAILURE"
+  | "CURSOR_STALE";
 
 export interface FabricErrorShape {
   code: FabricErrorCode;

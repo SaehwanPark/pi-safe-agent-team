@@ -9,7 +9,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { FabricError, asFabricError } from "../core/errors.ts";
 import { Coordinator } from "../core/coordinator.ts";
-import { DEFAULT_FABRIC_CONFIG, type AgentStatus, type FabricConfig, type AgentMessage, type AgentRecord, type FabricStatus, type ModelRoute, type TaskRecord } from "../core/types.ts";
+import { DEFAULT_FABRIC_CONFIG, type AgentStatus, type AgentSummary, type FabricConfig, type AgentMessage, type AgentRecord, type FabricSnapshot, type FabricStatus, type ModelRoute, type TaskRecord } from "../core/types.ts";
 import { BrokerClient } from "../broker/client.ts";
 import { BrokerServer, defaultEndpoint, detectCaseInsensitivePaths } from "../broker/server.ts";
 import { GitWorkspaceStrategy, type WorkspaceStrategy } from "../workspace.ts";
@@ -327,7 +327,7 @@ export class FabricRuntime {
           // Automatic compaction runs inside an already-admitted root turn, so
           // the coordinator correctly reports a lifecycle conflict. Any other
           // error means admission is unknown and compaction must fail closed.
-          if (!(error instanceof FabricError) || error.code !== "LIFECYCLE_CONFLICT") throw error;
+          if (!(error instanceof FabricError) || error.code !== "LIFECYCLE_CONFLICT" || !/already running/i.test(error.message)) throw error;
         }
       }
 
@@ -681,37 +681,23 @@ export class FabricRuntime {
     }
 
     try {
-      const status = (await this.status(request.signal)) as FabricStatus;
-      if (status.config?.caseInsensitivePaths !== undefined) {
-        this.caseInsensitivePaths = status.config.caseInsensitivePaths;
-      }
-      // `FabricStatus.rootId` is the durable fabric identity, not necessarily
-      // the broker agent ID (the normal host uses `fabric-*` and `root-*`
-      // respectively). Prefer the attached binding and retain the historical
-      // status-root fallback for lightweight callers that use one ID for both.
-      const rootAgentId = this.root?.agentId ?? status.rootId;
-      const rootAgent = status.agents.find((a) => a.id === rootAgentId);
-      const rootBusy = !rootAgent || rootAgent.status === "starting" || rootAgent.status === "running";
-
-      const runningChildren = status.agents.filter(
-        (a) => a.depth > 0 && (a.status === "starting" || a.status === "running" || a.status === "draining"),
-      ).length;
-      const recoveringAgents = status.agents.filter((a) => a.reconnectable === true).length;
-      const unresolvedStatuses = ["pending", "ready", "active", "waiting", "blocked"];
-      const unresolvedChildTasks = status.tasks.filter(
-        (t) => unresolvedStatuses.includes(t.status),
-      ).length;
-      const unownedUnresolvedTasks = status.tasks.filter(
-        (t) => !t.owner && unresolvedStatuses.includes(t.status),
-      ).length;
-      const mutableHolds = status.resources.filter((r) => r.mutableHold !== undefined).length;
-      const pendingRootRequests = status.pendingRequests.filter(
-        (r) => (r.to === rootAgentId || r.from === rootAgentId) && r.status === "pending",
-      ).length;
+      // Quiescence only needs bounded aggregates. Keeping this query separate
+      // from the diagnostic status projection prevents historical task output
+      // from becoming an LCM transport failure.
+      const raw = (await this.status(request.signal, undefined, "fabric.snapshot")) as FabricSnapshot | FabricStatus;
+      const snapshot = "activeTasks" in raw ? raw : this.snapshotFromLegacyStatus(raw);
+      if (snapshot.caseInsensitivePaths !== undefined) this.caseInsensitivePaths = snapshot.caseInsensitivePaths;
+      const rootBusy = snapshot.rootStatus === undefined || snapshot.rootStatus === "starting" || snapshot.rootStatus === "running" || snapshot.rootStatus === "draining";
+      const runningChildren = snapshot.runningChildren;
+      const recoveringAgents = snapshot.recoveringAgents;
+      const unresolvedChildTasks = snapshot.unresolvedChildTasks;
+      const unownedUnresolvedTasks = snapshot.unownedUnresolvedTasks;
+      const mutableHolds = snapshot.mutableHolds;
+      const pendingRootRequests = snapshot.pendingRootRequests;
       const pendingRootDeliveries = this.pendingRootDeliveriesCount;
-      const pendingModelTurns = status.pendingModelTurns?.length ?? 0;
-      const activeWriteFences = status.activeFences ?? 0;
-      const activeWriteQuarantines = status.activeWriteQuarantines ?? status.resources.filter((resource) => (resource.writeQuarantineUntil ?? 0) > now).length;
+      const pendingModelTurns = snapshot.pendingModelTurns;
+      const activeWriteFences = snapshot.activeWriteFences;
+      const activeWriteQuarantines = snapshot.activeWriteQuarantines;
 
       const quiescenceReasons: string[] = [];
       if (this.draining) quiescenceReasons.push("fabric_draining");
@@ -731,24 +717,18 @@ export class FabricRuntime {
       const quiescent = quiescenceReasons.length === 0;
       const sessionReplacementSafe = quiescent;
 
-      const activeTasks = status.tasks
-        .filter((t) => unresolvedStatuses.includes(t.status))
-        .slice(0, 50)
-        .map((t) => ({
-          id: t.id,
-          status: t.status,
-          owner: t.owner,
-          description: t.description,
-        }));
+      const activeTasks = snapshot.activeTasks.slice(0, 50).map((task) => ({
+        id: task.id,
+        status: task.status,
+        owner: task.owner,
+        description: task.description,
+      }));
 
-      const mutableResources = status.resources
-        .filter((r) => r.mutableHold !== undefined)
-        .slice(0, 50)
-        .map((r) => ({
-          id: r.id,
-          path: r.path,
-          holder: r.mutableHold?.agentId,
-        }));
+      const mutableResources = snapshot.mutableResources.slice(0, 50).map((resource) => ({
+        id: resource.id,
+        path: resource.path,
+        holder: resource.holder,
+      }));
 
       return {
         version: 1,
@@ -806,8 +786,41 @@ export class FabricRuntime {
     }
   }
 
-  async status(signal?: AbortSignal, timeoutMs?: number): Promise<unknown> {
-    return this.request("fabric.status", {}, timeoutMs, signal);
+  private snapshotFromLegacyStatus(status: FabricStatus): FabricSnapshot {
+    const rootAgent = status.agents.find((agent) => agent.id === this.root?.agentId) ?? status.agents.find((agent) => agent.depth === 0);
+    const unresolvedStatuses = new Set(["pending", "ready", "active", "waiting", "blocked"]);
+    const unresolved = status.tasks.filter((task) => unresolvedStatuses.has(task.status));
+    return {
+      rootId: status.rootId,
+      rootAgentId: rootAgent?.id,
+      rootStatus: rootAgent?.status,
+      caseInsensitivePaths: status.config?.caseInsensitivePaths,
+      runningChildren: status.agents.filter((agent) => agent.depth > 0 && ["starting", "running", "draining"].includes(agent.status)).length,
+      recoveringAgents: status.agents.filter((agent) => agent.reconnectable === true).length,
+      unresolvedChildTasks: unresolved.length,
+      unownedUnresolvedTasks: unresolved.filter((task) => task.owner === undefined).length,
+      mutableHolds: status.resources.filter((resource) => resource.mutableHold !== undefined).length,
+      activeWriteFences: status.activeFences ?? 0,
+      activeWriteQuarantines: status.activeWriteQuarantines ?? status.resources.filter((resource) => (resource.writeQuarantineUntil ?? 0) > Date.now()).length,
+      pendingRootRequests: rootAgent ? status.pendingRequests.filter((request) => request.status === "pending" && (request.to === rootAgent.id || request.from === rootAgent.id)).length : 0,
+      pendingModelTurns: status.pendingModelTurns?.length ?? 0,
+      activeTasks: unresolved.slice(0, 50).map((task) => ({ id: task.id, status: task.status, owner: task.owner, description: task.description.slice(0, 1024) })),
+      mutableResources: status.resources.filter((resource) => resource.mutableHold !== undefined).slice(0, 50).map((resource) => ({ id: resource.id, path: resource.path, holder: resource.mutableHold?.agentId })),
+    };
+  }
+
+  async status(signal?: AbortSignal, timeoutMs?: number, operation = "fabric.status"): Promise<unknown> {
+    try {
+      return await this.request(operation, {}, timeoutMs, signal);
+    } catch (error) {
+      // Keep hosts compatible with a pre-R8 broker while new brokers use the
+      // bounded server-side snapshot operation. Do not mask frame or transport
+      // failures as a legacy status query.
+      if (operation === "fabric.snapshot" && error instanceof FabricError && error.code === "INVALID_ARGUMENT" && /unknown coordinator operation/i.test(error.message)) {
+        return this.request("fabric.status", {}, timeoutMs, signal);
+      }
+      throw error;
+    }
   }
 
   /** Wait for the broker's FIFO admission wake instead of polling capacity. */
@@ -871,6 +884,12 @@ export class FabricRuntime {
   async markArtifactsCleaned(agentId: string): Promise<void> {
     if (!this.root) return;
     await this.root.client.request("agent.mark_artifacts_cleaned", { agentId });
+  }
+
+  /** Persist that useful external artifacts were retained instead of deleted. */
+  async markArtifactsRetained(agentId: string, artifact: Record<string, unknown> = {}): Promise<void> {
+    if (!this.root) return;
+    await this.root.client.request("agent.mark_artifacts_retained", { agentId, artifact });
   }
 
   /**
@@ -1249,15 +1268,16 @@ export class FabricRuntime {
 
   /**
    * Reclaim artifacts left by actors whose broker recovery window expired.
-   * Workspace strategies decide whether a worktree is disposable (clean and at
-   * its recorded base); a failed cleanup therefore preserves the worktree and
-   * its session history for inspection.
+   * A failed cleanup is an intentional retained-artifact outcome, not an
+   * unhandled state: the useful branch/session location moves to cold metadata
+   * so the terminal agent and completed task can still leave hot state.
    */
   private cleanupAbandonedAgentArtifacts(status?: FabricStatus): Promise<void> {
     if (this.cleanupPromise) return this.cleanupPromise;
     const operation = (async () => {
       if (!this.root || this.stopped) return;
       const durable = status ?? (await this.status() as FabricStatus);
+      const agents = await this.discoverAllAgentsForCleanup(durable);
       const now = Date.now();
       const grace = this.config.reconnectGraceMs ?? DEFAULT_FABRIC_CONFIG.reconnectGraceMs ?? 0;
       const caseFold = process.platform === "win32" || this.caseInsensitivePaths === true;
@@ -1266,14 +1286,14 @@ export class FabricRuntime {
         return caseFold ? canonical.toLowerCase() : canonical;
       };
       const protectedPaths = new Set(
-        durable.agents
+        agents
           .filter((agent) => (!["completed", "failed", "cancelled"].includes(agent.status) || agent.reconnectable === true) && agent.workspace?.mode === "worktree")
           .map((agent) => agent.workspace?.path)
           .filter((path): path is string => Boolean(path))
           .map(pathKey),
       );
-      const candidates = durable.agents.filter((agent) => {
-        if (agent.depth === 0 || !agent.workspace || agent.artifactsCleanedAt !== undefined || !["completed", "failed", "cancelled"].includes(agent.status) || agent.reconnectable === true) return false;
+      const candidates = agents.filter((agent) => {
+        if (agent.depth === 0 || !agent.workspace || agent.artifactDisposition !== undefined || agent.artifactsCleanedAt !== undefined || !["completed", "failed", "cancelled"].includes(agent.status) || agent.reconnectable === true) return false;
         if (agent.recoveryExpiredAt !== undefined) return agent.recoveryExpiredAt <= now;
         return now - agent.lastActivity >= grace;
       });
@@ -1283,16 +1303,20 @@ export class FabricRuntime {
         const sessionsRoot = resolve(this.stateDirectory, "sessions");
         const sessionPath = resolve(sessionsRoot, agent.id);
         if (sessionPath === sessionsRoot || !sessionPath.startsWith(`${sessionsRoot}${sep}`)) continue;
+        let workspaceHandled = false;
         try {
           await this.workspaceStrategy.cleanup(workspace);
-        } catch {
-          // A dirty or divergent worktree is intentionally retained as a
-          // recovery artifact.
+          workspaceHandled = true;
+        } catch (error) {
+          // A dirty or divergent worktree is intentionally retained. Record
+          // both locations because the session may contain recovery context.
+          await this.markArtifactsRetained(agent.id, await this.retainedArtifactMetadata(workspace, sessionPath, error)).catch(() => undefined);
           continue;
         }
         try {
           await fs.rm(sessionPath, { recursive: true, force: true });
-        } catch {
+        } catch (error) {
+          await this.markArtifactsRetained(agent.id, await this.retainedArtifactMetadata(workspaceHandled ? undefined : workspace, sessionPath, error)).catch(() => undefined);
           continue;
         }
         // The marker is written only after both external artifacts have been
@@ -1308,6 +1332,35 @@ export class FabricRuntime {
     return cleanupPromise;
   }
 
+  private async discoverAllAgentsForCleanup(status: FabricStatus): Promise<AgentSummary[]> {
+    const byId = new Map(status.agents.map((agent) => [agent.id, agent]));
+    if (status.truncated?.agents !== true || !this.root) return [...byId.values()];
+    let after = status.agents.at(-1)?.cursor;
+    for (let page = 0; page < 10_000 && after; page++) {
+      const batch = await this.root.client.request<AgentSummary[]>("discover.agents", { scope: "all", limit: 100, after });
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      for (const agent of batch) byId.set(agent.id, agent);
+      const next = batch.at(-1)?.cursor;
+      if (!next || next === after || batch.length < 100) break;
+      after = next;
+    }
+    return [...byId.values()];
+  }
+
+  private async retainedArtifactMetadata(workspace: AgentRecord["workspace"] | undefined, sessionPath: string | undefined, error: unknown): Promise<Record<string, unknown>> {
+    const metadata: Record<string, unknown> = {
+      workspace,
+      sessionPath,
+      baseRef: workspace?.baseRef,
+      reason: (error instanceof Error ? error.message : String(error)).slice(0, 1800),
+    };
+    if (workspace && this.workspaceStrategy.describe) {
+      const described: { headRef?: string } = await this.workspaceStrategy.describe(workspace).catch((): { headRef?: string } => ({}));
+      if (described.headRef) metadata.headRef = described.headRef;
+    }
+    return metadata;
+  }
+
   private booleanCapabilities(input: SpawnToolInput): Record<string, boolean> {
     const result: Record<string, boolean> = {};
     for (const key of ["maySpawn", "mayMessagePeers", "mayEscalate", "mayTransferOwnership", "mayWriteRepo", "mayUseShell"] as const) {
@@ -1317,7 +1370,7 @@ export class FabricRuntime {
   }
 
   private handleRootEvent(event: { event: string; data: unknown }): void {
-    if (event.event === "slot_available") {
+    if (event.event === "slot_available" || event.event === "model_turn_granted" || event.event === "model_turn_cancelled") {
       const data = event.data as { agentId?: string };
       if (data.agentId === this.root?.agentId) {
         this.rootTurnAdmissionNotified = true;
@@ -1747,18 +1800,52 @@ export class ManagedChild {
   private async cleanupWorkspace(): Promise<void> {
     // Only a clean worktree still at its recorded base is disposable. A clean
     // branch with commits is a user-owned recovery artifact and must remain
-    // available for merge, cherry-pick, or inspection. Shared workspaces have
-    // no workspace deletion step, but their child session directory is still
-    // safe to remove after the session abort boundary.
+    // available for merge, cherry-pick, or inspection. Record that deliberate
+    // retention separately so terminal hot records can still be archived.
+    let workspaceHandled = this.workspace?.mode !== "worktree";
+    let sessionHandled = false;
+    const sessionPath = this.sessionArtifactPath();
     try {
-      if (this.workspace?.mode === "worktree") await this.runtime.workspaceStrategy.cleanup(this.workspace);
+      if (this.workspace?.mode === "worktree") {
+        await this.runtime.workspaceStrategy.cleanup(this.workspace);
+        workspaceHandled = true;
+      }
       await this.cleanupSessionArtifacts();
-      if (this.workspace) await this.runtime.markArtifactsCleaned(this.agentId).catch(() => undefined);
-    } catch {
-      // Dirty, committed, or uncertain child work is intentionally retained as
-      // a recovery artifact; the durable cleanup marker remains unset for
-      // later inspection.
+      sessionHandled = true;
+    } catch (error) {
+      await (this.runtime.markArtifactsRetained?.(this.agentId, await this.retainedArtifactMetadata(
+        workspaceHandled ? undefined : this.workspace,
+        sessionHandled ? undefined : sessionPath,
+        error,
+      )) ?? Promise.resolve()).catch(() => undefined);
+      return;
     }
+    // If the broker acknowledgement is lost after both external artifacts are
+    // handled, leave the terminal record eligible for a later cleanup retry;
+    // do not mislabel already-deleted artifacts as retained.
+    await (this.runtime.markArtifactsCleaned?.(this.agentId) ?? Promise.resolve()).catch(() => undefined);
+  }
+
+  private sessionArtifactPath(): string {
+    return resolve(this.stateDirectory, "sessions", this.agentId);
+  }
+
+  private async retainedArtifactMetadata(
+    workspace: AgentRecord["workspace"] | undefined,
+    sessionPath: string | undefined,
+    error: unknown,
+  ): Promise<Record<string, unknown>> {
+    const metadata: Record<string, unknown> = {
+      workspace,
+      sessionPath,
+      baseRef: workspace?.baseRef,
+      reason: (error instanceof Error ? error.message : String(error)).slice(0, 1800),
+    };
+    if (workspace && this.runtime.workspaceStrategy.describe) {
+      const described: { headRef?: string } = await this.runtime.workspaceStrategy.describe(workspace).catch((): { headRef?: string } => ({}));
+      if (described.headRef) metadata.headRef = described.headRef;
+    }
+    return metadata;
   }
 
   private async cleanupSessionArtifacts(): Promise<void> {
@@ -2140,7 +2227,7 @@ export class ManagedChild {
   }
 
   private handleEvent(event: { event: string; data: unknown }): void {
-    if (event.event === "slot_available") {
+    if (event.event === "slot_available" || event.event === "model_turn_granted" || event.event === "model_turn_cancelled") {
       const data = event.data as { agentId?: string };
       if (data.agentId === this.agentId) {
         this.turnAdmissionNotified = true;

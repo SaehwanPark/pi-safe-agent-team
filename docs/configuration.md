@@ -80,9 +80,11 @@ Current defaults:
 | `heartbeatMs` | 1 minute |
 | `agentHeartbeatTimeoutMs` | 3 minutes | Time without an actor heartbeat before the broker marks it failed/reconnectable and releases runtime resource claims. Semantic task ownership remains reserved during grace. |
 | `reconnectGraceMs` | 10 minutes | How long a stale reconnectable actor keeps its `maxTotalAgents` slot and task ownership before terminal retirement; unfinished tasks then return to `ready`. |
+| `modelTurnGrantTtlMs` | 30 seconds | Lease for a capacity grant before an unclaimed model-turn ticket returns to the FIFO queue. |
 | `messageRetention` | 2048 recent records |
 | `historyRetentionMs` | 24 hours | Age before terminal agents/tasks/resolved requests may move to compact tombstones. |
 | `maxArchivedRecords` | 4096 per record type | Bound for retained agent/task/request tombstones; referenced entries remain until safe to prune. |
+| `historyGcBatchSize` | 256 records | Maximum terminal records archived by one maintenance pass. |
 | `fenceMs` (per `resource.begin_write`) | 30s, clamped 1s-120s | Lifetime of a guarded-write fence. Not a config field: passed per call by the guarded host. The active fence map is ephemeral, while the matched resource carries a journaled restart quarantine through this expiry. |
 | `caseInsensitivePaths` | auto | Fold policy keys so differently-cased spellings share one resource. Undefined = probe the broker volume at startup (always true on Windows). Set `false` to keep keys case-sensitive. |
 

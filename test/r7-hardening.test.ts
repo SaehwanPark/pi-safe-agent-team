@@ -143,11 +143,14 @@ test("broker turn admission is durable FIFO and wakes the next waiter", () => {
 
   const released = coordinator.dispatch("root", "agent.end_turn", { status: "ready" });
   assert.ok(released.events.some((event) => event.type === "slot_available" && event.agentId === first.agent.id));
-  assert.equal((coordinator.dispatch("root", "agent.status", { agentId: first.agent.id }).value as AgentRecord).status, "running");
+  // The grant is durable but does not start work on behalf of a host whose
+  // response/event may have been lost. The matching retry claims it.
+  assert.equal((coordinator.dispatch("root", "agent.status", { agentId: first.agent.id }).value as AgentRecord).status, "ready");
   assert.deepEqual(coordinator.dispatch(first.agent.id, "agent.begin_turn", { operationId: "first-turn" }).value, { started: true });
   assert.equal(coordinator.dispatch(first.agent.id, "agent.begin_turn", { operationId: "first-turn" }).value.replayed, true);
   coordinator.dispatch(first.agent.id, "agent.end_turn", { status: "ready" });
-  assert.equal((coordinator.dispatch("root", "agent.status", { agentId: second.agent.id }).value as AgentRecord).status, "running");
+  assert.equal((coordinator.dispatch("root", "agent.status", { agentId: second.agent.id }).value as AgentRecord).status, "ready");
+  assert.deepEqual(coordinator.dispatch(second.agent.id, "agent.begin_turn", { operationId: "second-turn" }).value, { started: true });
 });
 
 test("the broker wakes a queued turn without polling and preserves its ticket", async () => {
