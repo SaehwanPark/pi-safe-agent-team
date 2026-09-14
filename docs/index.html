@@ -1027,29 +1027,57 @@
         
         <div class="callout info">
           <div class="callout-title">Verified Release Channels</div>
-          Tagged releases run cross-platform checks, the installed-tarball smoke, and the Pi + local-context-manager smoke before trusted npm publication. Use the GitHub install below for unreleased changes.
+          Tagged releases run cross-platform checks, the installed-tarball smoke, and the Pi + local-context-manager smoke before trusted npm publication. Use the pinned npm or GitHub forms for reproducible installs; the development form intentionally follows the moving <code>main</code> branch.
         </div>
 
-        <h3 class="subsection-header">Option 1: Pi Package Manager (Recommended)</h3>
+        <h3 class="subsection-header">Option 1: Install the published release via Pi (Recommended)</h3>
         <p>From your project workspace, run:</p>
         <div class="code-wrapper">
           <div class="code-header">
             <span>Terminal</span>
             <button class="copy-btn" onclick="copyCode('install-pi')">Copy</button>
           </div>
-          <pre><code id="install-pi">pi install git:github.com/SaehwanPark/pi-safe-agent-team</code></pre>
+          <pre><code id="install-pi">pi install npm:pi-safe-agents-team</code></pre>
         </div>
 
-        <h3 class="subsection-header">Option 2: Install the npm package</h3>
+        <h3 class="subsection-header">Option 2: Pin the npm release</h3>
+        <div class="code-wrapper">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button class="copy-btn" onclick="copyCode('install-npm-pin')">Copy</button>
+          </div>
+          <pre><code id="install-npm-pin">pi install npm:pi-safe-agents-team@0.3.0</code></pre>
+        </div>
+
+        <h3 class="subsection-header">Option 3: Pin the GitHub release</h3>
+        <div class="code-wrapper">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button class="copy-btn" onclick="copyCode('install-github-pin')">Copy</button>
+          </div>
+          <pre><code id="install-github-pin">pi install git:github.com/SaehwanPark/pi-safe-agent-team@v0.3.0</code></pre>
+        </div>
+
+        <h3 class="subsection-header">Option 4: Development/latest from GitHub</h3>
+        <p>This follows the moving <code>main</code> branch and is intended for unreleased changes:</p>
+        <div class="code-wrapper">
+          <div class="code-header">
+            <span>Terminal</span>
+            <button class="copy-btn" onclick="copyCode('install-pi-latest')">Copy</button>
+          </div>
+          <pre><code id="install-pi-latest">pi install git:github.com/SaehwanPark/pi-safe-agent-team</code></pre>
+        </div>
+
+        <h3 class="subsection-header">Option 5: Install the npm package in a project</h3>
         <div class="code-wrapper">
           <div class="code-header">
             <span>Terminal</span>
             <button class="copy-btn" onclick="copyCode('install-npm')">Copy</button>
           </div>
-          <pre><code id="install-npm">npm install pi-safe-agent-team</code></pre>
+          <pre><code id="install-npm">npm install pi-safe-agents-team</code></pre>
         </div>
 
-        <h3 class="subsection-header">Option 3: Clone to User Extensions Directory</h3>
+        <h3 class="subsection-header">Option 6: Clone to User Extensions Directory</h3>
         <p>Clone directly into your personal Pi extensions directory to make it available across all workspaces:</p>
         <div class="code-wrapper">
           <div class="code-header">
@@ -1059,7 +1087,7 @@
           <pre><code id="install-git">git clone https://github.com/SaehwanPark/pi-safe-agent-team ~/.pi/agent/extensions/pi-safe-agents-team</code></pre>
         </div>
 
-        <h3 class="subsection-header">Option 4: Local Development Setup</h3>
+        <h3 class="subsection-header">Option 7: Local Development Setup</h3>
         <div class="code-wrapper">
           <div class="code-header">
             <span>Terminal</span>

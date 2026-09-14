@@ -15,8 +15,10 @@ fi
 
 # Check the package surface explicitly: advertised benchmark and smoke scripts
 # must be present in the published archive rather than only in the repository.
-tar -tzf "${TARBALL}" | grep -q '^package/bench/r10-production-soak.ts$'
-tar -tzf "${TARBALL}" | grep -q '^package/scripts/smoke-isolated-pi.sh$'
+# Consume the complete tar listing before filtering: grep -q can exit early and
+# turn tar's expected SIGPIPE into a false failure under bash pipefail.
+tar -tzf "${TARBALL}" | grep -F -x 'package/bench/r10-production-soak.ts' >/dev/null
+tar -tzf "${TARBALL}" | grep -F -x 'package/scripts/smoke-isolated-pi.sh' >/dev/null
 
 INSTALL_DIR="${TMP_DIR}/install"
 mkdir -p "${INSTALL_DIR}"
