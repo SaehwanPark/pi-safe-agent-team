@@ -168,6 +168,7 @@ export class Coordinator {
     "resource.inspect",
     "resource.snapshot",
     "resource.list",
+    "agent.artifacts",
     "resource.check_write",
     "fabric.status",
     "fabric.snapshot",
@@ -312,6 +313,8 @@ export class Coordinator {
         return this.withEvents(events, this.markArtifactsRetained(this.requireActor(actorId).id, parseString(args.agentId, "agentId"), args.artifact, events));
       case "agent.resolve_artifact":
         return this.withEvents(events, this.resolveArtifact(this.requireActor(actorId).id, parseString(args.artifactId, "artifactId"), args.resolution, events));
+      case "agent.artifacts":
+        return this.withEvents(events, this.listRetainedArtifacts(this.requireActor(actorId).id, args), events);
       case "agent.begin_turn":
         return this.withEvents(events, this.beginTurn(this.requireActor(actorId).id, args, events));
       case "agent.reconcile_turn":
@@ -404,6 +407,10 @@ export class Coordinator {
     if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
     const operationId = args.operationId;
     if (operationId === undefined) return undefined;
+    // Reconciliation uses operationId as the physical provider-operation
+    // identity, not as a replay-cache key. Once its reservation is resolved,
+    // an identical retry is a harmless no-op observation.
+    if (operation === "agent.reconcile_turn") return undefined;
     assertCondition(Coordinator.idempotentOperations.has(operation), "INVALID_ARGUMENT", `operationId is not supported for ${operation}`);
     assertCondition(typeof operationId === "string" && operationId.length > 0 && operationId.length <= 128 && !operationId.includes("\u0000"), "INVALID_ARGUMENT", "operationId must be a bounded non-empty string without NUL");
     assertCondition(actorId !== undefined, "IDENTITY_CONFLICT", "operationId requires an authenticated actor");
@@ -668,6 +675,10 @@ export class Coordinator {
     assertCondition(input.workspaceRetained === undefined || typeof input.workspaceRetained === "boolean", "INVALID_ARGUMENT", "artifact.workspaceRetained must be boolean");
     assertCondition(input.sessionRetained === undefined || typeof input.sessionRetained === "boolean", "INVALID_ARGUMENT", "artifact.sessionRetained must be boolean");
     assertCondition(!existing || existing.status !== "resolved", "LIFECYCLE_CONFLICT", `Artifact ${existing?.id ?? target.retainedArtifactId} has already been resolved`);
+    if (!existing) {
+      this.trimRetainedArtifacts(events);
+      assertCondition(this.retainedArtifacts.size < (this.config.maxRetainedArtifacts ?? DEFAULT_FABRIC_CONFIG.maxRetainedArtifacts!), "AGENT_LIMIT_REACHED", "retained artifact limit reached; resolve an existing artifact before retaining another");
+    }
     const keepWorkspace = input.workspaceRetained === undefined ? true : input.workspaceRetained;
     const keepSession = input.sessionRetained === undefined ? true : input.sessionRetained;
     const artifact: RetainedArtifactRecord = {
@@ -682,7 +693,6 @@ export class Coordinator {
       status: "retained",
     };
     this.retainedArtifacts.set(artifact.id, { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined });
-    this.trimRetainedArtifacts(events);
     const next = cloneAgent(target);
     next.artifactDisposition = "retained";
     next.retainedArtifactId = artifact.id;
@@ -705,6 +715,21 @@ export class Coordinator {
       this.retainedArtifacts.delete(artifact.id);
       events.push({ type: "agent_artifact_pruned", artifactId: artifact.id });
     }
+  }
+
+  private listRetainedArtifacts(actorId: AgentId, args: Record<string, unknown>): { artifacts: RetainedArtifactRecord[]; total: number; nextAfter?: string } {
+    const actor = this.requireActor(actorId);
+    assertCondition(actor.depth === 0, "CAPABILITY_DENIED", "Only a fabric root may list retained artifacts");
+    const limit = this.listLimit(args.limit);
+    const after = args.after === undefined ? undefined : parseString(args.after, "after", 16 * 1024);
+    const records = [...this.retainedArtifacts.values()].sort((left, right) => left.retainedAt - right.retainedAt || left.id.localeCompare(right.id));
+    let start = 0;
+    if (after !== undefined) {
+      start = records.findIndex((artifact) => artifact.id === after) + 1;
+      assertCondition(start > 0, "CURSOR_STALE", `Retained artifact cursor ${after} is stale`);
+    }
+    const page = records.slice(start, start + limit).map((artifact) => ({ ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined }));
+    return { artifacts: page, total: records.length, ...(start + page.length < records.length && page.length > 0 ? { nextAfter: page[page.length - 1].id } : {}) };
   }
 
   private resolveArtifact(actorId: AgentId, artifactId: string, rawResolution: unknown, events: CoordinatorEvent[]): RetainedArtifactRecord {
@@ -2336,15 +2361,21 @@ export class Coordinator {
       }
       let retainedArtifactId = current.retainedArtifactId;
       if (current.artifactDisposition === "retained" && !retainedArtifactId) {
+        this.trimRetainedArtifacts(events);
+        if (this.retainedArtifacts.size >= (this.config.maxRetainedArtifacts ?? DEFAULT_FABRIC_CONFIG.maxRetainedArtifacts!)) continue;
         retainedArtifactId = this.idFactory("retained-artifact");
-        this.retainedArtifacts.set(retainedArtifactId, {
+        const artifact: RetainedArtifactRecord = {
           id: retainedArtifactId,
           agentId: current.id,
           workspace: current.workspace ? { ...current.workspace } : undefined,
           retainedAt: now,
           reason: "Terminal agent artifacts were retained",
           status: "retained",
-        });
+        };
+        this.retainedArtifacts.set(retainedArtifactId, artifact);
+        // The artifact is externalized by the broker after the journal append;
+        // make the creation replayable instead of relying on a checkpoint copy.
+        events.push({ type: "agent_artifacts_retained", agentId: current.id, artifact: { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined } });
       }
       const tombstone: AgentTombstone = {
         id: current.id,
@@ -2566,7 +2597,8 @@ export class Coordinator {
     return Boolean(agent.authToken && token !== undefined && token === agent.authToken);
   }
 
-  exportState(): PersistedCoordinatorState {
+  exportState(options: { includeRetainedArtifacts?: boolean } = {}): PersistedCoordinatorState {
+    const includeRetainedArtifacts = options.includeRetainedArtifacts !== false;
     return {
       version: 1,
       nextMessageSequence: Object.fromEntries(this.nextMessageSequence),
@@ -2585,13 +2617,25 @@ export class Coordinator {
       archivedTasks: [...this.archivedTasks.values()].map((task) => ({ ...task, dependencies: [...(task.dependencies ?? [])] })),
       archivedRequests: [...this.archivedRequests.values()].map((request) => ({ ...request })),
       archivedResources: [...this.archivedResources.values()].map((resource) => ({ ...resource })),
-      retainedArtifacts: [...this.retainedArtifacts.values()].map((artifact) => ({ ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined })),
+      ...(includeRetainedArtifacts
+        ? { retainedArtifacts: [...this.retainedArtifacts.values()].map((artifact) => ({ ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined })) }
+        : { retainedArtifactIds: [...this.retainedArtifacts.keys()] }),
       acknowledgedMessages: [...this.acknowledgedMessages.values()].map(cloneAckTombstone),
       recoveryTurnReservations: [...this.recoveryTurnReservations.values()].map(cloneModelTurnRecoveryReservation),
     };
   }
 
-  restoreState(state: PersistedCoordinatorState): void {
+  exportRetainedArtifacts(): RetainedArtifactRecord[] {
+    return [...this.retainedArtifacts.values()].map((artifact) => ({ ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined }));
+  }
+
+  restoreRetainedArtifacts(records: readonly RetainedArtifactRecord[]): void {
+    assertCondition(records.length <= (this.config.maxRetainedArtifacts ?? DEFAULT_FABRIC_CONFIG.maxRetainedArtifacts!), "AGENT_LIMIT_REACHED", "retained artifact manifest exceeds configured capacity");
+    this.retainedArtifacts.clear();
+    for (const artifact of records) this.retainedArtifacts.set(artifact.id, { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined });
+  }
+
+  restoreState(state: PersistedCoordinatorState, options: { preserveExternalRetainedArtifacts?: boolean } = {}): void {
     assertCondition(state.version === 1, "PROTOCOL_VERSION_UNSUPPORTED", `Unsupported coordinator state version ${state.version}`);
     this.agents.clear();
     this.tasks.clear();
@@ -2604,7 +2648,7 @@ export class Coordinator {
     this.archivedTasks.clear();
     this.archivedRequests.clear();
     this.archivedResources.clear();
-    this.retainedArtifacts.clear();
+    if (!options.preserveExternalRetainedArtifacts && state.retainedArtifacts !== undefined) this.retainedArtifacts.clear();
     this.acknowledgedMessages.clear();
     this.recoveryTurnReservations.clear();
     this.nextMessageSequence.clear();
@@ -2638,7 +2682,10 @@ export class Coordinator {
     for (const archived of state.archivedTasks ?? []) this.archivedTasks.set(archived.id, { ...archived, dependencies: [...(archived.dependencies ?? [])] });
     for (const archived of state.archivedRequests ?? []) this.archivedRequests.set(archived.id, { ...archived });
     for (const archived of state.archivedResources ?? []) this.archivedResources.set(archived.id, { ...archived });
-    for (const artifact of state.retainedArtifacts ?? []) this.retainedArtifacts.set(artifact.id, { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined });
+    if (state.retainedArtifacts !== undefined && (!options.preserveExternalRetainedArtifacts || this.retainedArtifacts.size === 0)) {
+      this.retainedArtifacts.clear();
+      for (const artifact of state.retainedArtifacts) this.retainedArtifacts.set(artifact.id, { ...artifact, workspace: artifact.workspace ? { ...artifact.workspace } : undefined });
+    }
     for (const acknowledged of state.acknowledgedMessages ?? []) this.acknowledgedMessages.set(this.ackTombstoneKey(acknowledged.to, acknowledged.id, acknowledged.revision), { ...acknowledged, acknowledged: true });
     for (const reservation of state.recoveryTurnReservations ?? []) this.recoveryTurnReservations.set(reservation.agentId, cloneModelTurnRecoveryReservation(reservation));
     this.idempotency.clear();

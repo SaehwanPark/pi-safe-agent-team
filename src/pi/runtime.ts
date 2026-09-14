@@ -1739,7 +1739,7 @@ export class ManagedChild {
       contextMode: this.contextMode,
       contextDiagnostic: this.lastDiagnostic,
     })).agent;
-    this.record = await this.runtime.reconcileRecoveredTurn(this.client, registered, false);
+    this.record = await this.reconcileRecoveredTurn(registered, false);
     this.taskId = this.record.taskId;
     await this.reconcileDurableAgentState(this.record);
     this.started = true;
@@ -1929,7 +1929,7 @@ export class ManagedChild {
             contextMode: this.contextMode,
             contextDiagnostic: this.lastDiagnostic,
           });
-          const reconciled = await this.runtime.reconcileRecoveredTurn(this.client, registered.agent, this.session?.isStreaming === true, this.activeTurnOperationId);
+          const reconciled = await this.reconcileRecoveredTurn(registered.agent, this.session?.isStreaming === true, this.activeTurnOperationId);
           const durable = await this.reconcileDurableAgentState(reconciled);
           // A slot grant may have happened while the socket was down. Wake the
           // admission loop; its idempotent begin_turn retry observes the
@@ -1969,6 +1969,11 @@ export class ManagedChild {
    * missed. Clearing first also lets an explicit task reopen release a stale
    * in-memory gate before inbox delivery resumes.
    */
+  private async reconcileRecoveredTurn(registered: AgentRecord, providerStillRunning: boolean, operationId?: string): Promise<AgentRecord> {
+    const reconcile = (this.runtime as unknown as { reconcileRecoveredTurn?: (client: BrokerClient, agent: AgentRecord, running: boolean, operationId?: string) => Promise<AgentRecord> }).reconcileRecoveredTurn;
+    return typeof reconcile === "function" ? reconcile.call(this.runtime, this.client, registered, providerStillRunning, operationId) : registered;
+  }
+
   private async reconcileDurableAgentState(agent?: AgentRecord): Promise<AgentRecord> {
     const durable = agent ?? await this.client.request<AgentRecord>("agent.status", {});
     this.record = durable;

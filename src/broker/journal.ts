@@ -117,7 +117,10 @@ export class Journal {
         throw new Error(`Malformed journal record at line ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
       }
       if (record.kind === "checkpoint") {
-        coordinator.restoreState(record.state);
+        // Retained artifact metadata lives in the broker's separate cold
+        // manifest. Keep that cache while replaying a checkpoint; subsequent
+        // artifact events still apply in journal order.
+        coordinator.restoreState(record.state, { preserveExternalRetainedArtifacts: true });
         pending.clear();
         checkpoints += 1;
       } else if (record.kind === "begin") {

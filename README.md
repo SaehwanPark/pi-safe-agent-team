@@ -106,6 +106,7 @@ Use slash commands to inspect runtime state:
 - `/agents tree` — Visual tree of parent-child hierarchy and roles.
 - `/agents tasks` — Deterministic task board showing owners and statuses.
 - `/agents resources` — Active ownership, shared/mutable holds, and waiters.
+- `/agents artifacts` — Root-only retained worktree/session metadata; add `resolve <id> [resolution]` after integration or discard.
 - `/agents inbox` — Durable mailbox inspection for unacknowledged messages.
 
 ### 3. Coordinated File Modification
@@ -141,6 +142,7 @@ When an agent needs to edit a file:
 - [`docs/agents.md`](docs/agents.md) — Agent lifecycles, recursion constraints, recovery ordering, and session boundaries
 - [`bench/r7-long-run.ts`](bench/r7-long-run.ts) — Deterministic long-run/archive and write-quarantine benchmark (`npm run bench:r7 [iterations]`)
 - [`bench/r8-longevity-scale.ts`](bench/r8-longevity-scale.ts) — Default-retention hot-state, large-resource, bounded-frame, grant-recovery, and checkpoint soak (`npm run bench:r8 [iterations]`)
+- [`bench/r9-chaos.ts`](bench/r9-chaos.ts) — Broker/client/journal restart, dropped-connection, grant-expiry, ACK-pruning, resource-compaction, and retained-artifact chaos soak (`npm run bench:r9-chaos [iterations]`)
 - [`PRIOR_ART.md`](PRIOR_ART.md) — Technical breakdown of preceding agent implementations
 
 ---

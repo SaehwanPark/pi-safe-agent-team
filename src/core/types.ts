@@ -455,8 +455,10 @@ export interface PersistedCoordinatorState {
   archivedAgents?: AgentTombstone[];
   archivedTasks?: TaskTombstone[];
   archivedRequests?: RequestTombstone[];
-  /** Useful retained Git/session artifacts are intentionally outside hot agent state. */
+  /** Legacy/full form; production broker checkpoints keep this collection external. */
   retainedArtifacts?: RetainedArtifactRecord[];
+  /** Compact references emitted when retained artifact metadata is externalized. */
+  retainedArtifactIds?: string[];
   /** Compact ACK proofs survive message and ordinary idempotency retention. */
   acknowledgedMessages?: MessageAckTombstone[];
   /** Capacity reservations for provider calls that may outlive a broker restart. */

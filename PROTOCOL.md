@@ -70,7 +70,7 @@ A reconnecting actor may re-register only with the matching token/session identi
 
 The public tool/command layer maps to these operation families:
 
-- `agent.register`, `agent.update`, `agent.configure_child`, `agent.mark_artifacts_cleaned`, `agent.mark_artifacts_retained`, `agent.begin_turn`, `agent.end_turn`, `agent.finish_turn`, `agent.drain`, `agent.heartbeat`, `agent.cancel`, `agent.status`;
+- `agent.register`, `agent.update`, `agent.configure_child`, `agent.mark_artifacts_cleaned`, `agent.mark_artifacts_retained`, `agent.artifacts`, `agent.resolve_artifact`, `agent.begin_turn`, `agent.reconcile_turn`, `agent.end_turn`, `agent.finish_turn`, `agent.drain`, `agent.heartbeat`, `agent.cancel`, `agent.status`;
 - `agent.spawn`;
 - `message.send`, `message.reply`, `message.ack`, `message.inbox`, `message.list`;
 - `discover.agents`;
@@ -109,7 +109,7 @@ Its response is bounded independently of historical task output and resource cou
 - The key is `(actor, operationId)`: one key addresses one logical request per actor, independent of the operation. Two actors may reuse the same `operationId` without collision.
 - A replay of the same actor + `operationId` + arguments returns the original response with `replayed: true` and creates nothing new.
 - Reusing an `operationId` for different arguments (or, for one actor, a different operation) raises `IDEMPOTENCY_CONFLICT`; it never returns the mismatched original response.
-- `operationId` is rejected with `INVALID_ARGUMENT` on any other operation, which are already deduplicated by message dedupe keys or are reads/claims with their own atomicity. `agent.begin_turn` is durable too: a capacity-blocked request journals a FIFO waiter and deliberately does not cache its provisional `started: false` response, so the same retry can observe a later grant. A grant carries the exact operation/purpose, reserves capacity while the actor remains `ready`, expires after `modelTurnGrantTtlMs`, and is claimed only by the matching host retry; expiry returns the ticket to FIFO rather than dropping the logical turn.
+- `operationId` is rejected with `INVALID_ARGUMENT` on any other operation, which are already deduplicated by message dedupe keys or are reads/claims with their own atomicity. `agent.begin_turn` is durable too: a capacity-blocked request journals a FIFO waiter and deliberately does not cache its provisional `started: false` response, so the same retry can observe a later grant. A grant carries the exact operation/purpose, reserves capacity while the actor remains `ready`, expires after `modelTurnGrantTtlMs`, and is claimed only by the matching host retry; expiry gives the ticket a new FIFO sequence and bounded retry budget before demoting it, so a dead head cannot starve later waiters. `agent.reconcile_turn` also accepts the provider operation identity during the post-restart recovery window; it is not a generic idempotency-cache key.
 - The record is journaled atomically with the transaction that applied it and is restored on replay and checkpointing, within a bounded per-coordinator window (oldest records evicted first). A legacy committed transaction with no record is not deduplicated.
 - An ambiguous client failure (`BROKER_UNAVAILABLE`/`PERSISTENCE_FAILURE`) may be retried once under the same `operationId`; deterministic business errors are never retried.
 
@@ -133,7 +133,7 @@ Guarantees:
 - **no global ordering**: messages from different senders may interleave;
 - **request/reply correlation**: a request has one request ID and at most one accepted response;
 - **busy safety**: notification delivery is separate from the durable inbox, so an active model turn cannot discard a message; the host tracks in-flight/accepted ID/revision pairs so duplicate notifications do not execute a message twice;
-- **exact acknowledgement**: a new client acknowledges `(messageId, revision)`. The broker rejects a stale revision, so a host that persisted an older coalesced payload cannot acknowledge the newer payload accidentally. An omitted revision remains accepted only for revision-1 legacy records; an ACK with a stable `operationId` replays its original success even if acknowledgement pruning removed the message before a retry;
+- **exact acknowledgement**: a new client acknowledges `(messageId, revision)`. The broker rejects a stale revision, so a host that persisted an older coalesced payload cannot acknowledge the newer payload accidentally. An omitted revision remains accepted only for revision-1 legacy records. A compact durable ACK tombstone preserves the recipient/message/revision proof after the full mailbox record and ordinary idempotency replay entry are pruned, returning already-acknowledged success rather than treating an unproven `MESSAGE_NOT_FOUND` as success;
 - **bounded retention**: the broker keeps recent message metadata/body within configured limits and reports truncation/retention in status. Messages addressed to permanently terminal actors become `abandonedAt` retention candidates without being presented as acknowledged.
 
 Acknowledgement means the Pi host accepted the exact `(messageId, revision)` payload into its session queue. It does not mean the model read or followed it. A model response is not a broker acknowledgement. Hosts should preserve the revision in their durable receipt and ACK payload.
@@ -192,7 +192,9 @@ Parent/child messages are always allowed when the actor retains the required cap
 
 An explicit `peerIds` entry is a narrow exception for that exact recipient and may be used without the broad peer capability. Descendant `peerIds` entries are intersected with the parent's explicit list; an empty list means no explicit exceptions, never a wildcard.
 
-`discover.agents(scope)` returns public metadata only: ID, role, task, route, status, and activity timestamps. It accepts bounded `status`, `limit`, and `after` filters for pagination and never returns a transcript. `task.list` and `resource.list` use the same bounded page contract. Page cursors encode `(createdAt,id)`; a malformed cursor is `INVALID_ARGUMENT`, while a cursor whose record was deleted/pruned is `CURSOR_STALE` rather than an implicit restart.
+`discover.agents(scope)` returns public metadata only: ID, role, task, route, status, and activity timestamps. It accepts bounded `status`, `limit`, and `after` filters for pagination and never returns a transcript. `task.list` and `resource.list` use the same bounded page contract. Page cursors encode `(createdAt,id)` in an opaque v2 base64url payload (with v1 decoding retained for compatibility); the cursor wire limit is independent of the entity-ID limit. A malformed cursor is `INVALID_ARGUMENT`, while a cursor whose record was deleted/pruned is `CURSOR_STALE` rather than an implicit restart.
+
+`agent.artifacts` is root-only and returns a bounded page of retained artifact metadata (`retained` or `resolved`) with `total`/`nextAfter`; it never includes child transcripts. `agent.resolve_artifact` records an explicit integration/discard resolution in the cold manifest. The broker stores this metadata in `retained-artifacts.json`, while checkpoints carry only compact artifact IDs.
 
 ## Tasks
 
@@ -214,7 +216,7 @@ Authorization and the filesystem mutation are not atomic, so guarded writes fenc
 - `transfer`: atomic owner change by an authorized owner/delegator;
 - `release`: release one of the caller's active holds, selected by exactly one of `resourceId`, `leaseId`, or `all=true` (releasing everything is explicit, never a forgotten selector);
 - `snapshot`: return `resourceId@version` for stable dependency tracking;
-- `retire`: root-only explicit transition from `active` to `retired`; it requires no holds, waiters, quarantine, active child resources, or fences. Retired resources remain inspectable but reject new grants, claims, borrows, transfers, and child definitions;
+- `retire`: root-only explicit transition from `active` to `retired`; it requires no holds, waiters, quarantine, active child resources, or fences. Retired resources remain inspectable but reject new grants, claims, borrows, transfers, and child definitions; after the history horizon they compact into bounded identity/path tombstones that remain listable/inspectable but carry no runtime grants or waiters;
 - `check_write`: authorize an actual file path only when the actor has a current mutable hold on a matching declared resource. With `hostGuard: true` (accepted only from the fabric root), the root instead participates in borrowing by exemption: the write is allowed when no overlapping resource carries a live foreign hold, and undeclared paths are writable without a prior declaration.
 
 Resource hierarchy uses explicit parent links. Equality and ancestor/descendant overlap are conflict candidates. A conflict returns a structured busy/waiting result; it is never silently granted. A waiting mutable request is ordered FIFO and wakes after a release or lease reclamation.

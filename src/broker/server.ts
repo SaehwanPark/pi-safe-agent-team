@@ -5,8 +5,9 @@ import { dirname, join, resolve } from "node:path";
 import { platform } from "node:os";
 import { FabricError, asFabricError } from "../core/errors.ts";
 import { Coordinator } from "../core/coordinator.ts";
-import type { CoordinatorEvent, FabricConfig, PersistedCoordinatorState } from "../core/types.ts";
+import type { CoordinatorEvent, FabricConfig } from "../core/types.ts";
 import { Journal } from "./journal.ts";
+import { RetainedArtifactStore } from "./artifact-store.ts";
 
 export const PROTOCOL_VERSION = 1;
 
@@ -179,6 +180,7 @@ export class BrokerServer {
   readonly endpoint: string;
   readonly coordinator: Coordinator;
   readonly journal: Journal;
+  readonly retainedArtifactStore: RetainedArtifactStore;
 
   private readonly server = net.createServer((socket) => this.accept(socket));
   private readonly connections = new Set<BrokerConnection>();
@@ -198,6 +200,7 @@ export class BrokerServer {
   private readonly wallClock: () => number;
   private transactionsSinceCheckpoint = 0;
   private lastMaintenanceTickAt?: number;
+  private retainedArtifactManifestDirty = false;
 
   constructor(options: BrokerServerOptions) {
     this.directory = options.directory;
@@ -207,6 +210,7 @@ export class BrokerServer {
     this.autoCoordinator = options.coordinator === undefined;
     this.coordinator = options.coordinator ?? new Coordinator({ rootId: options.rootId, rootAgentId: options.rootAgentId, config: resolveBrokerConfig(options) });
     this.journal = options.journal ?? new Journal({ directory: options.directory });
+    this.retainedArtifactStore = new RetainedArtifactStore({ directory: options.directory });
     const requestedMaintenanceMs = options.maintenanceMs ?? this.coordinator.config.heartbeatMs;
     const grantTtlMs = this.coordinator.config.modelTurnGrantTtlMs ?? 30_000;
     this.maintenanceMs = Math.max(1000, Math.min(requestedMaintenanceMs, grantTtlMs));
@@ -225,7 +229,10 @@ export class BrokerServer {
       this.coordinator.setCaseInsensitivePaths(detectCaseInsensitivePaths(this.policyRoot));
     }
     try {
+      await this.retainedArtifactStore.open();
+      this.coordinator.restoreRetainedArtifacts(this.retainedArtifactStore.records());
       await this.journal.replay(this.coordinator);
+      await this.syncRetainedArtifactManifest();
       this.transactionsSinceCheckpoint = 0;
       const recovery = this.coordinator.recover();
       if (recovery.events.length > 0) {
@@ -277,8 +284,14 @@ export class BrokerServer {
     this.lastMaintenanceTickAt = undefined;
     await this.operationTail.catch(() => undefined);
     // Compact the journal before closing connections so all state transitions
-    // accepted by this broker are represented by one durable snapshot.
-    await this.journal.checkpoint(this.coordinator.exportState()).catch(() => undefined);
+    // accepted by this broker are represented by one durable snapshot. Never
+    // replace the journal with an artifact-omitting checkpoint while the cold
+    // manifest is dirty; replay must retain the event until the manifest write
+    // succeeds.
+    await this.syncRetainedArtifactManifest();
+    if (!this.retainedArtifactManifestDirty) {
+      await this.journal.checkpoint(this.coordinator.exportState({ includeRetainedArtifacts: false })).catch(() => undefined);
+    }
     this.transactionsSinceCheckpoint = 0;
     for (const connection of this.connections) connection.close();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
@@ -294,6 +307,13 @@ export class BrokerServer {
 
   isStarted(): boolean {
     return this.started;
+  }
+
+  /** Run one serialized maintenance pass immediately (useful for bounded soaks and operators). */
+  async maintenanceNow(): Promise<void> {
+    if (!this.started) return;
+    this.enqueueMaintenance();
+    await this.operationTail;
   }
 
   private accept(socket: net.Socket): void {
@@ -360,7 +380,8 @@ export class BrokerServer {
     // Coordinator read projections are immutable and need no rollback copy.
     // For mutations this is the single snapshot shared with dispatch(), which
     // avoids cloning the complete fabric twice for one broker request.
-    const before = Coordinator.isReadOnlyOperation(request.op) ? undefined : this.coordinator.exportState();
+    const before = Coordinator.isReadOnlyOperation(request.op) ? undefined : this.coordinator.exportState({ includeRetainedArtifacts: false });
+    const retainedArtifactsBefore = isRetainedArtifactMutation(request.op) ? this.coordinator.exportRetainedArtifacts() : undefined;
     let response: ResponseFrame;
     try {
       if (request.args !== undefined && (!request.args || typeof request.args !== "object" || Array.isArray(request.args))) {
@@ -373,12 +394,14 @@ export class BrokerServer {
       if (result.events.length > 0 || result.idempotency !== undefined) {
         await this.journal.append(result.events, result.idempotency);
         this.transactionsSinceCheckpoint += 1;
+        if (hasRetainedArtifactEvents(result.events) || this.retainedArtifactManifestDirty) await this.syncRetainedArtifactManifest();
         await this.maybeCheckpoint();
       }
       response = { id: request.id, version: PROTOCOL_VERSION, ok: true, result: result.value };
       this.broadcast(result.events);
     } catch (error) {
       if (before) this.coordinator.restoreState(before);
+      if (retainedArtifactsBefore) this.coordinator.restoreRetainedArtifacts(retainedArtifactsBefore);
       response = { id: request.id, version: PROTOCOL_VERSION, ok: false, error: asFabricError(error, "PERSISTENCE_FAILURE").toJSON() };
     }
     this.cacheResponse(cacheKey, response);
@@ -396,24 +419,40 @@ export class BrokerServer {
 
   private async runMaintenance(skipStaleAgents = false): Promise<void> {
     if (!this.started) return;
-    const before = this.coordinator.exportState();
+    const before = this.coordinator.exportState({ includeRetainedArtifacts: false });
+    const retainedArtifactsBefore = this.coordinator.exportRetainedArtifacts();
     try {
       const result = this.coordinator.maintenance({ skipStaleAgents, skipHistoricalArchival: skipStaleAgents });
       if (result.events.length > 0) {
         await this.journal.append(result.events);
         this.transactionsSinceCheckpoint += 1;
+        if (hasRetainedArtifactEvents(result.events) || this.retainedArtifactManifestDirty) await this.syncRetainedArtifactManifest();
         await this.maybeCheckpoint();
         this.broadcast(result.events);
       }
     } catch {
       this.coordinator.restoreState(before);
+      this.coordinator.restoreRetainedArtifacts(retainedArtifactsBefore);
+    }
+  }
+
+  private async syncRetainedArtifactManifest(): Promise<void> {
+    try {
+      await this.retainedArtifactStore.replace(this.coordinator.exportRetainedArtifacts());
+      this.retainedArtifactManifestDirty = false;
+    } catch {
+      // The journal remains authoritative. Do not checkpoint away artifact
+      // events while the cold manifest is dirty; a later mutation/maintenance
+      // pass will retry the atomic manifest write.
+      this.retainedArtifactManifestDirty = true;
     }
   }
 
   private async maybeCheckpoint(): Promise<void> {
+    if (this.retainedArtifactManifestDirty) return;
     if (this.transactionsSinceCheckpoint < this.checkpointTransactions && await this.journal.size() < this.checkpointBytes) return;
     try {
-      await this.journal.checkpoint(this.coordinator.exportState());
+      await this.journal.checkpoint(this.coordinator.exportState({ includeRetainedArtifacts: false }));
       this.transactionsSinceCheckpoint = 0;
     } catch {
       // A failed compaction must not turn a committed coordinator mutation
@@ -542,6 +581,14 @@ export class BrokerServer {
     this.lockHandle = undefined;
     await fs.unlink(lockPath).catch(() => undefined);
   }
+}
+
+function hasRetainedArtifactEvents(events: readonly CoordinatorEvent[]): boolean {
+  return events.some((event) => event.type === "agent_artifacts_retained" || event.type === "agent_artifacts_resolved" || event.type === "agent_artifact_pruned");
+}
+
+function isRetainedArtifactMutation(operation: string): boolean {
+  return operation === "agent.mark_artifacts_retained" || operation === "agent.resolve_artifact";
 }
 
 export async function startBroker(options: BrokerServerOptions): Promise<BrokerServer> {

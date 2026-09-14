@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, stat, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Coordinator } from "../src/core/coordinator.ts";
+import { BrokerClient } from "../src/broker/client.ts";
+import { BrokerServer } from "../src/broker/server.ts";
 import { FabricError } from "../src/core/errors.ts";
-import type { AgentRecord, AgentSummary, FabricConfig, FabricStatus, ModelRoute, ResourceRecord } from "../src/core/types.ts";
+import type { AgentRecord, AgentSummary, FabricConfig, FabricStatus, ModelRoute, ResourceRecord, RetainedArtifactRecord } from "../src/core/types.ts";
 import { FabricRuntime, ManagedChild } from "../src/pi/runtime.ts";
 import { formatStatus } from "../index.ts";
 
@@ -69,6 +71,75 @@ test("ACK tombstones survive message pruning and eviction of the generic idempot
   const restoredReplay = restored.dispatch("child", "message.ack", { messageId: first.message.id, revision: 1 }).value as any;
   assert.equal(restoredReplay.alreadyAcknowledged, true);
   expectCode(() => restored.dispatch("child", "message.ack", { messageId: first.message.id, revision: 2 }), "MESSAGE_REVISION_CONFLICT");
+});
+
+test("broker checkpoints keep retained artifact metadata in the cold manifest", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "safe-agents-r9-artifacts-"));
+  const server = new BrokerServer({ directory, rootId: "fabric", rootAgentId: "root", checkpointTransactions: 1, maintenanceMs: 60_000 });
+  const root = new BrokerClient({ endpoint: server.endpoint, agentId: "root" });
+  try {
+    await server.start();
+    await root.connect();
+    const registered = await root.request<{ token: string }>("agent.register", { rootId: "fabric", route, capabilities: { maySpawn: true, mayMessagePeers: true } });
+    root.setIdentity("root", registered.token);
+    const spawned = await root.request<{ agent: AgentRecord; token: string }>("agent.spawn", { route });
+    const child = new BrokerClient({ endpoint: server.endpoint, agentId: spawned.agent.id, token: spawned.token });
+    try {
+      await child.connect();
+      await child.request("agent.register", { rootId: "fabric", parentId: "root", route, token: spawned.token });
+      await root.request("agent.cancel", { agentId: spawned.agent.id });
+      await root.request("agent.mark_artifacts_retained", {
+        agentId: spawned.agent.id,
+        artifact: {
+          workspace: { mode: "worktree", root: directory, path: join(directory, "worktree"), baseRef: "main", branch: "r9" },
+          sessionPath: join(directory, "sessions", spawned.agent.id),
+          reason: "test retention",
+        },
+      });
+      const listed = await root.request<{ artifacts: Array<{ id: string; status?: string }> }>("agent.artifacts", { limit: 100 });
+      assert.equal(listed.artifacts.length, 1);
+      assert.equal(listed.artifacts[0].status, "retained");
+      const manifest = JSON.parse(await readFile(join(directory, "retained-artifacts.json"), "utf8")) as { records: Array<{ id: string }> };
+      assert.equal(manifest.records.length, 1);
+      await server.stop();
+      const checkpoint = await readFile(join(directory, "events.jsonl"), "utf8");
+      assert.match(checkpoint, /retainedArtifactIds/);
+      assert.doesNotMatch(checkpoint, /retained-artifacts|workspace/);
+
+      const restarted = new BrokerServer({ directory, rootId: "fabric", rootAgentId: "root", checkpointTransactions: 1, maintenanceMs: 60_000 });
+      const reconnect = new BrokerClient({ endpoint: restarted.endpoint, agentId: "root", token: registered.token });
+      try {
+        await restarted.start();
+        await reconnect.connect();
+        await reconnect.request("agent.register", { rootId: "fabric", role: "root", route, token: registered.token, capabilities: { maySpawn: true, mayMessagePeers: true } });
+        const resolved = await reconnect.request<any>("agent.resolve_artifact", { artifactId: manifest.records[0].id, resolution: "merged" });
+        assert.equal(resolved.status, "resolved");
+        assert.equal(resolved.resolution, "merged");
+      } finally {
+        reconnect.close();
+        await restarted.stop();
+      }
+    } finally {
+      child.close();
+    }
+  } finally {
+    root.close();
+    if (server.isStarted()) await server.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("unresolved retained artifacts have an explicit bounded admission policy", () => {
+  const coordinator = makeCoordinator({ maxRetainedArtifacts: 2 });
+  registerRoot(coordinator);
+  for (const id of ["artifact-one", "artifact-two", "artifact-three"]) registerChild(coordinator, id);
+  for (const id of ["artifact-one", "artifact-two", "artifact-three"]) coordinator.dispatch("root", "agent.cancel", { agentId: id });
+  coordinator.dispatch("root", "agent.mark_artifacts_retained", { agentId: "artifact-one", artifact: { reason: "one" } });
+  coordinator.dispatch("root", "agent.mark_artifacts_retained", { agentId: "artifact-two", artifact: { reason: "two" } });
+  expectCode(() => coordinator.dispatch("root", "agent.mark_artifacts_retained", { agentId: "artifact-three", artifact: { reason: "three" } }), "AGENT_LIMIT_REACHED");
+  const page = coordinator.dispatch("root", "agent.artifacts", {}).value as { artifacts: RetainedArtifactRecord[]; total: number };
+  assert.equal(page.total, 2);
+  assert.equal(page.artifacts.length, 2);
 });
 
 test("recovery reservations keep a running provider route occupied until the host reconciles it", () => {
