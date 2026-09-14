@@ -88,14 +88,26 @@ export class AckProofStore implements MessageAckProofLookup {
     this.recordsSinceCompaction = 0;
     try {
       const content = await fs.readFile(this.filePath, "utf8");
-      const lines = content.endsWith("\n") ? content.slice(0, -1).split("\n") : content.split("\n");
+      const lines = content.split("\n");
+      let validBytes = 0;
       for (let index = 0; index < lines.length; index += 1) {
-        if (!lines[index]?.trim()) continue;
+        const line = lines[index]!;
+        const lineBytes = Buffer.byteLength(line) + (index < lines.length - 1 ? 1 : 0);
+        if (!line.trim()) {
+          validBytes += lineBytes;
+          continue;
+        }
         try {
-          this.remember(parseRecord(JSON.parse(lines[index]!)));
+          this.remember(parseRecord(JSON.parse(line)));
+          validBytes += lineBytes;
         } catch (error) {
-          if (index === lines.length - 1) break;
-          throw new Error(`Malformed ACK proof record at line ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
+          // A process crash can leave one partial final JSONL record. Repair
+          // that tail before future appends; an invalid complete record in the
+          // middle or a newline-terminated final record is corruption.
+          const isPartialTail = index === lines.length - 1 && !content.endsWith("\n");
+          if (!isPartialTail) throw new Error(`Malformed ACK proof record at line ${index + 1}: ${error instanceof Error ? error.message : String(error)}`);
+          await fs.truncate(this.filePath, validBytes);
+          break;
         }
       }
     } catch (error) {

@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { copyFile, readFile, mkdtemp, rm } from "node:fs/promises";
+import { appendFile, copyFile, readFile, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { BrokerClient } from "../src/broker/client.ts";
 import { BrokerServer } from "../src/broker/server.ts";
 import { Coordinator } from "../src/core/coordinator.ts";
-import type { AgentRecord, FabricConfig, ModelRoute } from "../src/core/types.ts";
+import { AckProofStore } from "../src/broker/ack-proof-store.ts";
+import type { AgentRecord, FabricConfig, MessageAckTombstone, ModelRoute } from "../src/core/types.ts";
 
 const route: ModelRoute = { provider: "test", model: "small", thinking: "medium" };
 
@@ -86,6 +87,29 @@ test("broker keeps ACK proofs in an append-only cold store, not hot checkpoint s
     for (const client of clients) client.close();
     if (restarted?.isStarted()) await restarted.stop();
     if (server?.isStarted()) await server.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ACK proof store repairs a partial final record before future appends", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "safe-agents-r10-ack-tail-"));
+  try {
+    const store = new AckProofStore({ directory });
+    await store.open();
+    const first: MessageAckTombstone = { id: "message:first", to: "child", revision: 1, acknowledgedAt: 1_000, acknowledged: true };
+    store.queue([first]);
+    await store.flush();
+    await appendFile(store.filePath, '{"version":1,"id":"partial');
+
+    const reopened = new AckProofStore({ directory });
+    await reopened.open();
+    assert.equal(reopened.findExact("child", first.id, 1)?.acknowledged, true);
+    const second: MessageAckTombstone = { id: "message:second", to: "child", revision: 1, acknowledgedAt: 1_001, acknowledged: true };
+    reopened.queue([second]);
+    await reopened.flush();
+    const records = (await readFile(store.filePath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { id: string });
+    assert.deepEqual(records.map((record) => record.id), [first.id, second.id]);
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });
